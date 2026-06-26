@@ -2,7 +2,7 @@
 
 LLM-Brain is a reusable skill/specification for building a durable, repository-agnostic memory system for AI coding agents.
 
-It is not Codex-only. Codex is one supported client/adapter alongside Claude Code, Hermes, OpenClaw, and generic Agent Skills clients.
+Agnostic intended to work alongside Codex, Claude Code, Hermes, OpenClaw, and generic Agent Skills clients.
 
 It is not a larger prompt, a transcript archive, or a prettier wiki. The goal is to create a portable brain for a project: one that remembers what happened, promotes reviewed knowledge into durable files, preserves provenance, detects conflicts, and generates task-specific context for different agents.
 
