@@ -1,5 +1,5 @@
 # Universal LLM-Brain Beyond the Wiki
-## Codex prompt
+## Universal agent skill prompt
 You are to design and implement a universal, repository-agnostic, language-agnostic “LLM-Brain” as a reusable skill that works across projects and also across a shared knowledge root.
 Your job is to inspect the current repository and existing project context, then build the solution directly into the current project in the most native way possible, while keeping the design portable across stacks and runtimes.
 
