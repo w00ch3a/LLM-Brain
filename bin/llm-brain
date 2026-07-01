@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+DEFAULT_ROOT="${LLM_BRAIN_ROOT:-/Volumes/home/Vaults/llm-brain}"
+
+usage() {
+  cat <<'USAGE'
+Usage: llm-brain <command> [path]
+
+Commands:
+  doctor [root]                               Check the filesystem-first brain root
+  stats [root]                                Count projects, episodes, concepts, claims, and review items
+  ingest-source <project-id> <source> [root]  Copy a source, record an episode, and open review
+  lint [root]                                 Check source hashes, links, and review backlog
+  help                                        Show this help
+
+Environment:
+  LLM_BRAIN_ROOT  Default root when [root] is omitted
+USAGE
+}
+
+brain_root() {
+  if [ "${1:-}" != "" ]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "$DEFAULT_ROOT"
+  fi
+}
+
+count_files() {
+  local root="$1"
+  local pattern="$2"
+
+  if [ ! -d "$root" ]; then
+    printf '0\n'
+    return
+  fi
+
+  find "$root" -type f -path "$pattern" 2>/dev/null | wc -l | tr -d ' '
+}
+
+count_dirs() {
+  local root="$1"
+  local depth="$2"
+
+  if [ ! -d "$root" ]; then
+    printf '0\n'
+    return
+  fi
+
+  find "$root" -mindepth "$depth" -maxdepth "$depth" -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
+now_utc() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
+safe_name() {
+  local value
+  value="$(basename "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//')"
+  if [ "$value" = "" ]; then
+    value="source"
+  fi
+  printf '%s\n' "$value"
+}
+
+secret_scan_source() {
+  local source="$1"
+  local pattern='-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-[A-Za-z0-9_-]{20,}|(api[_-]?key|secret|password|token)[[:space:]]*[:=][[:space:]]*"?[A-Za-z0-9_./+=-]{16,}'
+
+  if LC_ALL=C grep -Eq -- "$pattern" "$source"; then
+    printf 'ingest-source=secret-scan-blocked source=%s\n' "$source" >&2
+    return 2
+  fi
+}
+
+doctor() {
+  local root
+  root="$(brain_root "${1:-}")"
+
+  if [ ! -d "$root" ]; then
+    printf 'version=%s root=%s doctor=missing-root\n' "$VERSION" "$root"
+    return 1
+  fi
+
+  local status="ok"
+  [ -d "$root/registry" ] || status="missing-registry"
+  [ -d "$root/projects" ] || status="missing-projects"
+
+  printf 'version=%s root=%s doctor=%s\n' "$VERSION" "$root" "$status"
+  [ "$status" = "ok" ]
+}
+
+stats() {
+  local root
+  root="$(brain_root "${1:-}")"
+
+  local projects episodes concepts claims review_items
+  projects="$(count_dirs "$root/projects" 1)"
+  episodes="$(count_files "$root/projects" '*/episodes/*.md')"
+  concepts="$(count_files "$root/projects" '*/concepts/*.md')"
+  claims="$(count_files "$root/projects" '*/claims/*.md')"
+  review_items="$(count_files "$root/projects" '*/review/*.md')"
+
+  printf 'root=%s projects=%s episodes=%s concepts=%s claims=%s review_items=%s\n' \
+    "$root" "$projects" "$episodes" "$concepts" "$claims" "$review_items"
+}
+
+ingest_source() {
+  local project_id="${1:-}"
+  local source="${2:-}"
+  local root
+  root="$(brain_root "${3:-}")"
+
+  if [ "$project_id" = "" ] || [ "$source" = "" ]; then
+    printf 'Usage: llm-brain ingest-source <project-id> <source> [root]\n' >&2
+    return 64
+  fi
+  if [ ! -f "$source" ]; then
+    printf 'ingest-source=missing-source source=%s\n' "$source" >&2
+    return 66
+  fi
+
+  local project="$root/projects/$project_id"
+  if [ ! -d "$project" ]; then
+    printf 'ingest-source=missing-project project=%s root=%s\n' "$project_id" "$root" >&2
+    return 66
+  fi
+
+  secret_scan_source "$source"
+
+  local source_hash hash_short source_name source_dir dest timestamp day episode_dir episode review_dir review_file
+  source_hash="$(sha256_file "$source")"
+  hash_short="${source_hash:0:12}"
+  source_name="$(safe_name "$source")"
+  source_dir="$project/sources"
+  dest="$source_dir/$hash_short-$source_name"
+  timestamp="$(now_utc)"
+  day="${timestamp%%T*}"
+  episode_dir="$project/episodes/$day"
+  episode="$episode_dir/episode_${day//-/}_$hash_short.md"
+  review_dir="$project/review"
+  review_file="$review_dir/source_$hash_short.md"
+
+  mkdir -p "$source_dir" "$episode_dir" "$review_dir"
+
+  if [ ! -e "$dest" ]; then
+    cp -p "$source" "$dest"
+  fi
+  printf '%s  %s\n' "$source_hash" "$(basename "$dest")" >"$dest.sha256"
+
+  if [ ! -e "$episode" ]; then
+    cat >"$episode" <<EPISODE
+---
+type: Episode
+title: Ingested source $source_name
+timestamp: "$timestamp"
+brain_project_id: $project_id
+brain_episode_id: episode_${day//-/}_$hash_short
+brain_scope: project
+brain_source_path: "$dest"
+brain_source_hash_sha256: "$source_hash"
+brain_review_state: captured
+---
+# Ingested source $source_name
+
+Source copied to: \`$dest\`
+Source SHA-256: \`$source_hash\`
+
+This episode records source custody only. It is not promoted semantic memory.
+EPISODE
+  fi
+
+  if [ ! -e "$review_file" ]; then
+    cat >"$review_file" <<REVIEW
+---
+type: ReviewItem
+brain_project_id: $project_id
+brain_review_kind: source-ingest
+brain_review_state: proposed
+brain_source_path: "$dest"
+brain_source_hash_sha256: "$source_hash"
+---
+# Review source $source_name
+
+Extract candidate claims, procedures, references, and conflicts from the ingested source only when useful. Preserve provenance back to the source file before promotion.
+REVIEW
+  fi
+
+  printf '%s\tingest-source project=%s source=%s hash=%s episode=%s review=%s\n' \
+    "$timestamp" "$project_id" "$dest" "$source_hash" "$episode" "$review_file" >>"$project/audit.log"
+
+  printf 'ingest-source=ok project=%s source=%s source_hash=%s episode=%s review=%s\n' \
+    "$project_id" "$dest" "$source_hash" "$episode" "$review_file"
+}
+
+LINT_ERRORS=0
+LINT_WARNINGS=0
+LINT_INFOS=0
+
+lint_error() {
+  LINT_ERRORS=$((LINT_ERRORS + 1))
+  printf 'lint:error %s\n' "$*"
+}
+
+lint_warn() {
+  LINT_WARNINGS=$((LINT_WARNINGS + 1))
+  printf 'lint:warn %s\n' "$*"
+}
+
+lint_info() {
+  LINT_INFOS=$((LINT_INFOS + 1))
+  printf 'lint:info %s\n' "$*"
+}
+
+verify_source_hashes() {
+  local project="$1"
+
+  if [ ! -d "$project/sources" ]; then
+    return
+  fi
+
+  local sidecar source_file expected actual
+  while IFS= read -r sidecar; do
+    source_file="${sidecar%.sha256}"
+    expected="$(awk '{print $1; exit}' "$sidecar")"
+    if [ ! -f "$source_file" ]; then
+      lint_error "missing source for hash sidecar: $sidecar"
+      continue
+    fi
+    actual="$(sha256_file "$source_file")"
+    if [ "$expected" != "$actual" ]; then
+      lint_error "source hash mismatch: $source_file"
+    fi
+  done < <(find "$project/sources" -type f -name '*.sha256' 2>/dev/null)
+}
+
+project_source_root() {
+  local root="$1"
+  local project_id="$2"
+
+  if [ ! -f "$root/registry/projects.tsv" ]; then
+    return
+  fi
+
+  awk -F '\t' -v project_id="$project_id" '$2 == project_id { print $5; exit }' "$root/registry/projects.tsv"
+}
+
+link_exists() {
+  local project="$1"
+  local source_root="$2"
+  local target="$3"
+  local base
+  base="$(basename "$target")"
+
+  [ "$target" = "" ] && return 0
+  case "$target" in
+    http:*|https:*|/*) return 0 ;;
+  esac
+
+  if [ -f "$project/$target" ] ||
+    [ -f "$project/$target.md" ] ||
+    [ -f "$project/okf/$target" ] ||
+    [ -f "$project/okf/$target.md" ] ||
+    find "$project" -type f -name "$base.md" -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+
+  if [ "$source_root" != "" ] && [ -d "$source_root" ]; then
+    if [ -f "$source_root/$target" ] ||
+      [ -f "$source_root/$target.md" ] ||
+      [ -f "$source_root/wiki/$target" ] ||
+      [ -f "$source_root/wiki/$target.md" ] ||
+      find "$source_root" -type f -name "$base.md" -print -quit 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+check_links() {
+  local project="$1"
+  local source_root="$2"
+  local target
+
+  while IFS= read -r target; do
+    if ! link_exists "$project" "$source_root" "$target"; then
+      lint_warn "unresolved wikilink project=$(basename "$project") target=$target"
+    fi
+  done < <(
+    LC_ALL=C grep -Rho '\[\[[^]]\+\]\]' "$project" --include '*.md' 2>/dev/null |
+      sed 's/^\[\[//; s/\]\]$//; s/[|#].*$//' |
+      sort -u
+  )
+}
+
+lint_project() {
+  local root="$1"
+  local project="$2"
+  local project_id
+  project_id="$(basename "$project")"
+  local source_root
+  source_root="$(project_source_root "$root" "$project_id")"
+
+  [ -f "$project/audit.log" ] || lint_warn "missing audit.log project=$project_id"
+  [ -f "$project/okf/index.md" ] || [ -f "$project/index.md" ] || lint_warn "missing index project=$project_id"
+
+  verify_source_hashes "$project"
+  check_links "$project" "$source_root"
+
+  if [ -d "$project/review" ]; then
+    local pending
+    pending="$({ LC_ALL=C grep -REl 'brain_review_state:[[:space:]]*(draft|proposed|needs-validation)' "$project/review" --include '*.md' 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    if [ "$pending" != "0" ]; then
+      lint_info "pending review project=$project_id count=$pending"
+    fi
+  fi
+}
+
+lint_root() {
+  local root
+  root="$(brain_root "${1:-}")"
+
+  if [ ! -d "$root/projects" ]; then
+    lint_error "missing projects directory root=$root"
+    printf 'lint root=%s projects=0 errors=%s warnings=%s infos=%s\n' "$root" "$LINT_ERRORS" "$LINT_WARNINGS" "$LINT_INFOS"
+    return 1
+  fi
+
+  local project project_count=0
+  for project in "$root"/projects/*; do
+    [ -d "$project" ] || continue
+    project_count=$((project_count + 1))
+    lint_project "$root" "$project"
+  done
+
+  printf 'lint root=%s projects=%s errors=%s warnings=%s infos=%s\n' "$root" "$project_count" "$LINT_ERRORS" "$LINT_WARNINGS" "$LINT_INFOS"
+  [ "$LINT_ERRORS" = "0" ]
+}
+
+case "${1:-help}" in
+  doctor)
+    shift
+    doctor "${1:-}"
+    ;;
+  stats)
+    shift
+    stats "${1:-}"
+    ;;
+  ingest-source)
+    shift
+    ingest_source "${1:-}" "${2:-}" "${3:-}"
+    ;;
+  lint)
+    shift
+    lint_root "${1:-}"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac

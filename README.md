@@ -6,7 +6,7 @@ Agnostic intended to work alongside Codex, Claude Code, Hermes, OpenClaw, and ge
 
 It is not a larger prompt, a transcript archive, or a prettier wiki. The goal is to create a portable brain for a project: one that remembers what happened, promotes reviewed knowledge into durable files, preserves provenance, detects conflicts, and generates task-specific context for different agents.
 
-The current repository contains the skill prompt in [`SKILL.md`](SKILL.md). It is a specification for an agent to inspect a target repository and build the most native implementation for that stack.
+The repository contains the reusable skill prompt in [`SKILL.md`](SKILL.md) plus a minimal filesystem-first reference CLI in [`bin/llm-brain`](bin/llm-brain).
 
 ## What It Does
 
@@ -132,7 +132,33 @@ The pack should include only what the agent needs, with pointers for expansion. 
 
 ## Usage
 
-Use this repository as the source skill/specification for an agent that supports skills or project instructions.
+Use this repository as the source skill/specification for an agent that supports skills or project instructions, or run the small reference CLI directly.
+
+```bash
+bin/llm-brain doctor
+bin/llm-brain stats
+bin/llm-brain ingest-source <project-id> /path/to/source.md
+bin/llm-brain lint
+```
+
+By default the CLI reads `/Volumes/home/Vaults/llm-brain`. Override that with an argument or `LLM_BRAIN_ROOT`:
+
+```bash
+bin/llm-brain doctor /path/to/llm-brain
+LLM_BRAIN_ROOT=/path/to/llm-brain bin/llm-brain stats
+bin/llm-brain ingest-source <project-id> /path/to/source.md /path/to/llm-brain
+bin/llm-brain lint /path/to/llm-brain
+```
+
+`ingest-source` requires an explicit project id. It copies the source into that project, records an append-only episode, opens a review item, writes a source hash sidecar, and blocks likely secrets before custody.
+
+`lint` checks project structure, source hash sidecars, and unresolved wikilinks, including links that resolve through the project's registered source root. Pending review items are reported as informational backlog, not warnings.
+
+Run the self-check:
+
+```bash
+bash tests/self-check.sh
+```
 
 Typical flow:
 
@@ -159,7 +185,7 @@ Use LLM-Brain to build a Codex context pack for the current migration task.
 
 ## Current Status
 
-This repository currently contains the reusable skill prompt and license only. It does not yet ship a packaged CLI or reference implementation.
+This repository now ships a tiny Bash reference implementation with `doctor`, `stats`, `ingest-source`, and `lint`. It is deliberately a sidecar, not a framework.
 
 The skill is intentionally stack-neutral: when used inside another repository, it should reuse that repository's language, tooling, tests, and conventions instead of forcing a new runtime.
 
