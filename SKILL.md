@@ -260,7 +260,7 @@ Core features to implement:
 - Document mapping rules and edge cases.
 
 10. Secret scanner and redaction
-- Implement a pre-promotion scan path so secrets and sensitive tokens do not enter durable semantic memory.
+- Implement source-custody and pre-promotion scan paths so secrets and sensitive tokens do not enter the brain or durable semantic memory.
 - Quarantine sensitive candidate content.
 - Store safe provenance that something was redacted without exposing the secret itself.
 - Add tests for fake API keys and credentials.
@@ -308,7 +308,7 @@ Provide a usable CLI or repo-native command surface for at least:
 - init/bootstrap brain,
 - detect scope,
 - add topic,
-- ingest current thread/context,
+- ingest source/current thread/context,
 - reflect,
 - review list/show/approve/reject,
 - build indexes,
@@ -316,8 +316,15 @@ Provide a usable CLI or repo-native command surface for at least:
 - export OKF,
 - export Knowledge Catalog,
 - run secret scan,
-- stats/doctor,
+- stats/doctor/lint,
 - migrate.
+
+Reference CLI baseline for this repository:
+- The minimal Bash reference CLI currently provides `doctor`, `stats`, `ingest-source`, and `lint`.
+- `ingest-source` must require an explicit project id, copy the source into that project, write a content hash sidecar, record an append-only episode, create a review item, append an audit log entry, and block likely secrets before custody.
+- `lint` must check project structure, source hash sidecars, and unresolved wikilinks. It should resolve mirror-project wikilinks through the project registry source root where available.
+- Pending review items are governance backlog, not lint warnings by default. Report them as informational unless a specific release policy makes backlog itself a blocker.
+- Keep this baseline tiny. Add richer commands only when they close a real workflow gap.
 
 Implementation details and defaults:
 - Prefer OKF for semantic memory.
