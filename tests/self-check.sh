@@ -60,6 +60,17 @@ case "$ingest_output" in
   *) printf 'ingest failed: %s\n' "$ingest_output" >&2; exit 1 ;;
 esac
 
+map_output="$("$repo_root/bin/llm-brain" map proj_demo "$fixture")"
+case "$map_output" in
+  *"map=ok"*"project=proj_demo"*"INDEX.md"*) ;;
+  *) printf 'map failed: %s\n' "$map_output" >&2; exit 1 ;;
+esac
+
+case "$(cat "$fixture/projects/proj_demo/INDEX.md")" in
+  *"## Folder Map"*"## Canonical Files"*"## Where To Go"*"okf/index.md"*) ;;
+  *) printf 'map file missing expected sections\n' >&2; exit 1 ;;
+esac
+
 lint_output="$("$repo_root/bin/llm-brain" lint "$fixture")"
 case "$lint_output" in
   *"errors=0"*"warnings=0"*) ;;

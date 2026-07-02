@@ -12,6 +12,7 @@ Commands:
   doctor [root]                               Check the filesystem-first brain root
   stats [root]                                Count projects, episodes, concepts, claims, and review items
   ingest-source <project-id> <source> [root]  Copy a source, record an episode, and open review
+  map <project-id> [root]                     Build/update a project-level INDEX.md
   lint [root]                                 Check source hashes, links, and review backlog
   help                                        Show this help
 
@@ -117,6 +118,31 @@ stats() {
     "$root" "$projects" "$episodes" "$concepts" "$claims" "$review_items"
 }
 
+project_path() {
+  local root="$1"
+  local project_id="$2"
+
+  printf '%s/projects/%s\n' "$root" "$project_id"
+}
+
+require_project() {
+  local project_id="$1"
+  local root="$2"
+  local project
+  project="$(project_path "$root" "$project_id")"
+
+  if [ "$project_id" = "" ]; then
+    printf 'missing project id\n' >&2
+    return 64
+  fi
+  if [ ! -d "$project" ]; then
+    printf 'missing-project project=%s root=%s\n' "$project_id" "$root" >&2
+    return 66
+  fi
+
+  printf '%s\n' "$project"
+}
+
 ingest_source() {
   local project_id="${1:-}"
   local source="${2:-}"
@@ -132,11 +158,8 @@ ingest_source() {
     return 66
   fi
 
-  local project="$root/projects/$project_id"
-  if [ ! -d "$project" ]; then
-    printf 'ingest-source=missing-project project=%s root=%s\n' "$project_id" "$root" >&2
-    return 66
-  fi
+  local project
+  project="$(require_project "$project_id" "$root")"
 
   secret_scan_source "$source"
 
@@ -203,6 +226,89 @@ REVIEW
 
   printf 'ingest-source=ok project=%s source=%s source_hash=%s episode=%s review=%s\n' \
     "$project_id" "$dest" "$source_hash" "$episode" "$review_file"
+}
+
+folder_purpose() {
+  case "$1" in
+    okf) printf 'Canonical semantic memory and project/topic indexes' ;;
+    episodes) printf 'Append-only provenance and work-session records' ;;
+    review) printf 'Proposed claims, procedures, conflicts, and redaction decisions' ;;
+    sources) printf 'Copied source custody with hash sidecars' ;;
+    indexes) printf 'Derived lexical, vector-hash, and graph lookup surfaces' ;;
+    context-packs) printf 'Task- and agent-specific derived context packs' ;;
+    adapters) printf 'Generated agent-facing guidance' ;;
+    exports) printf 'Derived export formats' ;;
+    migrations) printf 'Schema and structure migrations' ;;
+    claims) printf 'Durable claim files, when this project stores them outside OKF' ;;
+    concepts) printf 'Durable concept files, when this project stores them outside OKF' ;;
+    procedures) printf 'Reusable procedure files, when this project stores them outside OKF' ;;
+    *) printf 'Project folder' ;;
+  esac
+}
+
+write_project_map() {
+  local project_id="${1:-}"
+  local root
+  root="$(brain_root "${2:-}")"
+  local project
+  project="$(require_project "$project_id" "$root")"
+
+  local map_file="$project/INDEX.md"
+  local timestamp source_root
+  timestamp="$(now_utc)"
+  source_root="$(project_source_root "$root" "$project_id")"
+
+  {
+    printf '# %s Index\n\n' "$project_id"
+    printf 'Generated: %s\n\n' "$timestamp"
+    printf 'This map is the first stop for agents navigating this LLM-Brain project. It points to active project folders and canonical files without replacing reviewed semantic memory.\n\n'
+
+    printf '## Folder Map\n\n'
+    printf '| Folder | Purpose |\n'
+    printf '|---|---|\n'
+
+    local dir base
+    for dir in "$project"/*; do
+      [ -d "$dir" ] || continue
+      base="$(basename "$dir")"
+      case "$base" in
+        archive|archived|06.Archived|Archived) continue ;;
+      esac
+      printf '| `%s/` | %s |\n' "$base" "$(folder_purpose "$base")"
+    done
+
+    printf '\n## Canonical Files\n\n'
+    printf '| File | Purpose |\n'
+    printf '|---|---|\n'
+    [ -f "$project/okf/index.md" ] && printf '| `okf/index.md` | Canonical project/topic semantic index |\n'
+    [ -f "$project/okf/log.md" ] && printf '| `okf/log.md` | Canonical semantic update log |\n'
+    [ -f "$project/audit.log" ] && printf '| `audit.log` | Append-only operational audit log |\n'
+    [ -f "$project/schema.version" ] && printf '| `schema.version` | Brain schema marker |\n'
+    [ "$source_root" != "" ] && printf '| `%s` | Registered source root |\n' "$source_root"
+
+    printf '\n## Where To Go\n\n'
+    if [ -f "$project/okf/index.md" ]; then
+      printf -- '- Start with `okf/index.md` for reviewed project knowledge.\n'
+    fi
+    if [ -d "$project/review" ]; then
+      printf -- '- Use `review/` for proposed knowledge that still needs human or governance review.\n'
+    fi
+    if [ -d "$project/sources" ]; then
+      printf -- '- Use `sources/` for raw source custody and hash sidecars.\n'
+    fi
+    if [ -d "$project/episodes" ]; then
+      printf -- '- Use `episodes/` for provenance, not canonical truth.\n'
+    fi
+    printf -- '- Do not treat generated maps, indexes, context packs, exports, or adapters as the semantic source of truth.\n'
+
+    if find "$project" -maxdepth 1 -type d \( -iname 'archive' -o -iname 'archived' -o -name '06.Archived' \) -print -quit 2>/dev/null | grep -q .; then
+      printf '\n## Archive Rule\n\n'
+      printf 'Archived folders are historical. Do not search them by default unless the task asks for history or superseded material.\n'
+    fi
+  } >"$map_file"
+
+  printf '%s\tmap project=%s file=%s\n' "$timestamp" "$project_id" "$map_file" >>"$project/audit.log"
+  printf 'map=ok project=%s file=%s\n' "$project_id" "$map_file"
 }
 
 LINT_ERRORS=0
@@ -362,6 +468,10 @@ case "${1:-help}" in
   ingest-source)
     shift
     ingest_source "${1:-}" "${2:-}" "${3:-}"
+    ;;
+  map)
+    shift
+    write_project_map "${1:-}" "${2:-}"
     ;;
   lint)
     shift

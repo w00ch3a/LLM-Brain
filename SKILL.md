@@ -316,12 +316,13 @@ Provide a usable CLI or repo-native command surface for at least:
 - export OKF,
 - export Knowledge Catalog,
 - run secret scan,
-- stats/doctor/lint,
+- stats/doctor/map/lint,
 - migrate.
 
 Reference CLI baseline for this repository:
-- The minimal Bash reference CLI currently provides `doctor`, `stats`, `ingest-source`, and `lint`.
+- The minimal Bash reference CLI currently provides `doctor`, `stats`, `ingest-source`, `map`, and `lint`.
 - `ingest-source` must require an explicit project id, copy the source into that project, write a content hash sidecar, record an append-only episode, create a review item, append an audit log entry, and block likely secrets before custody.
+- `map` must require an explicit project id and generate one project-level `INDEX.md` listing active folders, canonical files, and starting points. Do not create recursive index files for every subfolder unless measured navigation failures justify it.
 - `lint` must check project structure, source hash sidecars, and unresolved wikilinks. It should resolve mirror-project wikilinks through the project registry source root where available.
 - Pending review items are governance backlog, not lint warnings by default. Report them as informational unless a specific release policy makes backlog itself a blocker.
 - Keep this baseline tiny. Add richer commands only when they close a real workflow gap.

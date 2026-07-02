@@ -138,6 +138,7 @@ Use this repository as the source skill/specification for an agent that supports
 bin/llm-brain doctor
 bin/llm-brain stats
 bin/llm-brain ingest-source <project-id> /path/to/source.md
+bin/llm-brain map <project-id>
 bin/llm-brain lint
 ```
 
@@ -147,10 +148,13 @@ By default the CLI reads `/Volumes/home/Vaults/llm-brain`. Override that with an
 bin/llm-brain doctor /path/to/llm-brain
 LLM_BRAIN_ROOT=/path/to/llm-brain bin/llm-brain stats
 bin/llm-brain ingest-source <project-id> /path/to/source.md /path/to/llm-brain
+bin/llm-brain map <project-id> /path/to/llm-brain
 bin/llm-brain lint /path/to/llm-brain
 ```
 
 `ingest-source` requires an explicit project id. It copies the source into that project, records an append-only episode, opens a review item, writes a source hash sidecar, and blocks likely secrets before custody.
+
+`map` requires an explicit project id. It writes a project-level `INDEX.md` that lists active folders, canonical files, and where an agent should start. It deliberately does not create recursive indexes for every subfolder.
 
 `lint` checks project structure, source hash sidecars, and unresolved wikilinks, including links that resolve through the project's registered source root. Pending review items are reported as informational backlog, not warnings.
 
@@ -185,7 +189,7 @@ Use LLM-Brain to build a Codex context pack for the current migration task.
 
 ## Current Status
 
-This repository now ships a tiny Bash reference implementation with `doctor`, `stats`, `ingest-source`, and `lint`. It is deliberately a sidecar, not a framework.
+This repository now ships a tiny Bash reference implementation with `doctor`, `stats`, `ingest-source`, `map`, and `lint`. It is deliberately a sidecar, not a framework.
 
 The skill is intentionally stack-neutral: when used inside another repository, it should reuse that repository's language, tooling, tests, and conventions instead of forcing a new runtime.
 
