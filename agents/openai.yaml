@@ -1,0 +1,5 @@
+interface:
+  display_name: "LLM-Brain"
+  short_description: "Filesystem-first memory for coding agents"
+  brand_color: "#1557D4"
+  default_prompt: "Use $llm-brain to bootstrap durable project memory for this repo."

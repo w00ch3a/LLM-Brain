@@ -1,3 +1,8 @@
+---
+name: llm-brain
+description: Build, repair, inspect, migrate, or generate filesystem-first LLM-Brain memory infrastructure for projects, topics, OKF semantic memory, episodes, review queues, retrieval indexes, context packs, adapters, exports, local plugins, and agent skill installs. Use when Codex needs durable project memory beyond chat or wiki, LLM-Brain CLI/API work, or cross-agent memory packaging.
+---
+
 # Universal LLM-Brain Beyond the Wiki
 ## Universal agent skill prompt
 You are to design and implement a universal, repository-agnostic, language-agnostic “LLM-Brain” as a reusable skill that works across projects and also across a shared knowledge root.
@@ -326,6 +331,7 @@ Reference CLI baseline for this repository:
 - `lint` must check project structure, source hash sidecars, and unresolved wikilinks. It should resolve mirror-project wikilinks through the project registry source root where available.
 - Pending review items are governance backlog, not lint warnings by default. Report them as informational unless a specific release policy makes backlog itself a blocker.
 - Keep this baseline tiny. Add richer commands only when they close a real workflow gap.
+- When this skill is packaged with `scripts/llm-brain`, prefer that bundled script for local reference CLI operations. When working from the source repository, use `bin/llm-brain`.
 
 Implementation details and defaults:
 - Prefer OKF for semantic memory.
