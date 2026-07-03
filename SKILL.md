@@ -332,6 +332,7 @@ Reference CLI baseline for this repository:
 - Pending review items are governance backlog, not lint warnings by default. Report them as informational unless a specific release policy makes backlog itself a blocker.
 - Keep this baseline tiny. Add richer commands only when they close a real workflow gap.
 - When this skill is packaged with `scripts/llm-brain`, prefer that bundled script for local reference CLI operations. When working from the source repository, use `bin/llm-brain`.
+- Use `scripts/package-ai-skill.sh` to build release artifacts for both direct skill installs and Codex plugin installs.
 
 Implementation details and defaults:
 - Prefer OKF for semantic memory.

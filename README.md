@@ -8,6 +8,59 @@ It is not a larger prompt, a transcript archive, or a prettier wiki. The goal is
 
 The repository contains the reusable skill prompt in [`SKILL.md`](SKILL.md) plus a minimal filesystem-first reference CLI in [`bin/llm-brain`](bin/llm-brain).
 
+## AI Skill Packages
+
+LLM-Brain can be shipped two ways:
+
+- a direct skill package for agents that load `SKILL.md` folders,
+- a Codex plugin package with `.codex-plugin/plugin.json`, UI metadata, the `llm-brain` skill, and the bundled reference CLI.
+
+Build both release artifacts with:
+
+```bash
+scripts/package-ai-skill.sh
+```
+
+The command writes:
+
+```text
+dist/llm-brain-skill-<version>.tar.gz
+dist/llm-brain-skill-<version>.tar.gz.sha256
+dist/llm-brain-plugin-<version>.tar.gz
+dist/llm-brain-plugin-<version>.tar.gz.sha256
+```
+
+The direct skill archive expands to:
+
+```text
+llm-brain/
+  SKILL.md
+  agents/openai.yaml
+  scripts/llm-brain
+```
+
+The Codex plugin archive expands to:
+
+```text
+llm-brain/
+  .codex-plugin/plugin.json
+  LICENSE
+  skills/llm-brain/
+    SKILL.md
+    agents/openai.yaml
+    scripts/llm-brain
+```
+
+For a direct local skill install, extract the skill archive into the agent's skill root, for example `~/.codex/skills/`.
+
+For a Codex personal plugin install, extract the plugin archive into `~/plugins/llm-brain`, make sure the personal marketplace entry points at `./plugins/llm-brain`, then run:
+
+```bash
+codex plugin add llm-brain@personal
+```
+
+Release artifacts are generated output and are not committed. Rebuild them from source when cutting a new release.
+
 ## What It Does
 
 LLM-Brain guides an agent to add a filesystem-first memory layer to any project.
