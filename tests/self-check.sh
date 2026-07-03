@@ -67,8 +67,53 @@ case "$map_output" in
 esac
 
 case "$(cat "$fixture/projects/proj_demo/INDEX.md")" in
-  *"## Folder Map"*"## Canonical Files"*"## Where To Go"*"okf/index.md"*) ;;
+  *"llm-brain:generated-map"*"## Folder Map"*"## Canonical Files"*"## Where To Go"*"okf/index.md"*) ;;
   *) printf 'map file missing expected sections\n' >&2; exit 1 ;;
+esac
+
+if grep -Fq "$external_root" "$fixture/projects/proj_demo/INDEX.md"; then
+  printf 'map leaked registered source root path\n' >&2
+  exit 1
+fi
+
+map_second_output="$("$repo_root/bin/llm-brain" map proj_demo "$fixture")"
+case "$map_second_output" in
+  *"map=ok"*"project=proj_demo"*"INDEX.md"*) ;;
+  *) printf 'second generated map failed: %s\n' "$map_second_output" >&2; exit 1 ;;
+esac
+
+if "$repo_root/bin/llm-brain" map ../escape "$fixture" >"$fixture/invalid-project.out" 2>&1; then
+  printf 'invalid project id unexpectedly passed\n' >&2
+  exit 1
+fi
+
+case "$(cat "$fixture/invalid-project.out")" in
+  *"invalid-project-id"*) ;;
+  *) printf 'invalid project id did not report validation failure\n' >&2; exit 1 ;;
+esac
+
+mkdir -p "$fixture/projects/proj_human/okf"
+: >"$fixture/projects/proj_human/audit.log"
+cat >"$fixture/projects/proj_human/okf/index.md" <<'HUMAN_OKF'
+# Human OKF Index
+HUMAN_OKF
+cat >"$fixture/projects/proj_human/INDEX.md" <<'HUMAN_INDEX'
+# Human Index
+HUMAN_INDEX
+
+if "$repo_root/bin/llm-brain" map proj_human "$fixture" >"$fixture/human-index.out" 2>&1; then
+  printf 'human INDEX overwrite unexpectedly passed\n' >&2
+  exit 1
+fi
+
+case "$(cat "$fixture/human-index.out")" in
+  *"map=refuse-existing-index"*) ;;
+  *) printf 'human INDEX refusal did not report expected error\n' >&2; exit 1 ;;
+esac
+
+case "$(cat "$fixture/projects/proj_human/INDEX.md")" in
+  "# Human Index") ;;
+  *) printf 'human INDEX was changed\n' >&2; exit 1 ;;
 esac
 
 lint_output="$("$repo_root/bin/llm-brain" lint "$fixture")"

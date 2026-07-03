@@ -3,6 +3,7 @@ set -euo pipefail
 
 VERSION="0.1.0"
 DEFAULT_ROOT="${LLM_BRAIN_ROOT:-/Volumes/home/Vaults/llm-brain}"
+GENERATED_MAP_MARKER="<!-- llm-brain:generated-map -->"
 
 usage() {
   cat <<'USAGE'
@@ -125,16 +126,30 @@ project_path() {
   printf '%s/projects/%s\n' "$root" "$project_id"
 }
 
-require_project() {
+validate_project_id() {
   local project_id="$1"
-  local root="$2"
-  local project
-  project="$(project_path "$root" "$project_id")"
 
   if [ "$project_id" = "" ]; then
     printf 'missing project id\n' >&2
     return 64
   fi
+
+  case "$project_id" in
+    .|..|*..*|*/*|*[!A-Za-z0-9._-]*)
+      printf 'invalid-project-id project=%s\n' "$project_id" >&2
+      return 64
+      ;;
+  esac
+}
+
+require_project() {
+  local project_id="$1"
+  local root="$2"
+  local project
+
+  validate_project_id "$project_id" || return $?
+  project="$(project_path "$root" "$project_id")"
+
   if [ ! -d "$project" ]; then
     printf 'missing-project project=%s root=%s\n' "$project_id" "$root" >&2
     return 66
@@ -258,8 +273,14 @@ write_project_map() {
   timestamp="$(now_utc)"
   source_root="$(project_source_root "$root" "$project_id")"
 
+  if [ -f "$map_file" ] && ! grep -Fq "$GENERATED_MAP_MARKER" "$map_file"; then
+    printf 'map=refuse-existing-index project=%s file=%s\n' "$project_id" "$map_file" >&2
+    return 73
+  fi
+
   {
     printf '# %s Index\n\n' "$project_id"
+    printf '%s\n\n' "$GENERATED_MAP_MARKER"
     printf 'Generated: %s\n\n' "$timestamp"
     printf 'This map is the first stop for agents navigating this LLM-Brain project. It points to active project folders and canonical files without replacing reviewed semantic memory.\n\n'
 
@@ -274,30 +295,30 @@ write_project_map() {
       case "$base" in
         archive|archived|06.Archived|Archived) continue ;;
       esac
-      printf '| `%s/` | %s |\n' "$base" "$(folder_purpose "$base")"
+      printf "| \`%s/\` | %s |\n" "$base" "$(folder_purpose "$base")"
     done
 
     printf '\n## Canonical Files\n\n'
     printf '| File | Purpose |\n'
     printf '|---|---|\n'
-    [ -f "$project/okf/index.md" ] && printf '| `okf/index.md` | Canonical project/topic semantic index |\n'
-    [ -f "$project/okf/log.md" ] && printf '| `okf/log.md` | Canonical semantic update log |\n'
-    [ -f "$project/audit.log" ] && printf '| `audit.log` | Append-only operational audit log |\n'
-    [ -f "$project/schema.version" ] && printf '| `schema.version` | Brain schema marker |\n'
-    [ "$source_root" != "" ] && printf '| `%s` | Registered source root |\n' "$source_root"
+    [ -f "$project/okf/index.md" ] && printf "| \`okf/index.md\` | Canonical project/topic semantic index |\n"
+    [ -f "$project/okf/log.md" ] && printf "| \`okf/log.md\` | Canonical semantic update log |\n"
+    [ -f "$project/audit.log" ] && printf "| \`audit.log\` | Append-only operational audit log |\n"
+    [ -f "$project/schema.version" ] && printf "| \`schema.version\` | Brain schema marker |\n"
+    [ "$source_root" != "" ] && printf "| \`registry source root\` | Registered source root path is redacted in this generated map |\n"
 
     printf '\n## Where To Go\n\n'
     if [ -f "$project/okf/index.md" ]; then
-      printf -- '- Start with `okf/index.md` for reviewed project knowledge.\n'
+      printf -- "- Start with \`okf/index.md\` for reviewed project knowledge.\n"
     fi
     if [ -d "$project/review" ]; then
-      printf -- '- Use `review/` for proposed knowledge that still needs human or governance review.\n'
+      printf -- "- Use \`review/\` for proposed knowledge that still needs human or governance review.\n"
     fi
     if [ -d "$project/sources" ]; then
-      printf -- '- Use `sources/` for raw source custody and hash sidecars.\n'
+      printf -- "- Use \`sources/\` for raw source custody and hash sidecars.\n"
     fi
     if [ -d "$project/episodes" ]; then
-      printf -- '- Use `episodes/` for provenance, not canonical truth.\n'
+      printf -- "- Use \`episodes/\` for provenance, not canonical truth.\n"
     fi
     printf -- '- Do not treat generated maps, indexes, context packs, exports, or adapters as the semantic source of truth.\n'
 

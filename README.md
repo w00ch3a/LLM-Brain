@@ -154,7 +154,7 @@ bin/llm-brain lint /path/to/llm-brain
 
 `ingest-source` requires an explicit project id. It copies the source into that project, records an append-only episode, opens a review item, writes a source hash sidecar, and blocks likely secrets before custody.
 
-`map` requires an explicit project id. It writes a project-level `INDEX.md` that lists active folders, canonical files, and where an agent should start. It deliberately does not create recursive indexes for every subfolder.
+`map` requires an explicit project id. It writes a project-level `INDEX.md` that lists active folders, canonical files, and where an agent should start. It deliberately does not create recursive indexes for every subfolder. Generated maps include a `llm-brain:generated-map` marker, refuse to overwrite a human-authored `INDEX.md`, and redact registered source-root paths.
 
 `lint` checks project structure, source hash sidecars, and unresolved wikilinks, including links that resolve through the project's registered source root. Pending review items are reported as informational backlog, not warnings.
 
