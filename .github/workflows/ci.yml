@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runtime checks
+        run: |
+          bash -n bin/llm-brain
+          bash -n tests/self-check.sh
+          bash -n tests/v2-self-check.sh
+          tests/self-check.sh
+          tests/v2-self-check.sh
+          scripts/package-ai-skill.sh
+      - name: Diff check
+        run: git diff --check
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck bin/llm-brain scripts/package-ai-skill.sh tests/*.sh

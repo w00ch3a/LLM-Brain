@@ -1,7 +1,7 @@
 {
   "name": "llm-brain",
-  "version": "0.1.0",
-  "description": "Filesystem-first durable memory and knowledge workflow specification for LLM agents.",
+  "version": "0.2.0",
+  "description": "Filesystem-first, provider-assisted durable memory lifecycle for coding agents.",
   "author": {
     "name": "LLM-Brain Maintainers",
     "url": "https://github.com/w00ch3a"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "LLM-Brain",
     "shortDescription": "Filesystem-first memory for coding agents.",
-    "longDescription": "LLM-Brain provides a filesystem-first memory workflow for agents across repositories, with OKF semantic memory, append-only episodes, review queues, provenance, indexes, context packs, and adapter guidance.",
+    "longDescription": "LLM-Brain captures source custody, lets an explicit local provider propose memory, automatically promotes only policy-safe candidates, and builds inspectable OKF retrieval and context packs.",
     "developerName": "LLM-Brain Maintainers",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +30,7 @@
     ],
     "websiteURL": "https://github.com/w00ch3a/LLM-Brain",
     "defaultPrompt": [
-      "Use LLM-Brain to create a project memory with claims and reviews.",
+      "Use LLM-Brain to create a filesystem-first project memory with safe automatic promotion.",
       "Use LLM-Brain to bootstrap a new topic brain for this repo.",
       "Use LLM-Brain to generate a project pack for this task."
     ],

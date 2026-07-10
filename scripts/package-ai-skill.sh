@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
+# Build-only helper. Python is intentionally not a runtime dependency.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin_name="llm-brain"
-version="${1:-}"
+version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
+requested_version="${1:-$version}"
+
+[ "$requested_version" = "$version" ] || { printf 'package: VERSION is authoritative (%s)\n' "$version" >&2; exit 64; }
+case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) printf 'package: invalid SemVer in VERSION\n' >&2; exit 65 ;; esac
 
 manifest="$repo_root/.codex-plugin/plugin.json"
-if [ "$version" = "" ]; then
-  version="$(python3 - "$manifest" <<'PY'
+manifest_version="$(python3 - "$manifest" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -15,60 +19,132 @@ from pathlib import Path
 print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["version"])
 PY
 )"
-fi
+[ "$manifest_version" = "$version" ] || { printf 'package: plugin version (%s) does not match VERSION (%s)\n' "$manifest_version" "$version" >&2; exit 65; }
+
+bash -n "$repo_root/bin/llm-brain"
+bash -n "$repo_root/tests/self-check.sh"
+bash -n "$repo_root/tests/v2-self-check.sh"
 
 dist_dir="$repo_root/dist"
-skill_parent="$dist_dir/skill"
-plugin_parent="$dist_dir/plugin"
-skill_stage="$skill_parent/$plugin_name"
-plugin_stage="$plugin_parent/$plugin_name"
+stage_root="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-package.XXXXXX")"
+trap 'rm -rf "$stage_root"' EXIT
+skill_stage="$stage_root/skill/$plugin_name"
+plugin_stage="$stage_root/plugin/$plugin_name"
 
-rm -rf "$skill_parent" "$plugin_parent"
 mkdir -p \
   "$skill_stage/agents" \
+  "$skill_stage/references" \
   "$skill_stage/scripts" \
   "$plugin_stage/.codex-plugin" \
   "$plugin_stage/skills/$plugin_name/agents" \
+  "$plugin_stage/skills/$plugin_name/references" \
   "$plugin_stage/skills/$plugin_name/scripts"
 
-python3 - "$manifest" "$plugin_stage/.codex-plugin/plugin.json" "$version" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-source = Path(sys.argv[1])
-target = Path(sys.argv[2])
-version = sys.argv[3]
-
-payload = json.loads(source.read_text(encoding="utf-8"))
-payload["version"] = version
-target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
-
+install -m 0644 "$repo_root/LICENSE" "$skill_stage/LICENSE"
+install -m 0644 "$repo_root/VERSION" "$skill_stage/VERSION"
 install -m 0644 "$repo_root/SKILL.md" "$skill_stage/SKILL.md"
 install -m 0644 "$repo_root/agents/openai.yaml" "$skill_stage/agents/openai.yaml"
+install -m 0644 "$repo_root/references/architecture.md" "$skill_stage/references/architecture.md"
 install -m 0755 "$repo_root/bin/llm-brain" "$skill_stage/scripts/llm-brain"
 
 install -m 0644 "$repo_root/LICENSE" "$plugin_stage/LICENSE"
+install -m 0644 "$repo_root/VERSION" "$plugin_stage/VERSION"
+install -m 0644 "$manifest" "$plugin_stage/.codex-plugin/plugin.json"
 install -m 0644 "$repo_root/SKILL.md" "$plugin_stage/skills/$plugin_name/SKILL.md"
 install -m 0644 "$repo_root/agents/openai.yaml" "$plugin_stage/skills/$plugin_name/agents/openai.yaml"
+install -m 0644 "$repo_root/references/architecture.md" "$plugin_stage/skills/$plugin_name/references/architecture.md"
 install -m 0755 "$repo_root/bin/llm-brain" "$plugin_stage/skills/$plugin_name/scripts/llm-brain"
 
 bash -n "$skill_stage/scripts/llm-brain"
 bash -n "$plugin_stage/skills/$plugin_name/scripts/llm-brain"
 
-skill_archive="$dist_dir/${plugin_name}-skill-${version}.tar.gz"
-plugin_archive="$dist_dir/${plugin_name}-plugin-${version}.tar.gz"
-rm -f "$skill_archive" "$plugin_archive" "$skill_archive.sha256" "$plugin_archive.sha256"
+mkdir -p "$dist_dir"
+python3 - "$stage_root" "$dist_dir" "$plugin_name" "$version" <<'PY'
+import gzip
+import io
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
 
-tar -czf "$skill_archive" -C "$skill_parent" "$plugin_name"
-tar -czf "$plugin_archive" -C "$plugin_parent" "$plugin_name"
+stage_root = Path(sys.argv[1])
+dist_dir = Path(sys.argv[2])
+name = sys.argv[3]
+version = sys.argv[4]
 
-(
-  cd "$dist_dir"
-  shasum -a 256 "$(basename "$skill_archive")" >"$(basename "$skill_archive").sha256"
-  shasum -a 256 "$(basename "$plugin_archive")" >"$(basename "$plugin_archive").sha256"
-)
+def members(root: Path):
+    entries = [root]
+    entries.extend(sorted(root.rglob("*"), key=lambda p: p.relative_to(root.parent).as_posix()))
+    return entries
 
-printf 'package=ok type=skill file=%s\n' "$skill_archive"
-printf 'package=ok type=plugin file=%s\n' "$plugin_archive"
+def safe_member(name: str) -> bool:
+    path = PurePosixPath(name)
+    return not path.is_absolute() and ".." not in path.parts and name and not name.startswith("./")
+
+def build(root: Path, destination: Path):
+    with destination.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped:
+            with tarfile.open(mode="w", fileobj=zipped, format=tarfile.PAX_FORMAT) as archive:
+                for source in members(root):
+                    arcname = source.relative_to(root.parent).as_posix()
+                    if not safe_member(arcname):
+                        raise ValueError(f"unsafe archive member: {arcname}")
+                    info = archive.gettarinfo(str(source), arcname)
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    info.mtime = 0
+                    if info.isfile():
+                        info.mode = 0o755 if os.access(source, os.X_OK) else 0o644
+                        with source.open("rb") as handle:
+                            archive.addfile(info, handle)
+                    elif info.isdir():
+                        info.mode = 0o755
+                        archive.addfile(info)
+                    else:
+                        raise ValueError(f"unexpected archive member type: {source}")
+
+def verify(archive_path: Path, expected_root: str, cli_member: str):
+    with tarfile.open(archive_path, "r:gz") as archive:
+        names = archive.getnames()
+        if not names or any(not safe_member(item) for item in names):
+            raise ValueError("unsafe archive layout")
+        if any(not (item == expected_root or item.startswith(expected_root + "/")) for item in names):
+            raise ValueError("unexpected archive root")
+        required = {f"{expected_root}/LICENSE", f"{expected_root}/VERSION", cli_member}
+        if not required.issubset(names):
+            raise ValueError("archive misses required release files")
+        with tempfile.TemporaryDirectory(prefix="llm-brain-verify-") as temp:
+            archive.extractall(temp)
+            extracted = Path(temp) / expected_root / cli_member.removeprefix(expected_root + "/")
+            if not extracted.is_file():
+                raise ValueError("packaged CLI missing after extraction")
+            os.chmod(extracted, 0o755)
+            observed = subprocess.check_output([str(extracted), "--version"], text=True).strip()
+            if observed != version:
+                raise ValueError(f"packaged CLI version mismatch: {observed}")
+            subprocess.run([str(extracted), "help"], check=True, stdout=subprocess.DEVNULL)
+
+targets = [
+    (stage_root / "skill" / name, dist_dir / f"{name}-skill-{version}.tar.gz", f"{name}/scripts/llm-brain"),
+    (stage_root / "plugin" / name, dist_dir / f"{name}-plugin-{version}.tar.gz", f"{name}/skills/{name}/scripts/llm-brain"),
+]
+for root, destination, cli_member in targets:
+    first = destination.with_suffix(destination.suffix + ".first")
+    second = destination.with_suffix(destination.suffix + ".second")
+    build(root, first)
+    build(root, second)
+    if first.read_bytes() != second.read_bytes():
+        raise ValueError(f"non-reproducible archive: {destination.name}")
+    first.replace(destination)
+    second.unlink()
+    verify(destination, name, cli_member)
+    digest = __import__("hashlib").sha256(destination.read_bytes()).hexdigest()
+    destination.with_suffix(destination.suffix + ".sha256").write_text(f"{digest}  {destination.name}\n", encoding="utf-8")
+PY
+
+printf 'package=ok type=skill file=%s\n' "$dist_dir/${plugin_name}-skill-${version}.tar.gz"
+printf 'package=ok type=plugin file=%s\n' "$dist_dir/${plugin_name}-plugin-${version}.tar.gz"
