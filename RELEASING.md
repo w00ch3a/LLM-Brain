@@ -1,6 +1,6 @@
 # Releasing LLM-Brain
 
-`VERSION` is the only package-version authority. The plugin manifest must match it. Storage schema is independent and lives in project `schema.version` files.
+`VERSION` is the only package-version authority. Storage schema is independent and lives in project `schema.version` files.
 
 ## Local release gate
 
@@ -35,4 +35,4 @@ bin/llm-brain --root /Volumes/home/Vaults/llm-brain lint
 
 ## External publication
 
-Commit, push, tag, create a GitHub release, publish an archive or reinstall a plugin only with explicit authority. After publication, download or extract the published artefact and repeat the packaged CLI check in a fresh task.
+Commit, push, tag or publish an archive only with explicit authority. After publication, download or extract the published artefact and repeat the packaged CLI check in a fresh task.

@@ -1,5 +1,0 @@
-interface:
-  display_name: "LLM-Brain"
-  short_description: "Filesystem-first durable memory for coding agents"
-  brand_color: "#1557D4"
-  default_prompt: "Use $llm-brain to inspect this project and create only the authorised durable memory needed for the task."

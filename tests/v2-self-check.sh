@@ -14,7 +14,7 @@ repo="$fixture/repo"
 vault="$fixture/vault"
 mkdir -p "$repo" "$vault"
 git -C "$repo" init -q
-git -C "$repo" remote add origin https://github.com/example/brain-demo.git
+git -C "$repo" remote add origin https://example.invalid/brain-demo.git
 
 project_output="$($cli --root "$vault" project ensure "$repo")"
 project_id="$(printf '%s\n' "$project_output" | sed -n 's/.*project_id=\([^ ]*\).*/\1/p')"
@@ -64,7 +64,7 @@ claim_id="$(printf '%s\n' "$promotion" | sed -n 's/.*canonical=.*\/\([^/]*\)\.md
 search="$($cli --root "$vault" search "$project_id" 'durable memory')"
 assert_contains "$search" "$claim_id"
 
-pack="$($cli --root "$vault" pack build "$project_id" --agent codex --task 'durable memory' --budget-tokens 200)"
+pack="$($cli --root "$vault" pack build "$project_id" --agent generic --task 'durable memory' --budget-tokens 200)"
 pack_file="$(printf '%s\n' "$pack" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 assert_file "$pack_file"
 grep -Fq 'The project stores durable memory' "$pack_file" || fail "pack lacks selected memory"
@@ -156,8 +156,8 @@ $cli --root "$vault" retract "$project_id" "$claim_id" --reason 'fixture retract
 search_after="$($cli --root "$vault" search "$project_id" 'durable memory')"
 if printf '%s\n' "$search_after" | grep -Fq "$claim_id"; then fail "retracted claim remained searchable"; fi
 
-$cli --root "$vault" adapters build "$project_id" --agent codex >/dev/null
-assert_file "$vault/projects/$project_id/adapters/codex.md"
+$cli --root "$vault" adapters build "$project_id" --agent generic >/dev/null
+assert_file "$vault/projects/$project_id/adapters/generic.md"
 catalog="$($cli --root "$vault" export knowledge-catalog "$project_id")"
 catalog_path="$(printf '%s\n' "$catalog" | sed -n 's/.*path=\([^ ]*\).*/\1/p')"
 assert_file "$catalog_path/manifest.tsv"

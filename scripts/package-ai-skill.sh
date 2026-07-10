@@ -3,23 +3,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-plugin_name="llm-brain"
+package_name="llm-brain"
 version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
 requested_version="${1:-$version}"
 
 [ "$requested_version" = "$version" ] || { printf 'package: VERSION is authoritative (%s)\n' "$version" >&2; exit 64; }
 case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) printf 'package: invalid SemVer in VERSION\n' >&2; exit 65 ;; esac
-
-manifest="$repo_root/.codex-plugin/plugin.json"
-manifest_version="$(python3 - "$manifest" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["version"])
-PY
-)"
-[ "$manifest_version" = "$version" ] || { printf 'package: plugin version (%s) does not match VERSION (%s)\n' "$manifest_version" "$version" >&2; exit 65; }
 
 bash -n "$repo_root/bin/llm-brain"
 bash -n "$repo_root/tests/self-check.sh"
@@ -28,38 +17,22 @@ bash -n "$repo_root/tests/v2-self-check.sh"
 dist_dir="$repo_root/dist"
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-package.XXXXXX")"
 trap 'rm -rf "$stage_root"' EXIT
-skill_stage="$stage_root/skill/$plugin_name"
-plugin_stage="$stage_root/plugin/$plugin_name"
+skill_stage="$stage_root/skill/$package_name"
 
 mkdir -p \
-  "$skill_stage/agents" \
   "$skill_stage/references" \
-  "$skill_stage/scripts" \
-  "$plugin_stage/.codex-plugin" \
-  "$plugin_stage/skills/$plugin_name/agents" \
-  "$plugin_stage/skills/$plugin_name/references" \
-  "$plugin_stage/skills/$plugin_name/scripts"
+  "$skill_stage/scripts"
 
 install -m 0644 "$repo_root/LICENSE" "$skill_stage/LICENSE"
 install -m 0644 "$repo_root/VERSION" "$skill_stage/VERSION"
 install -m 0644 "$repo_root/SKILL.md" "$skill_stage/SKILL.md"
-install -m 0644 "$repo_root/agents/openai.yaml" "$skill_stage/agents/openai.yaml"
 install -m 0644 "$repo_root/references/architecture.md" "$skill_stage/references/architecture.md"
 install -m 0755 "$repo_root/bin/llm-brain" "$skill_stage/scripts/llm-brain"
 
-install -m 0644 "$repo_root/LICENSE" "$plugin_stage/LICENSE"
-install -m 0644 "$repo_root/VERSION" "$plugin_stage/VERSION"
-install -m 0644 "$manifest" "$plugin_stage/.codex-plugin/plugin.json"
-install -m 0644 "$repo_root/SKILL.md" "$plugin_stage/skills/$plugin_name/SKILL.md"
-install -m 0644 "$repo_root/agents/openai.yaml" "$plugin_stage/skills/$plugin_name/agents/openai.yaml"
-install -m 0644 "$repo_root/references/architecture.md" "$plugin_stage/skills/$plugin_name/references/architecture.md"
-install -m 0755 "$repo_root/bin/llm-brain" "$plugin_stage/skills/$plugin_name/scripts/llm-brain"
-
 bash -n "$skill_stage/scripts/llm-brain"
-bash -n "$plugin_stage/skills/$plugin_name/scripts/llm-brain"
 
 mkdir -p "$dist_dir"
-python3 - "$stage_root" "$dist_dir" "$plugin_name" "$version" <<'PY'
+python3 - "$stage_root" "$dist_dir" "$package_name" "$version" <<'PY'
 import gzip
 import io
 import os
@@ -129,8 +102,7 @@ def verify(archive_path: Path, expected_root: str, cli_member: str):
             subprocess.run([str(extracted), "help"], check=True, stdout=subprocess.DEVNULL)
 
 targets = [
-    (stage_root / "skill" / name, dist_dir / f"{name}-skill-{version}.tar.gz", f"{name}/scripts/llm-brain"),
-    (stage_root / "plugin" / name, dist_dir / f"{name}-plugin-{version}.tar.gz", f"{name}/skills/{name}/scripts/llm-brain"),
+    (stage_root / "skill" / name, dist_dir / f"{name}-{version}.tar.gz", f"{name}/scripts/llm-brain"),
 ]
 for root, destination, cli_member in targets:
     first = destination.with_suffix(destination.suffix + ".first")
@@ -146,5 +118,4 @@ for root, destination, cli_member in targets:
     destination.with_suffix(destination.suffix + ".sha256").write_text(f"{digest}  {destination.name}\n", encoding="utf-8")
 PY
 
-printf 'package=ok type=skill file=%s\n' "$dist_dir/${plugin_name}-skill-${version}.tar.gz"
-printf 'package=ok type=plugin file=%s\n' "$dist_dir/${plugin_name}-plugin-${version}.tar.gz"
+printf 'package=ok type=standalone file=%s\n' "$dist_dir/${package_name}-${version}.tar.gz"

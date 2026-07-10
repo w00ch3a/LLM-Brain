@@ -1193,7 +1193,7 @@ cmd_search() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local task="" agent="codex" budget=1200 topic="" include_proposed=0 include_cold=0 dir results selected hash pack bytes=0 line rel
+  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 dir results selected hash pack bytes=0 line rel
   while [ $# -gt 0 ]; do
     case "$1" in --task) task="${2:-}"; shift 2 ;; --agent) agent="${2:-}"; shift 2 ;; --budget-tokens) budget="${2:-}"; shift 2 ;; --topic) topic="${2:-}"; shift 2 ;; --include-proposed) include_proposed=1; shift ;; --include-cold) include_cold=1; shift ;; *) die 64 "unknown pack option: $1" ;; esac
   done
@@ -1243,7 +1243,7 @@ cmd_adapters() {
   [ "${1:-}" = "--agent" ] && agent="${2:-all}"
   dir="$(require_project "$project_id")"
   acquire_lock "project-$project_id"
-  for name in codex claude hermes openclaw generic; do
+  for name in generic; do
     [ "$agent" = "all" ] || [ "$agent" = "$name" ] || continue
     local file="$dir/adapters/${name}.md"
     if [ -f "$file" ] && ! grep -Fq "$GENERATED_MARKER" "$file"; then

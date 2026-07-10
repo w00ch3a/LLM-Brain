@@ -55,7 +55,7 @@ bin/llm-brain ingest /path/to/source.md --provider /path/to/reflector
 
 # Retrieval and derived views
 bin/llm-brain search <project-id> "task words"
-bin/llm-brain pack build <project-id> --agent codex --task "current task"
+bin/llm-brain pack build <project-id> --agent generic --task "current task"
 bin/llm-brain index build <project-id>
 ```
 
