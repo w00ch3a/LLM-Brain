@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Made index freshness and retrieval metadata truthful.
+- Added optional deterministic graph expansion, historical retrieval and explain output.
+- Added opt-in hybrid lexical/semantic retrieval with explicit query embedders and visible lexical fallback.
+- Added retrieval regression fixtures for ranking, graph links, conflicts, supersession and pack metadata.
+
 ## 0.2.0 - 2026-07-10
 
 - Replaced the minimal reference CLI with a schema-v2 filesystem lifecycle.

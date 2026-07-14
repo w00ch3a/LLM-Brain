@@ -18,6 +18,10 @@ PROJECT_OVERRIDE="${LLM_BRAIN_PROJECT_ID:-}"
 ACTOR="${LLM_BRAIN_ACTOR:-llm-brain}"
 REFLECTOR="${LLM_BRAIN_REFLECTOR:-}"
 EMBEDDER="${LLM_BRAIN_EMBEDDER:-}"
+QUERY_EMBEDDER="${LLM_BRAIN_QUERY_EMBEDDER:-}"
+SEARCH_SUPERSESSION_MAP=""
+INDEX_EXPECTED_SIGNATURE=""
+INDEX_EXPECTED_SIGNATURE_READY=0
 GENERATED_MARKER="<!-- llm-brain:generated-map -->"
 MAX_SOURCE_BYTES=$((10 * 1024 * 1024))
 
@@ -40,8 +44,8 @@ Commands:
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT
   index build|status PROJECT_ID [--embedder EXECUTABLE]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--include-proposed] [--include-cold]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--explain] [--include-proposed] [--include-cold]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical]
   adapters build PROJECT_ID [--agent NAME|all]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -1093,6 +1097,163 @@ embedding_field() {
   esac
 }
 
+canonical_signature() {
+  local dir="$1" file rel
+  while IFS= read -r file; do
+    canonical_file_effective "$dir" "$file" || continue
+    rel="${file#"$dir"/}"
+    printf '%s\t%s\n' "$rel" "$(sha256_file "$file")"
+  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+}
+
+index_manifest_hash() {
+  local dir="$1" manifest="$dir/indexes/manifest.tsv"
+  if [ -f "$manifest" ]; then sha256_file "$manifest"; fi
+  return 0
+}
+
+index_documents_state() {
+  local dir="$1" file="$dir/indexes/documents.tsv" expected actual
+  [ -f "$file" ] || { printf 'missing\n'; return; }
+  if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
+  actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
+  [ "$expected" = "$actual" ] && printf 'current\n' || printf 'stale\n'
+}
+
+index_manifest_state() {
+  local dir="$1" file="$dir/indexes/manifest.tsv" expected actual
+  [ -f "$file" ] || { printf 'missing\n'; return; }
+  if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
+  actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
+  [ "$expected" = "$actual" ] && printf 'current\n' || printf 'stale\n'
+}
+
+index_graph_state() {
+  local dir="$1" file="$dir/indexes/graph.tsv" header docs manifest
+  [ -f "$file" ] || { printf 'missing\n'; return; }
+  header="$(sed -n '1p' "$file")"
+  [ "$header" = $'source\trelation\ttarget' ] || { printf 'stale\n'; return; }
+  docs="$(index_documents_state "$dir")"
+  manifest="$(index_manifest_state "$dir")"
+  [ "$docs" = "current" ] && [ "$manifest" = "current" ] && printf 'current\n' || printf 'stale\n'
+}
+
+valid_embedding_row() {
+  local dimensions="$1" vector="$2"
+  awk -v dimensions="$dimensions" -v vector="$vector" '
+    BEGIN {
+      if (dimensions !~ /^[1-9][0-9]*$/) exit 1
+      count=split(vector, values, /[[:space:]]+/)
+      if (count != dimensions) exit 1
+      for (i=1; i<=count; i++) {
+        if (values[i] !~ /^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/) exit 1
+      }
+      exit 0
+    }
+  '
+}
+
+index_vectors_state() {
+  local dir="$1" file="$dir/indexes/vectors.tsv" manifest_state expected_count actual_count path hash model dimensions vector first_model="" first_dimensions=""
+  [ -f "$file" ] || { printf 'missing\n'; return; }
+  [ "$(sed -n '1p' "$file")" = $'path\thash\tmodel\tdimensions\tvector' ] || { printf 'stale\n'; return; }
+  manifest_state="$(index_manifest_state "$dir")"
+  [ "$manifest_state" = "current" ] || { printf 'stale\n'; return; }
+  if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then
+    expected_count="$(printf '%s\n' "$INDEX_EXPECTED_SIGNATURE" | awk 'NF { count++ } END { print count + 0 }')"
+  else
+    expected_count="$(canonical_signature "$dir" | wc -l | tr -d ' ')"
+  fi
+  actual_count="$(tail -n +2 "$file" | wc -l | tr -d ' ')"
+  [ "$expected_count" = "$actual_count" ] || { printf 'stale\n'; return; }
+  while IFS=$'\t' read -r path hash model dimensions vector; do
+    [ -n "$path" ] || continue
+    [ -f "$dir/$path" ] || { printf 'stale\n'; return; }
+    [ "$(sha256_file "$dir/$path")" = "$hash" ] || { printf 'stale\n'; return; }
+    valid_embedding_row "$dimensions" "$vector" || { printf 'stale\n'; return; }
+    if [ -z "$first_model" ]; then
+      first_model="$model"; first_dimensions="$dimensions"
+    elif [ "$first_model" != "$model" ] || [ "$first_dimensions" != "$dimensions" ]; then
+      printf 'stale\n'; return
+    fi
+  done < <(tail -n +2 "$file")
+  printf 'current\n'
+}
+
+graph_target_matches() {
+  local dir="$1" file="$2" target="$3" rel basename title
+  rel="${file#"$dir"/}"
+  target="${target#./}"
+  target="${target#"$dir"/}"
+  basename="$(basename "$rel" .md)"
+  title="$(frontmatter_field "$file" title)"
+  [ "$target" = "$rel" ] || [ "$target" = "$rel.md" ] || [ "$target" = "$basename" ] || [ "$target" = "$title" ]
+}
+
+file_superseded_by_current_memory() {
+  local dir="$1" target_file="$2" candidate supersedes
+  if [ -n "$SEARCH_SUPERSESSION_MAP" ] && [ -f "$SEARCH_SUPERSESSION_MAP" ]; then
+    local target_rel target_base target_title
+    target_rel="${target_file#"$dir"/}"; target_base="$(basename "$target_rel" .md)"; target_title="$(frontmatter_field "$target_file" title)"
+    awk -F '\t' -v rel="$target_rel" -v base="$target_base" -v title="$target_title" '$1 == rel || $1 == rel ".md" || $1 == base || $1 == title { found=1 } END { exit !found }' "$SEARCH_SUPERSESSION_MAP"
+    return $?
+  fi
+  [ "$(frontmatter_field "$target_file" brain_review_state review_state)" != "superseded" ] || return 0
+  # ponytail: O(n^2) supersession scan; replace with a maintained reverse map only when vault size proves it necessary.
+  while IFS= read -r candidate; do
+    [ "$candidate" = "$target_file" ] && continue
+    canonical_file_effective "$dir" "$candidate" || continue
+    supersedes="$(frontmatter_field "$candidate" brain_supersedes)"
+    [ -n "$supersedes" ] || continue
+    graph_target_matches "$dir" "$target_file" "$supersedes" && return 0
+  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  return 1
+}
+
+build_supersession_map() {
+  local dir="$1" map="$2" file rel supersedes
+  : >"$map"
+  while IFS= read -r file; do
+    canonical_file_effective "$dir" "$file" || continue
+    supersedes="$(frontmatter_field "$file" brain_supersedes)"
+    [ -n "$supersedes" ] || continue
+    rel="${file#"$dir"/}"
+    printf '%s\t%s\n' "$supersedes" "$rel" >>"$map"
+  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+}
+
+search_file_eligible() {
+  local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" state sensitivity temperature
+  [ ! -f "$dir/okf/retractions/$(basename "$file" .md).md" ] || return 1
+  state="$(frontmatter_field "$file" brain_review_state review_state)"
+  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  [ "$sensitivity" != "restricted" ] || return 1
+  if [ "$state" = "superseded" ]; then
+    [ "$historical" = "1" ] || return 1
+  elif [ "$include_proposed" = "0" ]; then
+    [ "$state" = "approved" ] || return 1
+  fi
+  if [ "$historical" = "0" ]; then
+    file_superseded_by_current_memory "$dir" "$file" && return 1
+  fi
+  temperature="$(frontmatter_field "$file" brain_loading_temperature)"
+  [ "$include_cold" = "1" ] || [ "$temperature" != "cold" ] || return 1
+  [ -z "$topic" ] || [ "$(frontmatter_field "$file" brain_topic_id topic_id)" = "$topic" ] || return 1
+  return 0
+}
+
+file_conflict_state() {
+  local file="$1" graph_file="${2:-}" rel
+  [ -n "$(frontmatter_field "$file" brain_conflicts)" ] && { printf 'conflicted\n'; return; }
+  if [ -n "$graph_file" ] && [ -f "$graph_file" ]; then
+    rel="${file#"${graph_file%/indexes/graph.tsv}"/}"
+    if awk -F '\t' -v path="$rel" '$2 == "conflicts_with" && ($1 == path || $3 == path) { found=1 } END { exit !found }' "$graph_file"; then
+      printf 'conflicted\n'; return
+    fi
+  fi
+  printf 'clear\n'
+}
+
 build_indexes() {
   local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state sensitivity temp body
   dir="$(require_project "$project_id")"
@@ -1153,69 +1314,247 @@ cmd_index() {
       build_indexes "$project_id" "$embedder"
       ;;
     status)
-      local dir manifest vector_state
+      local dir manifest docs_state graph_state vectors_state manifest_state manifest_hash documents hybrid_ready
       dir="$(require_project "$project_id")"; manifest="$dir/indexes/manifest.tsv"
-      [ -f "$manifest" ] || { printf 'index_status=missing project_id=%s\n' "$project_id"; return 1; }
-      vector_state="$([ -f "$dir/indexes/vectors.tsv" ] && printf available || printf unavailable)"
-      printf 'index_status=present project_id=%s documents=%s vector_search=%s\n' "$project_id" "$(($(wc -l <"$manifest") - 1))" "$vector_state"
+      [ -f "$manifest" ] || { printf 'index_status=missing project_id=%s documents_index=missing graph_index=missing vector_index=missing retrieval_mode=lexical hybrid_ready=false manifest_hash=none\n' "$project_id"; return 1; }
+      docs_state="$(index_documents_state "$dir")"
+      graph_state="$(index_graph_state "$dir")"
+      vectors_state="$(index_vectors_state "$dir")"
+      manifest_state="$(index_manifest_state "$dir")"
+      manifest_hash="$(index_manifest_hash "$dir")"
+      documents="$(tail -n +2 "$manifest" | wc -l | tr -d ' ')"
+      hybrid_ready=false; [ "$vectors_state" = "current" ] && hybrid_ready=true
+      printf 'index_status=present project_id=%s documents=%s documents_index=%s graph_index=%s vector_index=%s manifest_index=%s retrieval_mode=lexical hybrid_ready=%s manifest_hash=%s\n' "$project_id" "$documents" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" "$hybrid_ready" "${manifest_hash:-none}"
       ;;
     *) die 64 "index requires build or status" ;;
   esac
 }
 
+resolve_graph_target() {
+  local dir="$1" target="$2" file rel
+  while IFS= read -r file; do
+    graph_target_matches "$dir" "$file" "$target" || continue
+    rel="${file#"$dir"/}"
+    printf '%s\n' "$rel"
+    return 0
+  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  return 1
+}
+
 cmd_search() {
   local project_id="$1" query="$2"; shift 2 || true
-  local topic="" limit=20 include_proposed=0 include_cold=0 dir term file rel score title type state sensitivity temp
+  local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file=""
+  local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file=""
+  local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked
+  local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
   while [ $# -gt 0 ]; do
-    case "$1" in --topic) topic="${2:-}"; shift 2 ;; --limit) limit="${2:-}"; shift 2 ;; --include-proposed) include_proposed=1; shift ;; --include-cold) include_cold=1; shift ;; *) die 64 "unknown search option: $1" ;; esac
+    case "$1" in
+      --topic) topic="${2:-}"; shift 2 ;;
+      --limit) limit="${2:-}"; shift 2 ;;
+      --strategy) strategy="${2:-}"; shift 2 ;;
+      --query-embedder) query_embedder="${2:-}"; shift 2 ;;
+      --expand-graph) expand_graph=1; shift ;;
+      --historical) historical=1; shift ;;
+      --explain) explain=1; shift ;;
+      --include-proposed) include_proposed=1; shift ;;
+      --include-cold) include_cold=1; shift ;;
+      --metadata-file) metadata_file="${2:-}"; shift 2 ;;
+      *) die 64 "unknown search option: $1" ;;
+    esac
   done
+  validate_scalar "$query" || die 65 "query must be a single line"
+  case "$strategy" in lexical|hybrid) ;; *) die 64 "search strategy must be lexical or hybrid" ;; esac
+  require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   dir="$(require_project "$project_id")"
-  printf 'path\tscore\ttype\tstate\tsensitivity\ttitle\n'
+  INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
+  INDEX_EXPECTED_SIGNATURE_READY=1
+  docs_state="$(index_documents_state "$dir")"
+  graph_state="$(index_graph_state "$dir")"
+  vectors_state="$(index_vectors_state "$dir")"
+  manifest_hash="$(index_manifest_hash "$dir")"
+  [ "$graph_state" = "current" ] && graph_file="$dir/indexes/graph.tsv"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-search.XXXXXX")"
+  lexical_raw="$tmp_dir/lexical.raw.tsv"; lexical_rank="$tmp_dir/lexical.rank.tsv"
+  semantic_raw="$tmp_dir/semantic.raw.tsv"; semantic_rank="$tmp_dir/semantic.rank.tsv"; union="$tmp_dir/union.tsv"
+  base_records="$tmp_dir/base.tsv"; graph_records="$tmp_dir/graph.tsv"; final_ranked="$tmp_dir/final.tsv"
+  SEARCH_SUPERSESSION_MAP="$tmp_dir/supersession.tsv"
+  build_supersession_map "$dir" "$SEARCH_SUPERSESSION_MAP"
+  : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"
   while IFS= read -r file; do
-    rel="${file#"$dir"/}"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; temp="$(frontmatter_field "$file" brain_loading_temperature)"; [ -n "$temp" ] || temp="warm"
-    [ ! -f "$dir/okf/retractions/$(basename "$file" .md).md" ] || continue
-    [ "$sensitivity" != "restricted" ] || continue
-    [ "$include_proposed" = "1" ] || [ "$state" = "approved" ] || continue
-    [ "$include_cold" = "1" ] || [ "$temp" != "cold" ] || continue
-    [ -z "$topic" ] || [ "$(frontmatter_field "$file" brain_topic_id topic_id)" = "$topic" ] || continue
+    search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" || continue
+    rel="${file#"$dir"/}"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; title="$(frontmatter_field "$file" title)"
     score=0
     if grep -Fqi -- "$query" "$file"; then score=$((score + 20)); fi
     for term in $(printf '%s' "$query" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' '); do
       [ "${#term}" -gt 2 ] || continue
       grep -Fqi -- "$term" "$file" && score=$((score + 1))
-      printf '%s' "$(frontmatter_field "$file" title)" | grep -Fqi -- "$term" && score=$((score + 4))
+      printf '%s' "$title" | grep -Fqi -- "$term" && score=$((score + 4))
     done
-    [ "$score" -gt 0 ] || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$(frontmatter_field "$file" type)" "$state" "${sensitivity:-internal}" "$(frontmatter_field "$file" title)"
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort) | { head -1; tail -n +2 | sort -t $'\t' -k2,2nr -k1,1 | head -n "$limit"; }
+    [ "$score" -gt 0 ] && printf '%s\t%s\n' "$rel" "$score" >>"$lexical_raw"
+  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  sort -t $'\t' -k2,2nr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
+
+  if [ "$strategy" = "hybrid" ]; then
+    if [ "$vectors_state" != "current" ] || [ -z "$query_embedder" ] || [ ! -x "$query_embedder" ]; then
+      degraded=1
+    else
+      query_input="$tmp_dir/query.txt"; query_vector="$tmp_dir/query.vector"
+      printf '%s\n' "$query" >"$query_input"
+      if "$query_embedder" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
+        query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
+        vector_model="$(tail -n +2 "$dir/indexes/vectors.tsv" | head -n 1 | cut -f3)"; vector_dimensions="$(tail -n +2 "$dir/indexes/vectors.tsv" | head -n 1 | cut -f4)"
+        if [ "$query_model" = "$vector_model" ] && [ "$query_dimensions" = "$vector_dimensions" ]; then
+          awk -F '\t' -v q="$(embedding_field "$query_vector" vector)" -v model="$query_model" -v dimensions="$query_dimensions" '
+            BEGIN { split(q, qv, /[[:space:]]+/) }
+            NR > 1 && $3 == model && $4 == dimensions {
+              split($5, v, /[[:space:]]+/); dot=0; qn=0; vn=0
+              for (i=1; i<=dimensions; i++) { dot += qv[i] * v[i]; qn += qv[i] * qv[i]; vn += v[i] * v[i] }
+              if (qn > 0 && vn > 0) printf "%s\t%.12f\n", $1, dot / (sqrt(qn) * sqrt(vn))
+            }
+          ' "$dir/indexes/vectors.tsv" >"$semantic_raw"
+          while IFS=$'\t' read -r rel score; do
+            [ -n "$rel" ] || continue
+            search_file_eligible "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" && printf '%s\t%s\n' "$rel" "$score"
+          done <"$semantic_raw" >"$semantic_raw.filtered"
+          mv "$semantic_raw.filtered" "$semantic_raw"
+          sort -t $'\t' -k2,2nr -k1,1 "$semantic_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$semantic_rank"
+          semantic_ok=1
+        else
+          degraded=1
+        fi
+      else
+        degraded=1
+      fi
+    fi
+  fi
+  if [ "$strategy" = "hybrid" ] && [ "$semantic_ok" = "1" ]; then mode="hybrid-rrf"; fi
+
+  { cut -f1 "$lexical_rank"; if [ "$semantic_ok" = "1" ]; then cut -f1 "$semantic_rank"; fi; } | sort -u >"$union"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    local lexical_position lexical_score semantic_position final_score
+    lexical_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$lexical_rank")"
+    lexical_score="$(awk -F '\t' -v path="$rel" '$1 == path { print $3; exit }' "$lexical_rank")"
+    semantic_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$semantic_rank")"
+    if [ "$semantic_ok" = "1" ]; then
+      final_score="$(awk -v lexical="$lexical_position" -v semantic="$semantic_position" 'BEGIN { value=0; if (lexical != "") value += 1 / (60 + lexical); if (semantic != "") value += 1 / (60 + semantic); printf "%.12f", value }')"
+    else
+      final_score="${lexical_score:-0}"
+    fi
+    printf 'B\t%s\t%s\t%s\t%s\n' "$rel" "$final_score" "${lexical_position:-}" "${semantic_position:-}" >>"$base_records"
+  done <"$union"
+  sort -t $'\t' -k3,3nr -k2,2 "$base_records" -o "$base_records"
+
+  if [ "$expand_graph" = "1" ]; then
+    if [ "$graph_state" = "current" ]; then
+      while IFS=$'\t' read -r tag rel score lexical_position semantic_position; do
+        [ "$tag" = "B" ] || continue
+        [ "$graph_candidate_count" -lt "$limit" ] || break
+        while IFS=$'\t' read -r source relation target; do
+          [ -n "$target" ] || continue
+          case "$relation" in links_to|supersedes|conflicts_with) ;; *) continue ;; esac
+          target_rel="$(resolve_graph_target "$dir" "$target" 2>/dev/null || true)"
+          [ -n "$target_rel" ] || continue
+          [ "$target_rel" != "$rel" ] || continue
+          search_file_eligible "$dir" "$dir/$target_rel" "$include_proposed" "$include_cold" "$topic" "$historical" || continue
+          graph_score="$(awk -v value="$score" 'BEGIN { printf "%.12f", value * 0.5 }')"
+          printf 'G\t%s\t%s\t%s\t%s\n' "$target_rel" "$graph_score" "$rel" "$relation" >>"$graph_records"
+          graph_candidate_count=$((graph_candidate_count + 1))
+        done < <(awk -F '\t' -v source="$rel" '$1 == source { print $1 "\t" $2 "\t" $3 }' "$dir/indexes/graph.tsv")
+      done <"$base_records"
+    else
+      degraded=1
+    fi
+  fi
+  [ "$graph_candidate_count" -gt 0 ] && mode="${mode}+graph"
+  [ "$degraded" = "1" ] && mode="${mode}-fallback"
+
+  awk -F '\t' '
+    $1 == "B" { base[$2]=$0; next }
+    $1 == "G" && (!( $2 in graph_score) || $3 > graph_score[$2]) { graph_score[$2]=$3; graph_source[$2]=$4; graph_relation[$2]=$5 }
+    END {
+      for (path in base) {
+        split(base[path], parts, "\t")
+        source=(path in graph_source ? graph_source[path] : "")
+        relation=(path in graph_relation ? graph_relation[path] : "")
+        print path "\t" parts[3] "\t" parts[4] "\t" parts[5] "\t" source "\t" relation
+      }
+      for (path in graph_score) if (!(path in base)) print path "\t" graph_score[path] "\t\t\t" graph_source[path] "\t" graph_relation[path]
+    }
+  ' "$base_records" "$graph_records" | sort -t $'\t' -k2,2nr -k1,1 >"$final_ranked"
+
+  if [ "$explain" = "1" ]; then
+    printf 'path\tscore\ttype\tstate\tsensitivity\ttitle\tlexical_rank\tsemantic_rank\tgraph_source\tgraph_relation\tauthority\tindex_status\n'
+  else
+    printf 'path\tscore\ttype\tstate\tsensitivity\ttitle\n'
+  fi
+  while IFS=$'\t' read -r rel score lexical_position semantic_position graph_source graph_relation; do
+    [ -n "$rel" ] || continue
+    file="$dir/$rel"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"; title="$(frontmatter_field "$file" title)"
+    [ "$state" = "superseded" ] || [ "$graph_relation" = "supersedes" ] || ! file_superseded_by_current_memory "$dir" "$file" || state="superseded"
+    if [ "$(file_conflict_state "$file" "$graph_file")" = "conflicted" ] || [ "$graph_relation" = "conflicts_with" ]; then state="${state}-conflicted"; fi
+    if [ "$explain" = "1" ]; then
+      authority="$(frontmatter_field "$file" brain_source_authority source_authority)"; [ -n "$authority" ] || authority="unknown"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\n' "$rel" "$score" "$(frontmatter_field "$file" type)" "$state" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state"
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$(frontmatter_field "$file" type)" "$state" "$sensitivity" "$title"
+    fi
+  done < <(head -n "$limit" "$final_ranked")
+  if [ -n "$metadata_file" ]; then
+    printf 'retrieval_mode=%s\ndegraded=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" >"$metadata_file"
+  fi
+  rm -rf "$tmp_dir"
+  SEARCH_SUPERSESSION_MAP=""
+  INDEX_EXPECTED_SIGNATURE=""
+  INDEX_EXPECTED_SIGNATURE_READY=0
 }
 
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 dir results selected hash pack bytes=0 line rel
+  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 dir results metadata selected hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none"
   while [ $# -gt 0 ]; do
-    case "$1" in --task) task="${2:-}"; shift 2 ;; --agent) agent="${2:-}"; shift 2 ;; --budget-tokens) budget="${2:-}"; shift 2 ;; --topic) topic="${2:-}"; shift 2 ;; --include-proposed) include_proposed=1; shift ;; --include-cold) include_cold=1; shift ;; *) die 64 "unknown pack option: $1" ;; esac
+    case "$1" in
+      --task) task="${2:-}"; shift 2 ;;
+      --agent) agent="${2:-}"; shift 2 ;;
+      --budget-tokens) budget="${2:-}"; shift 2 ;;
+      --topic) topic="${2:-}"; shift 2 ;;
+      --strategy) strategy="${2:-}"; shift 2 ;;
+      --query-embedder) query_embedder="${2:-}"; shift 2 ;;
+      --expand-graph) expand_graph=1; shift ;;
+      --historical) historical=1; shift ;;
+      --include-proposed) include_proposed=1; shift ;;
+      --include-cold) include_cold=1; shift ;;
+      *) die 64 "unknown pack option: $1" ;;
+    esac
   done
   [ -n "$task" ] || die 64 "pack build requires --task"
+  case "$strategy" in lexical|hybrid) ;; *) die 64 "pack strategy must be lexical or hybrid" ;; esac
   case "$budget" in ''|*[!0-9]*) die 64 "--budget-tokens must be a non-negative integer" ;; esac
   [ "$budget" -gt 0 ] || die 64 "--budget-tokens must be positive"
   dir="$(require_project "$project_id")"
   results="$(mktemp "$dir/context-packs/.search.XXXXXX")"
+  metadata="$(mktemp "$dir/context-packs/.metadata.XXXXXX")"
   local -a search_args
-  search_args=("$project_id" "$task" "--limit" "20")
+  search_args=("$project_id" "$task" "--limit" "20" "--strategy" "$strategy" "--metadata-file" "$metadata")
   [ -z "$topic" ] || search_args+=("--topic" "$topic")
+  [ -z "$query_embedder" ] || search_args+=("--query-embedder" "$query_embedder")
+  [ "$expand_graph" = "0" ] || search_args+=("--expand-graph")
+  [ "$historical" = "0" ] || search_args+=("--historical")
   [ "$include_proposed" = "0" ] || search_args+=("--include-proposed")
   [ "$include_cold" = "0" ] || search_args+=("--include-cold")
   cmd_search "${search_args[@]}" >"$results"
+  retrieval_mode="$(awk -F= '$1 == "retrieval_mode" { print $2 }' "$metadata")"
+  retrieval_degraded="$(awk -F= '$1 == "degraded" { print $2 }' "$metadata")"
+  manifest_hash="$(awk -F= '$1 == "manifest_hash" { print $2 }' "$metadata")"
   selected="$(tail -n +2 "$results" | cut -f1)"
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$selected")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$retrieval_mode|$retrieval_degraded|$manifest_hash|$selected")"
   pack="$dir/context-packs/$(slug "$agent")-$(slug "$task")-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
-    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_retrieval: lexical-and-graph\nbrain_selection_hash: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$hash" "$SCHEMA_VERSION"
+    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$SCHEMA_VERSION"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
     printf '## Selected Memory\n\n'
@@ -1232,7 +1571,7 @@ cmd_pack() {
   mv "${pack}.tmp.$$" "$pack"
   audit_v2 "$dir" "pack-build" "$(basename "$pack")" "" "built" "$(sha256_file "$pack")" "bytes=$bytes"
   release_lock
-  rm -f "$results"
+  rm -f "$results" "$metadata"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

@@ -69,6 +69,149 @@ pack_file="$(printf '%s\n' "$pack" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 assert_file "$pack_file"
 grep -Fq 'The project stores durable memory' "$pack_file" || fail "pack lacks selected memory"
 grep -Fq 'Source hash:' "$pack_file" || fail "pack lacks source provenance"
+grep -Fq 'brain_retrieval: lexical' "$pack_file" || fail "pack retrieval mode was not truthful"
+grep -Fq 'brain_retrieval_degraded: false' "$pack_file" || fail "lexical pack was incorrectly marked degraded"
+if grep -Fq 'lexical-and-graph' "$pack_file"; then fail "pack retained false lexical-and-graph metadata"; fi
+if missing_status="$($cli --root "$vault" index status "$project_id" 2>&1)"; then fail "missing index status unexpectedly succeeded"; fi
+assert_contains "$missing_status" 'documents_index=missing'
+
+semantic_claim="$vault/projects/$project_id/okf/claims/semantic_only.md"
+cat >"$semantic_claim" <<'SEMANTIC'
+---
+type: Claim
+title: Semantic-only retrieval anchor
+brain_project_id: fixture
+brain_claim_id: semantic_only
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Semantic-only retrieval anchor
+
+semantic anchor content
+SEMANTIC
+
+graph_target="$vault/projects/$project_id/okf/claims/linked_memory.md"
+cat >"$graph_target" <<'GRAPH_TARGET'
+---
+type: Claim
+title: Linked operational memory
+brain_project_id: fixture
+brain_claim_id: linked_memory
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Linked operational memory
+
+Graph expansion target content.
+GRAPH_TARGET
+
+graph_anchor="$vault/projects/$project_id/okf/claims/graph_anchor.md"
+cat >"$graph_anchor" <<'GRAPH_ANCHOR'
+---
+type: Claim
+title: Graph anchor memory
+brain_project_id: fixture
+brain_claim_id: graph_anchor
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Graph anchor memory
+
+graph anchor phrase. See [[Linked operational memory]].
+GRAPH_ANCHOR
+
+conflict_claim="$vault/projects/$project_id/okf/claims/conflict_memory.md"
+cat >"$conflict_claim" <<'CONFLICT'
+---
+type: Claim
+title: Conflicted memory
+brain_project_id: fixture
+brain_claim_id: conflict_memory
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+brain_conflicts: semantic_only
+---
+# Conflicted memory
+
+conflicted memory record.
+CONFLICT
+
+old_memory="$vault/projects/$project_id/okf/claims/old_memory.md"
+cat >"$old_memory" <<'OLD_MEMORY'
+---
+type: Claim
+title: Old current policy
+brain_project_id: fixture
+brain_claim_id: old_memory
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Old current policy
+
+old current policy wording.
+OLD_MEMORY
+
+new_memory="$vault/projects/$project_id/okf/claims/new_memory.md"
+cat >"$new_memory" <<'NEW_MEMORY'
+---
+type: Claim
+title: New current policy
+brain_project_id: fixture
+brain_claim_id: new_memory
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+brain_supersedes: okf/claims/old_memory.md
+---
+# New current policy
+
+new current policy wording.
+NEW_MEMORY
+
+identifier_claim="$vault/projects/$project_id/okf/claims/identifier_exact.md"
+cat >"$identifier_claim" <<'IDENTIFIER'
+---
+type: Claim
+title: deploy-release-v2
+brain_project_id: fixture
+brain_claim_id: identifier_exact
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Release identifier
+
+Generic release guidance.
+IDENTIFIER
+
+identifier_similar="$vault/projects/$project_id/okf/claims/identifier_similar.md"
+cat >"$identifier_similar" <<'IDENTIFIER_SIMILAR'
+---
+type: Claim
+title: Release guidance
+brain_project_id: fixture
+brain_claim_id: identifier_similar
+brain_review_state: approved
+brain_sensitivity: internal
+brain_loading_temperature: warm
+brain_source_authority: repository
+---
+# Release guidance
+
+deploy release guidance.
+IDENTIFIER_SIMILAR
 
 embedder="$fixture/embedder.sh"
 cat >"$embedder" <<'EMBEDDER'
@@ -76,11 +219,71 @@ cat >"$embedder" <<'EMBEDDER'
 printf 'model: fixture-embedder\ndimensions: 3\nvector: 0.1 0.2 0.3\n'
 EMBEDDER
 chmod 755 "$embedder"
-LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index build "$project_id" --embedder "$embedder" >/dev/null
+semantic_embedder="$fixture/semantic-embedder.sh"
+cat >"$semantic_embedder" <<'SEMANTIC_EMBEDDER'
+#!/usr/bin/env bash
+if grep -Fq 'semantic anchor' "$1"; then
+  printf 'model: fixture-semantic\ndimensions: 3\nvector: 1 0 0\n'
+else
+  printf 'model: fixture-semantic\ndimensions: 3\nvector: 0 1 0\n'
+fi
+SEMANTIC_EMBEDDER
+chmod 755 "$semantic_embedder"
+query_embedder="$fixture/query-embedder.sh"
+cat >"$query_embedder" <<'QUERY_EMBEDDER'
+#!/usr/bin/env bash
+printf 'model: fixture-semantic\ndimensions: 3\nvector: 1 0 0\n'
+QUERY_EMBEDDER
+chmod 755 "$query_embedder"
+LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index build "$project_id" --embedder "$semantic_embedder" >/dev/null
 assert_file "$vault/projects/$project_id/indexes/vectors.tsv"
-assert_contains "$(LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index status "$project_id")" 'vector_search=available'
-LLM_BRAIN_EMBEDDER_VERSION=v2 "$cli" --root "$vault" index build "$project_id" --embedder "$embedder" >/dev/null
+index_status="$(LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index status "$project_id")"
+assert_contains "$index_status" 'documents_index=current'
+assert_contains "$index_status" 'graph_index=current'
+assert_contains "$index_status" 'vector_index=current'
+assert_contains "$index_status" 'hybrid_ready=true'
+LLM_BRAIN_EMBEDDER_VERSION=v2 "$cli" --root "$vault" index build "$project_id" --embedder "$semantic_embedder" >/dev/null
 [ "$(find "$vault/projects/$project_id/indexes/embeddings" -type f -name '*.txt' | wc -l | tr -d ' ')" -ge 2 ] || fail "embedding cache did not vary by provider version"
+
+semantic_search="$($cli --root "$vault" search "$project_id" 'unrelated query' --strategy hybrid --query-embedder "$query_embedder" --limit 1)"
+assert_contains "$semantic_search" 'semantic_only.md'
+
+identifier_search="$($cli --root "$vault" search "$project_id" 'deploy-release-v2' --limit 1)"
+first_identifier="$(printf '%s\n' "$identifier_search" | tail -n +2 | head -n 1 | cut -f1)"
+[ "$first_identifier" = 'okf/claims/identifier_exact.md' ] || fail "exact identifier did not outrank similar memory"
+
+graph_search="$($cli --root "$vault" search "$project_id" 'graph anchor phrase' --expand-graph --limit 10)"
+assert_contains "$graph_search" 'okf/claims/linked_memory.md'
+
+explain_search="$($cli --root "$vault" search "$project_id" 'graph anchor phrase' --expand-graph --explain --limit 10)"
+assert_contains "$explain_search" 'graph_relation'
+assert_contains "$explain_search" 'links_to'
+
+conflict_search="$($cli --root "$vault" search "$project_id" 'conflicted memory')"
+assert_contains "$conflict_search" 'approved-conflicted'
+
+normal_history_search="$($cli --root "$vault" search "$project_id" 'old current policy')"
+if printf '%s\n' "$normal_history_search" | grep -Fq 'old_memory.md'; then fail "superseded memory was returned in normal mode"; fi
+historical_search="$($cli --root "$vault" search "$project_id" 'old current policy' --historical)"
+assert_contains "$historical_search" 'old_memory.md'
+assert_contains "$historical_search" 'superseded'
+
+printf '\nindex drift fixture\n' >>"$semantic_claim"
+stale_status="$($cli --root "$vault" index status "$project_id" 2>&1 || true)"
+assert_contains "$stale_status" 'documents_index=stale'
+assert_contains "$stale_status" 'vector_index=stale'
+metadata_file="$fixture/search-metadata"
+fallback_search="$($cli --root "$vault" search "$project_id" 'unrelated query' --strategy hybrid --query-embedder "$query_embedder" --metadata-file "$metadata_file")"
+assert_contains "$(cat "$metadata_file")" 'retrieval_mode=lexical-fallback'
+assert_contains "$(cat "$metadata_file")" 'degraded=true'
+LLM_BRAIN_EMBEDDER_VERSION=v3 "$cli" --root "$vault" index build "$project_id" --embedder "$semantic_embedder" >/dev/null
+
+hybrid_pack="$($cli --root "$vault" pack build "$project_id" --agent generic --task 'unrelated query' --strategy hybrid --query-embedder "$query_embedder" --budget-tokens 200)"
+hybrid_pack_file="$(printf '%s\n' "$hybrid_pack" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+assert_file "$hybrid_pack_file"
+grep -Fq 'brain_retrieval: hybrid-rrf' "$hybrid_pack_file" || fail "hybrid pack did not record actual retrieval mode"
+grep -Fq 'brain_retrieval_degraded: false' "$hybrid_pack_file" || fail "hybrid pack was unexpectedly degraded"
+grep -Fq 'brain_index_manifest_hash:' "$hybrid_pack_file" || fail "hybrid pack omitted index manifest hash"
 
 high_risk="$fixture/high-risk.md"
 cat >"$high_risk" <<EOF

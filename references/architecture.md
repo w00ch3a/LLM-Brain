@@ -41,6 +41,14 @@ vector: 0.1 -0.2 0.3
 
 The vector count must equal dimensions. Cache entries are keyed by document hash and `LLM_BRAIN_EMBEDDER_VERSION`; `vectors.tsv` exists only after a valid embedding build.
 
+Hybrid retrieval uses a separate explicit query embedder:
+
+```text
+query-embedder QUERY_TEXT_FILE
+```
+
+It returns the same three-line model, dimensions and vector format. The query model and dimensions must match the current vector index. Query embedding never makes a network call through the core.
+
 ## Promotion policy
 
 Automatic promotion requires all of the following:
@@ -55,9 +63,9 @@ Protected domains include clinical/healthcare, security/authentication, privacy,
 
 ## Retrieval and packs
 
-`documents.tsv`, `terms.tsv`, `graph.tsv` and `manifest.tsv` are deterministic rebuilds from effective-approved OKF. The graph includes project containment, topic, provenance, conflict/supersession metadata and document links. Search scans effective approved memory directly, so stale/missing indexes never cause a silent rebuild or incorrect read.
+`documents.tsv`, `terms.tsv`, `graph.tsv` and `manifest.tsv` are deterministic rebuilds from effective-approved OKF. Index status reports each derived surface as `current`, `stale` or `missing`. Lexical search is the default and continues to scan effective approved memory directly. `--expand-graph` performs deterministic one-hop expansion from a current graph index; only `links_to`, `supersedes` and `conflicts_with` edges participate. `--strategy hybrid` fuses lexical and semantic ranks with reciprocal-rank fusion over a current vector index. Stale or missing semantic/graph inputs produce explicit lexical fallback metadata.
 
-Context packs are content-addressed by task, agent, filters and selected paths. They record filters and selection hash, bound excerpts to approximately four bytes/token, include a source hash/provider and point back to a relative canonical path.
+Context packs are content-addressed by task, agent, filters, retrieval strategy and selected paths. They record the actual retrieval mode, degradation state, index manifest hash, filters and selection hash, bound excerpts to approximately four bytes/token, include a source hash/provider and point back to a relative canonical path.
 
 ## Migration rules
 
