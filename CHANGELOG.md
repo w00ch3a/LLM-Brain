@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-07-14
 
 - Made index freshness and retrieval metadata truthful.
 - Added optional deterministic graph expansion, historical retrieval and explain output.

@@ -9,7 +9,7 @@ VERSION_FILE=""
 for candidate in "$SCRIPT_DIR/../VERSION" "$SCRIPT_DIR/../../../VERSION"; do
   [ -f "$candidate" ] && { VERSION_FILE="$candidate"; break; }
 done
-VERSION="$(tr -d '[:space:]' <"$VERSION_FILE" 2>/dev/null || printf '0.2.0-dev')"
+VERSION="$(tr -d '[:space:]' <"$VERSION_FILE" 2>/dev/null || printf '0.3.0-dev')"
 SCHEMA_VERSION="2"
 DEFAULT_ROOT="${LLM_BRAIN_ROOT:-/Volumes/home/Vaults/llm-brain}"
 ROOT="$DEFAULT_ROOT"

@@ -4,7 +4,7 @@ LLM-Brain is a portable, filesystem-first memory lifecycle for software projects
 
 `capture → provider reflection → deterministic policy → approved memory → retrieval → scoped context`
 
-Version [`0.2.0`](VERSION) stores durable knowledge as inspectable OKF Markdown, keeps source custody and episodes separate from canonical memory, and rebuilds indexes, exports and context packs from that durable layer. It runs on Bash 3.2+ with standard macOS/Linux tools; Python standard library is used only to build the release archive.
+Version [`0.3.0`](VERSION) stores durable knowledge as inspectable OKF Markdown, keeps source custody and episodes separate from canonical memory, and rebuilds indexes, exports and context packs from that durable layer. It runs on Bash 3.2+ with standard macOS/Linux tools; Python standard library is used only to build the release archive.
 
 ## Quick start
 

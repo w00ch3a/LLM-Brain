@@ -1,6 +1,6 @@
-# LLM-Brain v0.2 architecture reference
+# LLM-Brain v0.3 architecture reference
 
-LLM-Brain v0.2 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version (`0.2.0`); `schema.version` in a project is the storage schema (`2`). Schema-1 vaults remain readable and are migrated only through `migrate apply --all`.
+LLM-Brain v0.3 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version (`0.3.0`); `schema.version` in a project is the storage schema (`2`). Schema-1 vaults remain readable and are migrated only through `migrate apply --all`.
 
 ## Data layers
 
