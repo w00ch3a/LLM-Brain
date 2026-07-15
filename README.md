@@ -1,79 +1,37 @@
-# LLM-Brain
+# LLM-Brain 🧠
 
-LLM-Brain is a portable, filesystem-first memory lifecycle for software projects.
+An Open Knowledge Framework (OKF) for structured, verifiable, and auditable AI intelligence.
 
-`capture → provider reflection → deterministic policy → approved memory → retrieval → scoped context`
+Built for high-fidelity reasoning, LLM-Brain moves beyond simple RAG by organizing knowledge into a verifiable graph of **Claims**, **Concepts**, **Episodes**, and **Procedures**.
 
-Version [`0.3.0`](VERSION) stores durable knowledge as inspectable OKF Markdown, keeps source custody and episodes separate from canonical memory, and rebuilds indexes, exports and context packs from that durable layer. It runs on Bash 3.2+ with standard macOS/Linux tools; Python standard library is used only to build the release archive.
+## 🚀 Key Features
 
-## Quick start
+- **Structured Reasoning**: Grounding LLM outputs in a formal ontology.
+- **Verifiable Integrity**: Built-in support for `review` and `retraction` layers to ensure truthfulness.
+- **Contextual Intelligence**: Generate semantic context packs for high-performance agentic workflows.
+- **Auditability**: Every piece of knowledge is part of a traceable episode.
 
+## 🛠 Installation & Usage
+
+### Installation
 ```bash
-# Inspect an existing root without changes
-bin/llm-brain --root /path/to/brain doctor
-bin/llm-brain --root /path/to/brain stats
-
-# Create project storage only when authorised
-bin/llm-brain --root /path/to/brain project ensure /path/to/repository
-
-# Capture source and optionally invoke an explicit local reflector
-bin/llm-brain --root /path/to/brain ingest /path/to/source.md \
-  --provider /path/to/trusted-reflector
-
-# Build an approved-only context pack
-bin/llm-brain --root /path/to/brain pack build <project-id> \
-  --agent generic --task "current task"
+# Clone the repository
+git clone https://github.com/w00ch3a/LLM-Brain.git
+cd LLM-Brain
+pip install -r requirements.txt
 ```
 
-The core makes no network calls. A reflector or embedder is an explicit local executable; do not configure one you do not trust with source material.
+### Running the CLI
+The CLI is available through two entry points:
+- **Core Binary:** `./bin/llm-brain`
+- **Shell Scripts:** `./scripts/llm-brain` (Recommended for quick terminal access)
 
-## Safety model
-
-Automatic promotion requires a low-risk claim, procedure or reference; confidence of at least `0.90`; clean secret scanning; provider ID/version; exact provenance; and no conflict. Clinical, security, authentication, privacy, legal, financial, production-control, destructive-migration and secret-related material stays in review. Retractions create tombstones instead of silently deleting history.
-
-Source reconciliation never substitutes current bytes for a historical hash. It recovers exact SHA-256 or legacy MD5 matches, revalidates effective canonical memory from current authority, or records an exhaustively searched source gap as unrecoverable only when no effective canonical item depends on it.
-
-## Commands
-
-```text
-root list|ensure|disable PATH
-detect
-project ensure [SOURCE_ROOT] [--id ID] [--alias ALIAS]
-topic add PROJECT_ID TITLE [--id ID] [--sensitivity LEVEL]
-ingest FILE [--topic ID] [--capture-only|--manual-only] [--provider EXECUTABLE]
-ingest-source PROJECT_ID FILE [ROOT]
-reflect list|prepare|submit|run PROJECT_ID [--provider EXECUTABLE]
-review list|show|decide PROJECT_ID ...
-validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
-retract PROJECT_ID CANONICAL_ID --reason TEXT
-index build|status PROJECT_ID [--embedder EXECUTABLE]
-search PROJECT_ID QUERY [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--explain] ...
-pack build PROJECT_ID --task TEXT [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] ...
-adapters build PROJECT_ID [--agent generic|all]
-export okf|knowledge-catalog|bundle PROJECT_ID
-import bundle FILE --dry-run|--apply [--project-id ID]
-map, secret-scan, stats, doctor, lint
-migrate check|apply|verify
-migrate reconcile-sources PROJECT_ID [--finalise-missing --reason TEXT]
-```
-
-Read-only commands do not create directories, write audit records or rebuild derived artefacts. `migrate apply --all` is an explicit staging/rollback operation, never a normal side effect.
-
-## Standalone package
-
+### Quick Start
 ```bash
-scripts/package-ai-skill.sh
+# Detect the knowledge structure in a project
+./scripts/llm-brain detect --root /path/to/your/project
 ```
 
-The command builds one deterministic standalone archive, checks archive members, extracts it and runs the packaged CLI’s version and help checks. The archive contains the CLI, skill contract, architecture reference, licence and version file; it contains no vendor-specific integration metadata.
+## 🏗 Architecture
 
-## Verification and documentation
-
-```bash
-bash -n bin/llm-brain
-tests/self-check.sh
-tests/v2-self-check.sh
-scripts/package-ai-skill.sh
-```
-
-See [SKILL.md](SKILL.md) for operating rules, [references/architecture.md](references/architecture.md) for the storage model, [RELEASING.md](RELEASING.md) for release gates and [SECURITY.md](SECURITY.md) for reporting boundaries.
+LLM-Brain is built on the **Open Knowledge Framework (OKF)**, designed to transform raw text into structured, actionable intelligence.
