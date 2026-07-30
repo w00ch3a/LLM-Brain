@@ -21,6 +21,13 @@ project_id="$(printf '%s\n' "$project_output" | sed -n 's/.*project_id=\([^ ]*\)
 [ -n "$project_id" ] || fail "project id missing"
 assert_contains "$($cli --root "$vault" project ensure "$repo")" 'changed=0'
 
+if invalid_project_output="$($cli --root "$vault" project ensure "$repo" --id bad/id 2>&1)"; then
+  fail "invalid project id unexpectedly passed"
+fi
+assert_contains "$invalid_project_output" 'invalid project id'
+[ ! -d "$vault/.locks/registry.lock" ] || fail "failed project ensure left registry lock behind"
+assert_contains "$($cli --root "$vault" project ensure "$repo")" 'changed=0'
+
 topic_output="$($cli --root "$vault" topic add "$project_id" "Automatic Memory")"
 topic_id="$(printf '%s\n' "$topic_output" | sed -n 's/.*topic_id=\([^ ]*\).*/\1/p')"
 [ -n "$topic_id" ] || fail "topic id missing"

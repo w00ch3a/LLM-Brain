@@ -24,6 +24,8 @@ INDEX_EXPECTED_SIGNATURE=""
 INDEX_EXPECTED_SIGNATURE_READY=0
 GENERATED_MARKER="<!-- llm-brain:generated-map -->"
 MAX_SOURCE_BYTES=$((10 * 1024 * 1024))
+CURRENT_LOCK=""
+MIGRATION_LOCK=""
 
 usage() {
   cat <<'USAGE'
@@ -197,15 +199,26 @@ acquire_lock() {
   if ! mkdir "$lock_dir" 2>/dev/null; then
     die 73 "lock held: $lock_dir"
   fi
-  printf 'pid=%s\ntimestamp=%s\nactor=%s\n' "$$" "$(now_utc)" "$ACTOR" >"$lock_dir/owner"
   CURRENT_LOCK="$lock_dir"
+  printf 'pid=%s\ntimestamp=%s\nactor=%s\n' "$$" "$(now_utc)" "$ACTOR" >"$lock_dir/owner"
 }
 
 release_lock() {
-  [ -n "${CURRENT_LOCK:-}" ] || return 0
-  rm -rf "$CURRENT_LOCK"
+  local lock_dir="${CURRENT_LOCK:-}"
   CURRENT_LOCK=""
+  [ -n "$lock_dir" ] || return 0
+  rm -rf "$lock_dir" 2>/dev/null || true
 }
+
+cleanup() {
+  release_lock
+  if [ -n "${MIGRATION_LOCK:-}" ]; then
+    rmdir "$MIGRATION_LOCK" 2>/dev/null || true
+    MIGRATION_LOCK=""
+  fi
+}
+
+trap cleanup EXIT
 
 project_dir() { printf '%s/projects/%s\n' "$ROOT" "$1"; }
 
@@ -2184,7 +2197,7 @@ cmd_migrate() {
       root_parent="$(dirname "$ROOT")"; base="$(basename "$ROOT")"; migration_id="v2-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
       local external_lock="$root_parent/.${base}.migration.lock"
       mkdir "$external_lock" 2>/dev/null || die 73 "migration lock held: $external_lock"
-      trap 'rmdir "$external_lock" 2>/dev/null || true' EXIT
+      MIGRATION_LOCK="$external_lock"
       inventory="$root_parent/.${base}.${migration_id}.inventory.tsv"
       migration_inventory "$ROOT" "$inventory"
       snapshot="$root_parent/${base}.snapshot.${migration_id}"; staging="$root_parent/${base}.migrate.${migration_id}"; rollback="$root_parent/${base}.rollback.${migration_id}"
@@ -2216,7 +2229,7 @@ cmd_migrate() {
         mv "$rollback" "$ROOT" || die 73 "post-migration verification failed and rollback could not be restored"
         die 1 "post-migration verification failed; original vault restored; failed staging retained at $failed"
       fi
-      trap - EXIT; rmdir "$external_lock" 2>/dev/null || true
+      MIGRATION_LOCK=""; rmdir "$external_lock" 2>/dev/null || true
       printf 'migration=ok root=%s snapshot=%s rollback=%s\n' "$ROOT" "$snapshot" "$rollback"
       ;;
     reconcile-sources)
