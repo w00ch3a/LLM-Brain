@@ -1,4 +1,4 @@
 interface:
   display_name: "LLM-Brain"
-  short_description: "Passive durable memory for project agents"
+  short_description: "Automatic durable memory for project agents"
   default_prompt: "Use $llm-brain to retrieve relevant project memory and capture the authorised closeout."

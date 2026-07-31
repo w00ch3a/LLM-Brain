@@ -4,7 +4,7 @@
 
 - Upgraded canonical storage to schema 3 and Google Open Knowledge Format v0.2.
 - Added strict PyYAML validation, legacy timestamp/citation migration, standard trust/lifecycle/freshness fields and Attested Computation interoperability.
-- Added passive Codex, Claude Code, Gemini CLI and generic-agent packaging with an explicit opt-out.
+- Added automatic Codex, Claude Code, Gemini CLI and generic-agent integration, giving users hands-off memory with an explicit opt-out.
 - Added the callable `llm-brain-upgrade` skill and deterministic package-and-all-vault upgrade, verification and rollback commands.
 - Added reproducible polyglot-plugin and standalone archives with pinned dependency checksums.
 - Removed machine-specific paths from public defaults and release documentation.

@@ -13,4 +13,4 @@ grep -Fq 'llm-brain-upgrade' "$repo_root/GEMINI.md"
 grep -Fxq 'llm-brain/hooks/session-start.sh' <<<"$archive_members"
 grep -Fxq 'llm-brain/skills/llm-brain-upgrade/SKILL.md' <<<"$archive_members"
 
-printf 'llm-brain passive self-check passed\n'
+printf 'llm-brain automatic-use self-check passed\n'

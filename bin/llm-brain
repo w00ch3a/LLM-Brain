@@ -2730,7 +2730,7 @@ upgrade_update_host() {
       ;;
   esac
   if [ -n "${LLM_BRAIN_GENERIC_INSTRUCTIONS:-}" ]; then
-    [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic passive adapter"
+    [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic automatic-use adapter"
     mkdir -p "$(dirname "$LLM_BRAIN_GENERIC_INSTRUCTIONS")"
     install -m 0644 "$source/adapters/generic.md" "$LLM_BRAIN_GENERIC_INSTRUCTIONS"
   fi
@@ -2778,7 +2778,7 @@ upgrade_backup_adapter() {
   else
     die 65 "unsupported generic instruction target: $target"
   fi
-  [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic passive adapter"
+  [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic automatic-use adapter"
   printf 'adapter_expected\t%s\n' "$(sha256_file "$source/adapters/generic.md")" >>"$receipt"
 }
 

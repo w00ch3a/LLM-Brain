@@ -18,7 +18,7 @@ bash -n "$repo_root/tests/self-check.sh"
 bash -n "$repo_root/tests/okf-self-check.sh"
 bash -n "$repo_root/tests/v3-self-check.sh"
 bash -n "$repo_root/tests/upgrade-self-check.sh"
-bash -n "$repo_root/tests/passive-self-check.sh"
+bash -n "$repo_root/tests/automatic-use-self-check.sh"
 bash -n "$repo_root/hooks/session-start.sh"
 python3 -m py_compile "$repo_root/lib/okf.py"
 

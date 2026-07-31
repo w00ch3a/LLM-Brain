@@ -1,13 +1,13 @@
 # LLM-Brain
 
-Passive, filesystem-first durable memory for coding agents, stored as human-readable [Google Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md).
+Active, automatic filesystem-first durable memory for coding agents, stored as human-readable [Google Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md).
 
-LLM-Brain gives Codex, Claude Code, Gemini CLI and generic agents governed project memory without requiring the user to ask for it on every task. Canonical knowledge remains inspectable Markdown; episodes, source custody, review, audit, indexes and context packs preserve how that knowledge was produced and used.
+LLM-Brain actively gives Codex, Claude Code, Gemini CLI and generic agents governed project memory. The experience is passive for the user: they do not need to remember, prompt or manage LLM-Brain on each task. Canonical knowledge remains inspectable Markdown; episodes, source custody, review, audit, indexes and context packs preserve how that knowledge was produced and used.
 
 ## What it provides
 
 - OKF v0.2 concepts with provenance, trust, lifecycle and freshness.
-- Passive preflight retrieval and authorised closeout capture.
+- Automatic preflight retrieval and authorised closeout capture, without user prompting.
 - Source custody, deterministic promotion policy, conflicts and retractions.
 - Lexical, graph and optional local-vector retrieval with scoped context packs.
 - `Attested Computation` interoperability without arbitrary code execution.
@@ -35,7 +35,7 @@ The polyglot plugin archive supports:
 - Gemini CLI through `gemini-extension.json` and `GEMINI.md`;
 - generic agents through `adapters/generic.md`.
 
-Set `LLM_BRAIN_PASSIVE=0` to opt out of passive retrieval and closeout. LLM-Brain does not run a daemon.
+Set `LLM_BRAIN_PASSIVE=0` to opt out of automatic retrieval and closeout. LLM-Brain does not run a daemon.
 
 ## Privacy
 

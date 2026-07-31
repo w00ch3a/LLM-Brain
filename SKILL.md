@@ -1,6 +1,6 @@
 ---
 name: llm-brain
-description: Automatically use filesystem-first LLM-Brain memory before and after every non-trivial project task, without waiting for the user to name it. Also use when asked to build, inspect, repair, migrate or retrieve durable project memory, OKF knowledge, reviews, indexes, context packs, adapters or exports. Skip passive use only when LLM_BRAIN_PASSIVE=0. Never replace current repository authority with an older memory record.
+description: Automatically use filesystem-first LLM-Brain memory before and after every non-trivial project task, without waiting for the user to name it. Also use when asked to build, inspect, repair, migrate or retrieve durable project memory, OKF knowledge, reviews, indexes, context packs, adapters or exports. Skip automatic use only when LLM_BRAIN_PASSIVE=0. Never replace current repository authority with an older memory record.
 ---
 
 # LLM-Brain operating skill
@@ -13,7 +13,9 @@ Its normal lifecycle is:
 
 Canonical semantic memory is a conformant Open Knowledge Format v0.2 bundle under `okf/`. Episodes, candidate reviews, indexes, packs, adapters and exports are supporting or derived layers.
 
-## Passive contract
+## Automatic operation, passive for the user
+
+LLM-Brain is active infrastructure. “Passive” describes the user experience: the agent uses LLM-Brain naturally, without requiring the user to remember, invoke or manage it.
 
 For every non-trivial project task, unless `LLM_BRAIN_PASSIVE=0`:
 

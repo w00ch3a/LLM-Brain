@@ -54,4 +54,4 @@ The public `upgrade` transaction:
 7. restores every changed root and the prior local package on failure;
 8. writes a non-secret receipt for verification or later rollback.
 
-Package v0.4.0 reads schemas 1, 2 and 3. The passive package uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. `LLM_BRAIN_PASSIVE=0` disables passive behaviour. No daemon or background scheduler exists.
+Package v0.4.0 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.

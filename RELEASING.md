@@ -15,7 +15,7 @@ python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/l
 python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/llm-brain-upgrade
 python3 "$codex_skills/.system/plugin-creator/scripts/validate_plugin.py" .
 bash scripts/package-ai-skill.sh
-bash tests/passive-self-check.sh
+bash tests/automatic-use-self-check.sh
 git diff --check
 ```
 
