@@ -1,0 +1,21 @@
+{
+  "name": "llm-brain",
+  "interface": {
+    "displayName": "LLM-Brain"
+  },
+  "plugins": [
+    {
+      "name": "llm-brain",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/w00ch3a/LLM-Brain.git",
+        "ref": "v0.4.0"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -59,6 +59,8 @@ case "$ingest_output" in
   *"ingest-source=ok"*"project=proj_demo"*"source_hash="*"episode="*"review="*) ;;
   *) printf 'ingest failed: %s\n' "$ingest_output" >&2; exit 1 ;;
 esac
+[ ! -f "$fixture/projects/proj_demo/schema.version" ] || { printf 'legacy ingest silently changed schema\n' >&2; exit 1; }
+[ ! -f "$fixture/projects/proj_demo/okf/project.md" ] || { printf 'legacy ingest silently changed canonical memory\n' >&2; exit 1; }
 
 map_output="$("$repo_root/bin/llm-brain" map proj_demo "$fixture")"
 case "$map_output" in

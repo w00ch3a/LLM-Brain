@@ -1,76 +1,57 @@
-# LLM-Brain v0.3 architecture reference
+# LLM-Brain v0.4 architecture reference
 
-LLM-Brain v0.3 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version (`0.3.0`); `schema.version` in a project is the storage schema (`2`). Schema-1 vaults remain readable and are migrated only through `migrate apply --all`.
+LLM-Brain v0.4 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction.
 
 ## Data layers
 
 | Layer | Location | Authority |
 |---|---|---|
-| Canonical semantic memory | `okf/` | Durable source of truth |
+| Canonical semantic memory | `okf/` | Conformant OKF v0.2 source of truth |
 | Episodic provenance | `episodes/YYYY-MM-DD/` | Append-only history; not truth |
 | Source custody | `sources/` | Full-SHA-256 content-addressed copies |
-| Exceptions | `review/`, `quarantine/` | Candidates, conflicts and secret/redaction metadata |
+| Exceptions | `review/`, `quarantine/` | Candidates, conflicts and redaction metadata |
 | Derived retrieval | `indexes/` | Rebuildable |
 | Derived consumption | `context-packs/`, `adapters/`, `exports/` | Rebuildable |
 
-Each v2 write uses `brain_*` frontmatter, an atomic same-directory temporary file, `umask 077`, a portable directory lock and the hash-chained `audit.v2.tsv`. Existing unknown frontmatter and legacy episode/audit contents are preserved by migration.
+The root `okf/index.md` contains only `okf_version: "0.2"` frontmatter plus progressive-disclosure links. Project identity is the normal `okf/project.md` concept. `okf/log.md` uses newest-first `## YYYY-MM-DD` groups. Every other Markdown file under `okf/` is a concept with parseable YAML frontmatter and a non-empty `type`.
 
-## Provider protocol
+PyYAML parsing is isolated in `lib/okf.py`. It rejects duplicate keys and malformed standard families while preserving unknown types and fields. Unknown types, unknown keys, broken links and missing optional families remain consumable. Bash owns CLI policy, locking, custody, migration and host orchestration.
 
-The core invokes only an explicit trusted executable:
+## Trust, lifecycle and retrieval
 
-```text
-reflector REQUEST_FILE EMPTY_OUTPUT_DIRECTORY
-```
+Schema-3 writers use the OKF `generated`, `verified`, `sources`, `status` and `stale_after` families plus useful `brain_*` extensions. Human verification is never inferred from approval. A verifier event is emitted only when a conformant actor and timestamp are actually recorded.
 
-The request records the episode and source as untrusted data. A provider emits one or more Markdown `ReviewItem` candidates. Required candidate metadata includes kind, confidence, risk, sensitivity, authority, provider ID/version and provenance. The core validates file bounds, frontmatter, secret scan, allowed kinds and custody-backed provenance before writing review records.
+Consumers derive:
 
-An embedder is another explicit executable:
+- no `verified` → `unverified`;
+- only non-human verification → `machine-confirmed`;
+- any `human:*` verification → `human-reviewed`;
+- `today >= stale_after` → stale;
+- absent `status` → stable.
 
-```text
-embedder CANONICAL_DOCUMENT
-```
+Indexes, search results and context packs surface lifecycle, trust and freshness. Effective memory still honours LLM-Brain sensitivity, retraction, conflict and supersession controls. `Attested Computation` documents are validated, indexed, preserved and exported; LLM-Brain does not execute their computation, executor or attester.
 
-Its output is exactly:
+## Provider and promotion policy
 
-```text
-model: local-model-id
-dimensions: 3
-vector: 0.1 -0.2 0.3
-```
+The core invokes only explicit trusted reflector, document embedder and query-embedder executables. Provider output is untrusted data and must pass bounded-file, YAML, secret, policy and custody checks.
 
-The vector count must equal dimensions. Cache entries are keyed by document hash and `LLM_BRAIN_EMBEDDER_VERSION`; `vectors.tsv` exists only after a valid embedding build.
+Automatic promotion remains limited to low-risk, high-confidence claims, procedures and references with provable custody and no protected-domain wording. Healthcare, clinical, security, authentication, privacy, legal, finance, payment, production control, destructive migration, secret, restricted, ambiguous, skill and adapter material remains review-only.
 
-Hybrid retrieval uses a separate explicit query embedder:
+## Migration and upgrade
 
-```text
-query-embedder QUERY_TEXT_FILE
-```
+`migrate check` is read-only and reports registry duplicates, review/scaffold counts, retraction candidates, source gaps and every OKF v0.2 transformation class. Schema-1/2 preflight accepts expected legacy reserved files, timestamps, citations and missing types while still rejecting malformed YAML and malformed standard families. Schema-3 staging and verification are strict.
 
-It returns the same three-line model, dimensions and vector format. The query model and dimensions must match the current vector index. Query embedding never makes a network call through the core.
+`migrate stage --all --output PATH` is an internal primitive used by the upgrader. It copies one root, performs the schema-3 transformation and verifies the staged copy without touching the live root. Normal operators use `migrate apply --all`, which retains the existing sibling snapshot/rollback behaviour and writes tar backups beneath `LLM_BRAIN_BACKUP_ROOT`.
 
-## Promotion policy
+The public `upgrade` transaction:
 
-Automatic promotion requires all of the following:
+1. discovers only configured roots;
+2. hashes package and vault state into a deterministic plan;
+3. installs the hash-locked PyYAML runtime;
+4. updates the detected host through its native manager;
+5. stages and verifies every vault before any cutover;
+6. rechecks live hashes, cuts over sequentially and verifies each root;
+7. restores every changed root and the prior local package on failure;
+8. writes a non-secret receipt for verification or later rollback.
 
-- claim, procedure or reference;
-- confidence `>= 0.90`, risk `low`, sensitivity `public` or `internal`;
-- exact source custody through an episode, effective approved OKF, explicit human directive, or verified runtime proof;
-- provider ID and version, clean secret scan and no conflict;
-- no protected-domain wording or ambiguity.
-
-Protected domains include clinical/healthcare, security/authentication, privacy, legal, finance/payment, production control, credentials/secrets and destructive migration. Skills and adapters are always review-only. The review file and canonical file are promoted under one project lock; conflicts write a review item and leave canonical memory untouched.
-
-## Retrieval and packs
-
-`documents.tsv`, `terms.tsv`, `graph.tsv` and `manifest.tsv` are deterministic rebuilds from effective-approved OKF. Index status reports each derived surface as `current`, `stale` or `missing`. Lexical search is the default and continues to scan effective approved memory directly. `--expand-graph` performs deterministic one-hop expansion from a current graph index; only `links_to`, `supersedes` and `conflicts_with` edges participate. `--strategy hybrid` fuses lexical and semantic ranks with reciprocal-rank fusion over a current vector index. Stale or missing semantic/graph inputs produce explicit lexical fallback metadata.
-
-Context packs are content-addressed by task, agent, filters, retrieval strategy and selected paths. They record the actual retrieval mode, degradation state, index manifest hash, filters and selection hash, bound excerpts to approximately four bytes/token, include a source hash/provider and point back to a relative canonical path.
-
-## Migration rules
-
-`migrate check` is read-only. `migrate apply --all` acquires an external sibling lock, inventories the live root, makes an SMB sibling snapshot and local tar backup, performs all changes in a sibling staging tree, compares the live manifest before cutover, then atomically renames the roots. Strict verification failure isolates the failed root and restores rollback immediately.
-
-Migration only reconciles exact, provable records: exact registry duplicates, scaffold review placeholders, canonical scaffold retractions, exact-hash source recovery and legacy topic compatibility. A legacy MD5 record is recoverable only when the candidate bytes reproduce that MD5; the custody copy is then addressed by SHA-256 and both algorithms remain explicit in provenance. An exhaustively searched gap may be finalised as unrecoverable only with a recorded reason and no effective canonical dependency. This closes an ambiguous operational exception without inventing missing content or silently replacing a drifted hash.
-
-An effective canonical item blocks source-gap finalisation. It may move to a current source only through `validate-source`, which requires an explicit reason, a bounded text file, a clean secret scan and exact SHA-256 custody. The former episode dependency is retained in the hash-chained audit event rather than left as an active provenance pointer. If current authority does not independently support the item, retract it instead.
+Package v0.4.0 reads schemas 1, 2 and 3. The passive package uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. `LLM_BRAIN_PASSIVE=0` disables passive behaviour. No daemon or background scheduler exists.

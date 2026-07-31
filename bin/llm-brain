@@ -4,21 +4,39 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_SOURCE_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  case "$SCRIPT_SOURCE" in /*) ;; *) SCRIPT_SOURCE="$SCRIPT_SOURCE_DIR/$SCRIPT_SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd -P)"
 VERSION_FILE=""
-for candidate in "$SCRIPT_DIR/../VERSION" "$SCRIPT_DIR/../../../VERSION"; do
+for candidate in "$SCRIPT_DIR/VERSION" "$SCRIPT_DIR/../VERSION" "$SCRIPT_DIR/../../../VERSION"; do
   [ -f "$candidate" ] && { VERSION_FILE="$candidate"; break; }
 done
 VERSION="$(tr -d '[:space:]' <"$VERSION_FILE" 2>/dev/null || printf '0.3.0-dev')"
-SCHEMA_VERSION="2"
-DEFAULT_ROOT="${LLM_BRAIN_ROOT:-/Volumes/home/Vaults/llm-brain}"
+if [ -n "$VERSION_FILE" ]; then
+  DETECTED_PACKAGE_ROOT="$(cd "$(dirname "$VERSION_FILE")" && pwd -P)"
+else
+  DETECTED_PACKAGE_ROOT="$SCRIPT_DIR"
+fi
+SCHEMA_VERSION="3"
+OKF_VERSION="0.2"
+PYYAML_VERSION="6.0.3"
+PLATFORM_DEFAULT_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/vault"
+DEFAULT_ROOT="${LLM_BRAIN_ROOT:-$PLATFORM_DEFAULT_ROOT}"
 ROOT="$DEFAULT_ROOT"
+ROOT_EXPLICIT=0
 CWD="$(pwd -P)"
 PROJECT_OVERRIDE="${LLM_BRAIN_PROJECT_ID:-}"
-ACTOR="${LLM_BRAIN_ACTOR:-llm-brain}"
+ACTOR="${LLM_BRAIN_ACTOR:-llm-brain/$VERSION}"
 REFLECTOR="${LLM_BRAIN_REFLECTOR:-}"
 EMBEDDER="${LLM_BRAIN_EMBEDDER:-}"
 QUERY_EMBEDDER="${LLM_BRAIN_QUERY_EMBEDDER:-}"
+BACKUP_ROOT="${LLM_BRAIN_BACKUP_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/backups}"
+OKF_HELPER="${LLM_BRAIN_OKF_HELPER:-}"
+OKF_PYTHON="${LLM_BRAIN_OKF_PYTHON:-}"
 SEARCH_SUPERSESSION_MAP=""
 INDEX_EXPECTED_SIGNATURE=""
 INDEX_EXPECTED_SIGNATURE_READY=0
@@ -26,6 +44,14 @@ GENERATED_MARKER="<!-- llm-brain:generated-map -->"
 MAX_SOURCE_BYTES=$((10 * 1024 * 1024))
 CURRENT_LOCK=""
 MIGRATION_LOCK=""
+UPGRADE_ACTIVE=0
+UPGRADE_RECEIPT=""
+UPGRADE_LOCKS=""
+UPGRADE_WORK=""
+UPGRADE_PACKAGE_ROOT=none
+UPGRADE_PACKAGE_BACKUP=none
+UPGRADE_HOST=standalone
+UPGRADE_MARKETPLACE=none
 
 usage() {
   cat <<'USAGE'
@@ -58,6 +84,10 @@ Commands:
   lint [--project PROJECT_ID] [--strict] [ROOT]
   migrate check|apply|verify [--all]
   migrate reconcile-sources PROJECT_ID [--finalise-missing --reason TEXT]
+  upgrade check --all [--host auto] [--target VERSION] [--root ROOT]
+  upgrade apply --all --host auto --target VERSION --plan-hash HASH [--root ROOT]
+  upgrade verify --receipt FILE
+  upgrade rollback --receipt FILE
   help | --version
 
 The core never calls a model itself. Reflectors and embedders are explicit,
@@ -69,6 +99,45 @@ say_error() { printf 'llm-brain: %s\n' "$*" >&2; }
 die() { local code="$1"; shift; say_error "$*"; exit "$code"; }
 now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 today_utc() { date -u '+%Y-%m-%d'; }
+
+resolve_okf_runtime() {
+  local candidate runtime_python
+  if [ -z "$OKF_HELPER" ]; then
+    for candidate in \
+      "$SCRIPT_DIR/../lib/okf.py" \
+      "$SCRIPT_DIR/lib/okf.py" \
+      "$SCRIPT_DIR/../scripts/okf.py" \
+      "$SCRIPT_DIR/../../lib/okf.py"; do
+      [ -f "$candidate" ] && { OKF_HELPER="$candidate"; break; }
+    done
+  fi
+  [ -n "$OKF_HELPER" ] && [ -f "$OKF_HELPER" ] || die 69 "OKF helper is unavailable"
+  if [ -z "$OKF_PYTHON" ]; then
+    runtime_python="${XDG_DATA_HOME:-$HOME/.local/share}/llm-brain/runtimes/$VERSION/bin/python"
+    if [ -x "$runtime_python" ]; then
+      OKF_PYTHON="$runtime_python"
+    else
+      OKF_PYTHON="$(command -v python3 || true)"
+    fi
+  fi
+  [ -n "$OKF_PYTHON" ] && [ -x "$OKF_PYTHON" ] || die 69 "Python 3 is unavailable"
+}
+
+okf() {
+  resolve_okf_runtime
+  "$OKF_PYTHON" "$OKF_HELPER" "$@"
+}
+
+okf_actor() {
+  case "$ACTOR" in human:*|process:*|*/*) printf '%s\n' "$ACTOR" ;; *) printf 'llm-brain/%s\n' "$VERSION" ;; esac
+}
+
+canonical_files() {
+  local dir="$1"
+  find "$dir/okf" -type f -name '*.md' \
+    ! -name 'index.md' ! -name 'log.md' ! -path '*/retractions/*' 2>/dev/null |
+    LC_ALL=C sort
+}
 
 require_positive_integer() {
   case "$1" in ''|*[!0-9]*) return 64 ;; esac
@@ -292,13 +361,38 @@ project_from_identity() {
 }
 
 write_project_index() {
-  local id="$1" dir="$2" tmp
+  local id="$1" dir="$2" tmp title="${SOURCE_ALIAS:-$1}" generated
+  generated="$(now_utc)"
   tmp="$dir/okf/index.md.tmp.$$"
-  [ -f "$dir/okf/index.md" ] && return 0
+  if [ ! -f "$dir/okf/index.md" ]; then
+    cat >"$tmp" <<EOF
+---
+okf_version: "$OKF_VERSION"
+---
+# LLM-Brain Knowledge
+
+## Project
+
+* [Project](project.md) - Project identity and scope.
+
+## Knowledge
+
+* [Claims](claims/) - Durable claims.
+* [Computations](computations/) - Attested computation contracts.
+* [Procedures](procedures/) - Reusable procedures.
+* [References](references/) - Durable references.
+* [Topics](topics/) - Scoped knowledge topics.
+EOF
+    mv "$tmp" "$dir/okf/index.md"
+  fi
+  [ -f "$dir/okf/project.md" ] && return 0
+  tmp="$dir/okf/project.md.tmp.$$"
   cat >"$tmp" <<EOF
 ---
 type: Project
-title: $(yaml_quote "$SOURCE_ALIAS")
+title: $(yaml_quote "$title")
+status: stable
+generated: {by: $(yaml_quote "llm-brain/$VERSION"), at: $(yaml_quote "$generated")}
 brain_project_id: $id
 brain_scope: project
 brain_review_state: approved
@@ -306,18 +400,22 @@ brain_sensitivity: internal
 brain_loading_temperature: hot
 brain_schema_version: $SCHEMA_VERSION
 brain_source_authority: repository
-timestamp: $(yaml_quote "$(now_utc)")
 ---
-# $SOURCE_ALIAS
+# $title
 
 Canonical filesystem-first durable memory for this project.
 EOF
-  mv "$tmp" "$dir/okf/index.md"
+  mv "$tmp" "$dir/okf/project.md"
 }
 
 ensure_project_layout() {
-  local id="$1" dir="$2"
+  local id="$1" dir="$2" initialise="${3:-0}" schema current=0
+  schema="$(cat "$dir/schema.version" 2>/dev/null || true)"
+  if [ "$initialise" = 1 ] || [ "$schema" = "$SCHEMA_VERSION" ] || { [ -z "$schema" ] && [ ! -f "$dir/okf/index.md" ]; }; then
+    current=1
+  fi
   ensure_dir "$dir/okf/claims"
+  ensure_dir "$dir/okf/computations"
   ensure_dir "$dir/okf/procedures"
   ensure_dir "$dir/okf/references"
   ensure_dir "$dir/okf/topics"
@@ -331,10 +429,12 @@ ensure_project_layout() {
   ensure_dir "$dir/exports"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
-  [ -f "$dir/schema.version" ] || printf '%s\n' "$SCHEMA_VERSION" >"$dir/schema.version"
-  [ -f "$dir/okf/log.md" ] || printf '# LLM-Brain Log\n\n' >"$dir/okf/log.md"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
-  write_project_index "$id" "$dir"
+  if [ "$current" = 1 ]; then
+    [ -f "$dir/schema.version" ] || printf '%s\n' "$SCHEMA_VERSION" >"$dir/schema.version"
+    [ -f "$dir/okf/log.md" ] || printf '# Directory Update Log\n\n## %s\n\n* **Initialization**: Created the OKF v0.2 bundle.\n' "$(today_utc)" >"$dir/okf/log.md"
+    write_project_index "$id" "$dir"
+  fi
 }
 
 audit_v2() {
@@ -450,7 +550,7 @@ cmd_project_ensure() {
   if [ ! -d "$dir" ]; then
     mkdir -p "$dir"; changed=1
   fi
-  ensure_project_layout "$id" "$dir"
+  ensure_project_layout "$id" "$dir" "$changed"
   if ! awk -F '\t' -v id="$id" 'NR > 1 && $2 == id { found=1 } END { exit !found }' "$(registry_projects)"; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\tactive\t%s\n' "$SCHEMA_VERSION" "$id" "$SOURCE_ALIAS" "$SOURCE_FINGERPRINT" "$SOURCE_ROOT" "$SOURCE_REMOTE" "$(now_utc)" >>"$(registry_projects)"
     changed=1
@@ -485,6 +585,8 @@ cmd_topic_add() {
 ---
 type: Topic
 title: $(yaml_quote "$title")
+status: stable
+generated: {by: $(yaml_quote "llm-brain/$VERSION"), at: $(yaml_quote "$(now_utc)")}
 brain_project_id: $project_id
 brain_topic_id: $id
 brain_scope: topic
@@ -492,7 +594,6 @@ brain_review_state: approved
 brain_sensitivity: $sensitivity
 brain_loading_temperature: warm
 brain_schema_version: $SCHEMA_VERSION
-timestamp: $(yaml_quote "$(now_utc)")
 ---
 # $title
 
@@ -776,14 +877,24 @@ promote_review_locked() {
     conflict="$(create_conflict_review "$dir" "$review_id" "$existing")"
     say_error "promotion conflict created: $conflict"
     return 73
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   confidence="$(frontmatter_field "$review" brain_confidence confidence)"
   sensitivity="$(frontmatter_field "$review" brain_sensitivity sensitivity)"
   body="$(review_body_for_canonical "$review")"
+  local generated_by generated_at verified_line=""
+  generated_by="$(frontmatter_field "$review" brain_provider_id)"
+  [ -n "$generated_by" ] && generated_by="${generated_by}/$(frontmatter_field "$review" brain_provider_version)"
+  case "$generated_by" in */?*) ;; *) generated_by="llm-brain/$VERSION" ;; esac
+  generated_at="$(now_utc)"
+  case "$actor" in human:*|process:*) verified_line="verified: {by: $(yaml_quote "$actor"), at: $(yaml_quote "$generated_at")}" ;; esac
   cat >"${dest}.tmp.$$" <<EOF
 ---
 type: $(printf '%s' "$kind" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
 title: $(yaml_quote "$title")
+status: stable
+generated: {by: $(yaml_quote "$generated_by"), at: $(yaml_quote "$generated_at")}
+$verified_line
+sources: [{resource: $(yaml_quote "review record $review_id")}]
 brain_project_id: $project_id
 brain_${kind}_id: $review_id
 brain_review_state: approved
@@ -797,7 +908,7 @@ brain_provider_id: $(yaml_quote "$(frontmatter_field "$review" brain_provider_id
 brain_provider_version: $(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")
 brain_candidate_hash_sha256: $(sha256_file "$review")
 brain_schema_version: $SCHEMA_VERSION
-last_validated_at: $(yaml_quote "$(now_utc)")
+last_validated_at: $(yaml_quote "$generated_at")
 ---
 # $title
 
@@ -1052,11 +1163,12 @@ cmd_retract() {
   cat >"${file}.tmp.$$" <<EOF
 ---
 type: Retraction
+status: stable
+generated: {by: $(yaml_quote "$(okf_actor)"), at: $(yaml_quote "$(now_utc)")}
 brain_project_id: $project_id
 brain_retracts: $canonical_id
 brain_review_state: superseded
 brain_schema_version: $SCHEMA_VERSION
-timestamp: $(yaml_quote "$(now_utc)")
 ---
 # Retraction for $canonical_id
 
@@ -1069,11 +1181,16 @@ EOF
 }
 
 canonical_file_effective() {
-  local dir="$1" file="$2" state sensitivity id
+  local dir="$1" file="$2" state status sensitivity id
   id="$(basename "$file" .md)"
   [ ! -f "$dir/okf/retractions/$id.md" ] || return 1
   state="$(frontmatter_field "$file" brain_review_state review_state)"
-  [ "$state" = "approved" ] || return 1
+  status="$(frontmatter_field "$file" status)"
+  if [ -n "$state" ]; then
+    [ "$state" = "approved" ] || return 1
+  else
+    [ "${status:-stable}" = "stable" ] || return 1
+  fi
   sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"
   [ "$sensitivity" != "restricted" ] || return 1
   return 0
@@ -1116,7 +1233,7 @@ canonical_signature() {
     canonical_file_effective "$dir" "$file" || continue
     rel="${file#"$dir"/}"
     printf '%s\t%s\n' "$rel" "$(sha256_file "$file")"
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
 }
 
 index_manifest_hash() {
@@ -1219,7 +1336,7 @@ file_superseded_by_current_memory() {
     supersedes="$(frontmatter_field "$candidate" brain_supersedes)"
     [ -n "$supersedes" ] || continue
     graph_target_matches "$dir" "$target_file" "$supersedes" && return 0
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   return 1
 }
 
@@ -1232,19 +1349,22 @@ build_supersession_map() {
     [ -n "$supersedes" ] || continue
     rel="${file#"$dir"/}"
     printf '%s\t%s\n' "$supersedes" "$rel" >>"$map"
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
 }
 
 search_file_eligible() {
-  local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" state sensitivity temperature
+  local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" state status sensitivity temperature
   [ ! -f "$dir/okf/retractions/$(basename "$file" .md).md" ] || return 1
   state="$(frontmatter_field "$file" brain_review_state review_state)"
+  status="$(frontmatter_field "$file" status)"; [ -n "$status" ] || status="stable"
   sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
   [ "$sensitivity" != "restricted" ] || return 1
-  if [ "$state" = "superseded" ]; then
+  if [ "$state" = "superseded" ] || [ "$status" = "deprecated" ]; then
     [ "$historical" = "1" ] || return 1
-  elif [ "$include_proposed" = "0" ]; then
+  elif [ "$include_proposed" = "0" ] && [ -n "$state" ]; then
     [ "$state" = "approved" ] || return 1
+  elif [ "$include_proposed" = "0" ]; then
+    [ "$status" = "stable" ] || return 1
   fi
   if [ "$historical" = "0" ]; then
     file_superseded_by_current_memory "$dir" "$file" && return 1
@@ -1268,22 +1388,24 @@ file_conflict_state() {
 }
 
 build_indexes() {
-  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state sensitivity temp body
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts
   dir="$(require_project "$project_id")"
   [ -z "$embedder" ] || [ -x "$embedder" ] || die 69 "embedder is not executable: $embedder"
   acquire_lock "project-$project_id"
   docs="$dir/indexes/documents.tsv"; terms="$dir/indexes/terms.tsv"; graph="$dir/indexes/graph.tsv"; manifest="$dir/indexes/manifest.tsv"; vectors="$dir/indexes/vectors.tsv"
   tmp_docs="${docs}.tmp.$$"; tmp_terms="${terms}.tmp.$$"; tmp_graph="${graph}.tmp.$$"; tmp_manifest="${manifest}.tmp.$$"; tmp_vectors="${vectors}.tmp.$$"
-  printf 'path\thash\ttype\ttitle\tstate\tsensitivity\ttemperature\ttopic_id\tvalidated_at\n' >"$tmp_docs"
+  printf 'path\thash\ttype\ttitle\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttemperature\ttopic_id\tgenerated_at\tstale_after\tsources\truntime\n' >"$tmp_docs"
   printf 'term\tpath\tcount\n' >"$tmp_terms"
   printf 'source\trelation\ttarget\n' >"$tmp_graph"
   printf 'path\thash\tschema\tembedder\n' >"$tmp_manifest"
   [ -z "$embedder" ] || printf 'path\thash\tmodel\tdimensions\tvector\n' >"$tmp_vectors"
   while IFS= read -r file; do
     canonical_file_effective "$dir" "$file" || continue
-    rel="${file#"$dir"/}"; hash="$(sha256_file "$file")"; title="$(frontmatter_field "$file" title)"; type="$(frontmatter_field "$file" type)"
+    rel="${file#"$dir"/}"; hash="$(sha256_file "$file")"
+    facts="$(okf facts "$file")"
+    IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
     state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; temp="$(frontmatter_field "$file" brain_loading_temperature)"; [ -n "$temp" ] || temp="warm"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$type" "$title" "$state" "${sensitivity:-internal}" "$temp" "$(frontmatter_field "$file" brain_topic_id topic_id)" "$(frontmatter_field "$file" last_validated_at)" >>"$tmp_docs"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$type" "$title" "$state" "$status" "$trust" "$freshness" "${sensitivity:-internal}" "$temp" "$(frontmatter_field "$file" brain_topic_id topic_id)" "$generated_at" "$stale_after" "$source_count" "$runtime" >>"$tmp_docs"
     body="$(cat "$file")"
     printf '%s\n' "$body" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '\n' | awk -v rel="$rel" 'length($0) > 2 { count[$0]++ } END { for (word in count) print word "\t" rel "\t" count[word] }' >>"$tmp_terms"
     printf '%s\tcontains\t%s\n' "$project_id" "$rel" >>"$tmp_graph"
@@ -1308,7 +1430,7 @@ build_indexes() {
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$(embedding_field "$vector" model)" "$(embedding_field "$vector" dimensions)" "$(embedding_field "$vector" vector)" >>"$tmp_vectors"
     fi
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   { head -1 "$tmp_docs"; tail -n +2 "$tmp_docs" | sort -u; } >"${tmp_docs}.sorted"; mv "${tmp_docs}.sorted" "$tmp_docs"
   { head -1 "$tmp_terms"; tail -n +2 "$tmp_terms" | sort -u; } >"${tmp_terms}.sorted"; mv "${tmp_terms}.sorted" "$tmp_terms"
   { head -1 "$tmp_graph"; tail -n +2 "$tmp_graph" | sort -u; } >"${tmp_graph}.sorted"; mv "${tmp_graph}.sorted" "$tmp_graph"
@@ -1350,7 +1472,7 @@ resolve_graph_target() {
     rel="${file#"$dir"/}"
     printf '%s\n' "$rel"
     return 0
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   return 1
 }
 
@@ -1404,7 +1526,7 @@ cmd_search() {
       printf '%s' "$title" | grep -Fqi -- "$term" && score=$((score + 4))
     done
     [ "$score" -gt 0 ] && printf '%s\t%s\n' "$rel" "$score" >>"$lexical_raw"
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   sort -t $'\t' -k2,2nr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
 
   if [ "$strategy" = "hybrid" ]; then
@@ -1497,20 +1619,22 @@ cmd_search() {
   ' "$base_records" "$graph_records" | sort -t $'\t' -k2,2nr -k1,1 >"$final_ranked"
 
   if [ "$explain" = "1" ]; then
-    printf 'path\tscore\ttype\tstate\tsensitivity\ttitle\tlexical_rank\tsemantic_rank\tgraph_source\tgraph_relation\tauthority\tindex_status\n'
+    printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\tlexical_rank\tsemantic_rank\tgraph_source\tgraph_relation\tauthority\tindex_status\n'
   else
-    printf 'path\tscore\ttype\tstate\tsensitivity\ttitle\n'
+    printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\n'
   fi
   while IFS=$'\t' read -r rel score lexical_position semantic_position graph_source graph_relation; do
     [ -n "$rel" ] || continue
-    file="$dir/$rel"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"; title="$(frontmatter_field "$file" title)"
+    local facts type status trust freshness generated_at stale_after source_count runtime
+    file="$dir/$rel"; facts="$(okf facts "$file")"; IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
+    state="$(frontmatter_field "$file" brain_review_state review_state)"; [ -n "$state" ] || state="$status"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"
     [ "$state" = "superseded" ] || [ "$graph_relation" = "supersedes" ] || ! file_superseded_by_current_memory "$dir" "$file" || state="superseded"
     if [ "$(file_conflict_state "$file" "$graph_file")" = "conflicted" ] || [ "$graph_relation" = "conflicts_with" ]; then state="${state}-conflicted"; fi
     if [ "$explain" = "1" ]; then
       authority="$(frontmatter_field "$file" brain_source_authority source_authority)"; [ -n "$authority" ] || authority="unknown"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\n' "$rel" "$score" "$(frontmatter_field "$file" type)" "$state" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state"
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$(frontmatter_field "$file" type)" "$state" "$sensitivity" "$title"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title"
     fi
   done < <(head -n "$limit" "$final_ranked")
   if [ -n "$metadata_file" ]; then
@@ -1573,10 +1697,12 @@ cmd_pack() {
     printf '## Selected Memory\n\n'
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
-      local source="$dir/$rel" excerpt
+      local source="$dir/$rel" excerpt facts type title status trust freshness generated_at stale_after source_count runtime
       excerpt="$(body_after_frontmatter "$source" | head -c 800)"
       [ $((bytes + ${#excerpt})) -le $((budget * 4)) ] || break
-      printf '### %s\n\n%s\n\nSource hash: <code>%s</code>  \nProvider: <code>%s</code>  \nExpansion: <code>%s</code>\n\n' "$(frontmatter_field "$source" title)" "$excerpt" "$(sha256_file "$source")" "$(frontmatter_field "$source" brain_provider_id)" "$rel"
+      facts="$(okf facts "$source")"
+      IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
+      printf '### %s\n\n%s\n\nType: <code>%s</code>  \nLifecycle: <code>%s</code>  \nTrust: <code>%s</code>  \nFreshness: <code>%s</code>  \nSource hash: <code>%s</code>  \nProvider: <code>%s</code>  \nExpansion: <code>%s</code>\n\n' "$title" "$excerpt" "$type" "$status" "$trust" "$freshness" "$(sha256_file "$source")" "$(frontmatter_field "$source" brain_provider_id)" "$rel"
       bytes=$((bytes + ${#excerpt}))
     done <<<"$selected"
     printf 'Actual bytes: %s\n' "$bytes"
@@ -1621,6 +1747,7 @@ EOF
 cmd_export() {
   local kind="$1" project_id="$2" dir out stage
   dir="$(require_project "$project_id")"
+  okf validate-bundle "$dir/okf" >/dev/null || die 65 "export refused non-conformant OKF bundle"
   case "$kind" in
     okf) printf 'export=okf path=%s\n' "$dir/okf" ;;
     knowledge-catalog)
@@ -1680,7 +1807,7 @@ cmd_import() {
   local bundle_schema bundle_project manifest_path manifest_hash
   bundle_schema="$(awk -F '\t' '$1 == "schema_version" { print $2; exit }' "$stage/bundle-manifest.tsv")"
   bundle_project="$(awk -F '\t' '$1 == "project_id" { print $2; exit }' "$stage/bundle-manifest.tsv")"
-  case "$bundle_schema" in 1|2) ;; *) rm -rf "$stage"; die 65 "unsupported bundle schema: $bundle_schema" ;; esac
+  case "$bundle_schema" in 1|2|3) ;; *) rm -rf "$stage"; die 65 "unsupported bundle schema: $bundle_schema" ;; esac
   [ "$bundle_project" = "$project_id" ] || { rm -rf "$stage"; die 73 "bundle project identity mismatch"; }
   while IFS=$'\t' read -r manifest_path manifest_hash; do
     [ "$manifest_path" = "path" ] && continue
@@ -1688,6 +1815,7 @@ cmd_import() {
     [ -f "$stage/$manifest_path" ] || { rm -rf "$stage"; die 65 "bundle manifest references missing file"; }
     [ "$(sha256_file "$stage/$manifest_path")" = "$manifest_hash" ] || { rm -rf "$stage"; die 65 "bundle manifest hash mismatch"; }
   done < <(tail -n +3 "$stage/bundle-manifest.tsv")
+  if ! okf validate-bundle "$stage/okf" >/dev/null; then rm -rf "$stage"; die 65 "bundle contains non-conformant OKF"; fi
   while IFS= read -r source; do
     is_regular_text_file "$source" || { rm -rf "$stage"; die 65 "bundle contains an invalid document"; }
     if secret_scan_file "$source"; then :; else rm -rf "$stage"; die 65 "bundle document matched secret scanner"; fi
@@ -1770,6 +1898,29 @@ lint_error() { LINT_ERRORS=$((LINT_ERRORS + 1)); printf 'lint:error %s\n' "$*"; 
 lint_warn() { LINT_WARNINGS=$((LINT_WARNINGS + 1)); printf 'lint:warn %s\n' "$*"; }
 lint_info() { LINT_INFOS=$((LINT_INFOS + 1)); printf 'lint:info %s\n' "$*"; }
 
+lint_okf_bundle() {
+  local project="$1" schema output errors malformed invalid_standard
+  schema="$(cat "$project/schema.version" 2>/dev/null || printf '1')"
+  if [ "$schema" = "$SCHEMA_VERSION" ]; then
+    if output="$(okf validate-bundle "$project/okf" 2>&1)"; then
+      printf '%s\n' "$output" | while IFS= read -r line; do
+        case "$line" in okf:error*) lint_error "$line" ;; esac
+      done
+      return 0
+    fi
+    printf '%s\n' "$output"
+    errors="$(printf '%s\n' "$output" | grep -c '^okf:error' || true)"
+    LINT_ERRORS=$((LINT_ERRORS + errors))
+    return 1
+  fi
+  output="$(okf audit "$project/okf")" || { lint_error "OKF audit failed project=$(basename "$project")"; return 1; }
+  malformed="$(printf '%s\n' "$output" | sed -n 's/.*malformed_frontmatter=\([0-9][0-9]*\).*/\1/p')"
+  invalid_standard="$(printf '%s\n' "$output" | sed -n 's/.*invalid_standard_fields=\([0-9][0-9]*\).*/\1/p')"
+  [ "${malformed:-0}" = 0 ] || lint_error "malformed canonical frontmatter project=$(basename "$project") count=$malformed"
+  [ "${invalid_standard:-0}" = 0 ] || lint_error "invalid OKF standard fields project=$(basename "$project") count=$invalid_standard"
+  lint_info "legacy OKF bundle awaits schema-3 migration project=$(basename "$project")"
+}
+
 check_registry() {
   [ -f "$(registry_projects)" ] || { lint_error "missing projects registry"; return; }
   [ -f "$(registry_roots)" ] || lint_info "missing roots registry (schema v1 compatibility)"
@@ -1782,6 +1933,7 @@ lint_project() {
   id="$(basename "$project")"
   [ -f "$project/okf/index.md" ] || lint_warn "missing canonical index project=$id"
   [ -f "$project/schema.version" ] || lint_info "missing schema marker project=$id (schema v1 compatibility)"
+  lint_okf_bundle "$project" || true
   while IFS= read -r sidecar; do
     source="${sidecar%.sha256}"; expected="$(awk '{print $1; exit}' "$sidecar")"
     [ -f "$source" ] || { lint_error "missing source for sidecar: $sidecar"; continue; }
@@ -1830,10 +1982,22 @@ cmd_doctor() {
   else
     cmd_lint >/dev/null || age=1
   fi
-  local now_epoch cutoff project file validated validated_epoch
+  local now_epoch cutoff project file validated validated_epoch schema facts type title status trust freshness rest
   now_epoch="$(date -u '+%s')"; cutoff=$((now_epoch - stale_days * 86400))
   for project in "$ROOT"/projects/*; do
     [ -d "$project" ] || continue
+    schema="$(cat "$project/schema.version" 2>/dev/null || printf '1')"
+    if [ "$schema" = "$SCHEMA_VERSION" ]; then
+      while IFS= read -r file; do
+        facts="$(okf facts "$file" 2>/dev/null || true)"
+        IFS=$'\t' read -r type title status trust freshness rest <<<"$facts"
+        if [ "$freshness" = "stale" ] || [ "$freshness" = "invalid" ]; then
+          say_error "doctor: $freshness canonical memory: ${file#"$ROOT"/}"
+          age=1
+        fi
+      done < <(canonical_files "$project")
+      continue
+    fi
     while IFS= read -r file; do
       validated="$(frontmatter_field "$file" last_validated_at)"
       if [ -z "$validated" ]; then
@@ -1859,7 +2023,7 @@ is_scaffold_content() {
 is_scaffold_review() { is_scaffold_content "$1"; }
 
 migration_report() {
-  local root="$1" duplicate_projects duplicate_roots scaffold reviews retractions source_unresolved source_unrecoverable
+  local root="$1" duplicate_projects duplicate_roots scaffold reviews retractions source_unresolved source_unrecoverable malformed=0 missing_types=0 invalid_reserved=0 legacy_timestamps=0 legacy_citations=0 invalid_standard=0 project audit
   duplicate_projects="$(awk -F '\t' 'NR > 1 { key=$0; if (seen[key]++) count++ } END { print count + 0 }' "$root/registry/projects.tsv" 2>/dev/null)"
   duplicate_roots="$(awk -F '\t' 'NR > 1 { key=$0; if (seen[key]++) count++ } END { print count + 0 }' "$root/registry/roots.tsv" 2>/dev/null)"
   scaffold="$({ find "$root/projects" -path '*/review/*.md' -type f -exec sh -c 'for file do grep -Eq "^Candidate statement: source .* was ingested into episodic memory|^Candidate statement: source context for |^Review whether this episode contains a reusable workflow before promotion\\." "$file" && grep -Eq "^brain_review_state:[[:space:]]*(proposed|needs-validation|draft)" "$file" && printf "%s\\n" "$file"; done' sh {} + 2>/dev/null || true; } | wc -l | tr -d ' ')"
@@ -1867,7 +2031,19 @@ migration_report() {
   retractions="$({ find "$root/projects" -type f \( -path '*/okf/claims/*.md' -o -path '*/okf/procedures/*.md' -o -path '*/okf/references/*.md' \) 2>/dev/null | while IFS= read -r file; do project="$(dirname "$(dirname "$(dirname "$file")")")"; is_scaffold_content "$file" && [ ! -f "$project/okf/retractions/$(basename "$file")" ] && printf '%s\n' "$file"; done || true; } | wc -l | tr -d ' ')"
   source_unresolved="$({ find "$root/projects" -path '*/migrations/source-reconciliation.tsv' -type f -exec awk -F '\t' 'NR > 1 && ($4 == "unsupported-hash" || $4 == "drifted-or-missing" || $4 == "missing-pointer") { count++ } END { if (count) print count }' {} + 2>/dev/null || true; } | awk '{ total += $1 } END { print total + 0 }')"
   source_unrecoverable="$({ find "$root/projects" -path '*/migrations/source-reconciliation.tsv' -type f -exec awk -F '\t' 'NR > 1 && $4 == "unrecoverable" { count++ } END { if (count) print count }' {} + 2>/dev/null || true; } | awk '{ total += $1 } END { print total + 0 }')"
-  printf 'migration_check root=%s duplicate_project_rows=%s duplicate_root_rows=%s review_items=%s scaffold_reviews=%s retractable_canonical=%s source_unresolved=%s source_unrecoverable=%s\n' "$root" "$duplicate_projects" "$duplicate_roots" "$reviews" "$scaffold" "$retractions" "$source_unresolved" "$source_unrecoverable"
+  for project in "$root"/projects/*; do
+    [ -d "$project/okf" ] || continue
+    audit="$(okf audit "$project/okf")" || die 65 "unable to audit OKF bundle: $project/okf"
+    printf '%s\n' "$audit" | grep -Eq '^malformed_frontmatter=[0-9]+ missing_types=[0-9]+ invalid_reserved=[0-9]+ legacy_timestamps=[0-9]+ legacy_citations=[0-9]+ invalid_standard_fields=[0-9]+$' ||
+      die 65 "invalid OKF audit result: $project/okf"
+    malformed=$((malformed + $(printf '%s\n' "$audit" | sed -n 's/.*malformed_frontmatter=\([0-9][0-9]*\).*/\1/p')))
+    missing_types=$((missing_types + $(printf '%s\n' "$audit" | sed -n 's/.*missing_types=\([0-9][0-9]*\).*/\1/p')))
+    invalid_reserved=$((invalid_reserved + $(printf '%s\n' "$audit" | sed -n 's/.*invalid_reserved=\([0-9][0-9]*\).*/\1/p')))
+    legacy_timestamps=$((legacy_timestamps + $(printf '%s\n' "$audit" | sed -n 's/.*legacy_timestamps=\([0-9][0-9]*\).*/\1/p')))
+    legacy_citations=$((legacy_citations + $(printf '%s\n' "$audit" | sed -n 's/.*legacy_citations=\([0-9][0-9]*\).*/\1/p')))
+    invalid_standard=$((invalid_standard + $(printf '%s\n' "$audit" | sed -n 's/.*invalid_standard_fields=\([0-9][0-9]*\).*/\1/p')))
+  done
+  printf 'migration_check root=%s duplicate_project_rows=%s duplicate_root_rows=%s review_items=%s scaffold_reviews=%s retractable_canonical=%s source_unresolved=%s source_unrecoverable=%s malformed_frontmatter=%s missing_types=%s invalid_reserved_files=%s legacy_timestamps=%s legacy_citations=%s invalid_standard_fields=%s\n' "$root" "$duplicate_projects" "$duplicate_roots" "$reviews" "$scaffold" "$retractions" "$source_unresolved" "$source_unrecoverable" "$malformed" "$missing_types" "$invalid_reserved" "$legacy_timestamps" "$legacy_citations" "$invalid_standard"
 }
 
 dedupe_tsv_exact() {
@@ -1987,7 +2163,7 @@ source_has_active_canonical_dependency() {
     canonical_file_effective "$dir" "$canonical" || continue
     grep -Fq "$hash" "$canonical" && return 0
     [ -z "$episode_id" ] || ! grep -Fq "$episode_id" "$canonical" || return 0
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   return 1
 }
 
@@ -2113,7 +2289,7 @@ EOF
 }
 
 migrate_project_in_place() {
-  local dir="$1" id review canonical rid source hash dest old_topic pointer ledger root_map algorithm custody_hash status
+  local dir="$1" id review canonical rid source hash dest old_topic pointer ledger root_map algorithm custody_hash status title
   id="$(basename "$1")"
   ensure_project_layout "$id" "$dir"
   printf '%s\n' "$SCHEMA_VERSION" >"$dir/schema.version"
@@ -2163,17 +2339,16 @@ migrate_project_in_place() {
       rid="$(frontmatter_field "$canonical" brain_claim_id brain_procedure_id)"; [ -n "$rid" ] || rid="$(basename "$canonical" .md)"
       write_migration_retraction "$dir" "$rid" "$canonical"
     fi
-    if [ -z "$(frontmatter_field "$canonical" last_validated_at)" ]; then
-      set_frontmatter_field "$canonical" last_validated_at "$(now_utc)"
-      audit_v2 "$dir" "migration-validation-backfill" "$(basename "$canonical" .md)" "" "validated" "$(sha256_file "$canonical")" "legacy-canonical"
-    fi
-  done < <(find "$dir/okf/claims" "$dir/okf/procedures" "$dir/okf/references" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(canonical_files "$dir")
   old_topic="$dir/topics"
   if [ -d "$old_topic" ]; then
     find "$old_topic" -type f -name '*.md' | while IFS= read -r source; do cp "$source" "$dir/okf/topics/legacy-$(basename "$source")"; done
     printf 'legacy_topics=%s\n' "$old_topic" >"$dir/migrations/legacy-topics.redirect"
   fi
   promote_context_architecture_directive "$dir"
+  title="$(awk -F '\t' -v id="$id" 'NR > 1 && $2 == id { print $3; exit }' "$(registry_projects)")"
+  [ -n "$title" ] || title="$id"
+  okf migrate-bundle "$dir/okf" --project-id "$id" --title "$title" --actor "llm-brain-migration/$VERSION" --at "$(now_utc)"
   build_indexes "$id" "" >/dev/null
   cmd_adapters build "$id" --agent all >/dev/null
   cmd_export knowledge-catalog "$id" >/dev/null
@@ -2187,6 +2362,29 @@ cmd_migrate() {
     verify)
       cmd_lint --strict; printf 'migration_verify=ok root=%s\n' "$ROOT"
       ;;
+    stage)
+      local all=0 output="" saved_root project
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --all) all=1; shift ;;
+          --output) output="${2:-}"; shift 2 ;;
+          *) die 64 "unknown migrate stage option: $1" ;;
+        esac
+      done
+      [ "$all" = 1 ] && [ -n "$output" ] || die 64 "migrate stage requires --all --output PATH"
+      [ "${output#/}" != "$output" ] || die 64 "migrate stage output must be absolute"
+      [ ! -e "$output" ] || die 73 "migrate stage output already exists: $output"
+      cmd_lint >/dev/null || die 73 "migration preflight failed; resolve lint errors first"
+      if [ -d "$ROOT/.locks" ] && find "$ROOT/.locks" -mindepth 1 -maxdepth 1 -type d | grep -q .; then die 73 "migration refused while project locks are present"; fi
+      saved_root="$ROOT"
+      clone_tree "$ROOT" "$output"
+      ROOT="$output"
+      acquire_lock registry; dedupe_tsv_exact "$(registry_projects)"; dedupe_tsv_exact "$(registry_roots)"; release_lock
+      for project in "$ROOT"/projects/*; do [ -d "$project" ] && migrate_project_in_place "$project"; done
+      cmd_lint --strict >/dev/null || { ROOT="$saved_root"; die 73 "staged migration failed strict verification"; }
+      ROOT="$saved_root"
+      printf 'migration_stage=ok source=%s output=%s\n' "$ROOT" "$output"
+      ;;
     apply)
       local all=0 root_parent base migration_id snapshot staging rollback inventory before after current_inventory failed snapshot_inventory backup_archive
       [ "${1:-}" = "--all" ] && all=1
@@ -2194,7 +2392,7 @@ cmd_migrate() {
       [ -d "$ROOT" ] || die 66 "brain root missing: $ROOT"
       cmd_lint >/dev/null || die 73 "migration preflight failed; resolve lint errors first"
       if [ -d "$ROOT/.locks" ] && find "$ROOT/.locks" -mindepth 1 -maxdepth 1 -type d | grep -q .; then die 73 "migration refused while project locks are present"; fi
-      root_parent="$(dirname "$ROOT")"; base="$(basename "$ROOT")"; migration_id="v2-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+      root_parent="$(dirname "$ROOT")"; base="$(basename "$ROOT")"; migration_id="v3-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
       local external_lock="$root_parent/.${base}.migration.lock"
       mkdir "$external_lock" 2>/dev/null || die 73 "migration lock held: $external_lock"
       MIGRATION_LOCK="$external_lock"
@@ -2203,8 +2401,8 @@ cmd_migrate() {
       snapshot="$root_parent/${base}.snapshot.${migration_id}"; staging="$root_parent/${base}.migrate.${migration_id}"; rollback="$root_parent/${base}.rollback.${migration_id}"
       clone_tree "$ROOT" "$snapshot"
       clone_tree "$ROOT" "$staging"
-      mkdir -p "$HOME/.local/state/llm-brain/backups/$migration_id"
-      backup_archive="$HOME/.local/state/llm-brain/backups/$migration_id/${base}.tar.gz"
+      mkdir -p "$BACKUP_ROOT/$migration_id"
+      backup_archive="$BACKUP_ROOT/$migration_id/${base}.tar.gz"
       tar -czf "$backup_archive" -C "$root_parent" "$base"
       snapshot_inventory="$root_parent/.${base}.${migration_id}.snapshot.tsv"
       migration_inventory "$snapshot" "$snapshot_inventory"
@@ -2242,10 +2440,727 @@ cmd_migrate() {
   esac
 }
 
+upgrade_manifest_hash() {
+  local root="$1" file rel
+  while IFS= read -r -d '' file; do
+    rel="${file#"$root"/}"
+    validate_scalar "$rel" || die 65 "upgrade refuses paths containing tabs or newlines"
+    printf '%s\t%s\n' "$rel" "$(sha256_file "$file")"
+  done < <(find "$root" -type f -print0)
+}
+
+upgrade_root_hash() {
+  upgrade_manifest_hash "$1" | LC_ALL=C sort | sha256_file /dev/stdin
+}
+
+upgrade_roots() {
+  local extra_file="$1" seed
+  {
+    [ "$ROOT_EXPLICIT" = 0 ] || printf '%s\n' "$ROOT"
+    [ -z "${LLM_BRAIN_ROOT:-}" ] || printf '%s\n' "$LLM_BRAIN_ROOT"
+    if [ "$ROOT_EXPLICIT" = 0 ] && [ -z "${LLM_BRAIN_ROOT:-}" ] && [ ! -s "$extra_file" ]; then printf '%s\n' "$PLATFORM_DEFAULT_ROOT"; fi
+    [ ! -f "${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/roots.tsv" ] || awk -F '\t' 'NF == 1 { print $1 } NF > 1 && $4 == "active" { print $2 }' "${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/roots.tsv"
+    [ ! -f "$extra_file" ] || cat "$extra_file"
+  } | awk 'NF && !seen[$0]++' | while IFS= read -r seed; do
+    [ -d "$seed" ] || continue
+    printf '%s\n' "$seed"
+    if [ -f "$seed/registry/roots.tsv" ]; then
+      awk -F '\t' 'NR > 1 && $4 == "active" { print $2 }' "$seed/registry/roots.tsv"
+    fi
+  done | awk 'NF && !seen[$0]++'
+}
+
+upgrade_host_info() {
+  local requested="$1" host inventory info marketplace version source name install_type manifest metadata candidate
+  host="$requested"
+  if [ "$host" = auto ]; then
+    host=standalone
+    for candidate in codex claude; do
+      command -v "$candidate" >/dev/null 2>&1 || continue
+      inventory="$(mktemp "${TMPDIR:-/tmp}/llm-brain-codex.XXXXXX")"
+      if [ "$candidate" = codex ]; then
+        codex plugin list --json >"$inventory" 2>/dev/null || true
+      else
+        claude plugin list --json >"$inventory" 2>/dev/null || true
+      fi
+      if info="$(okf plugin-info "$inventory" llm-brain 2>/dev/null)"; then
+        rm -f "$inventory"
+        printf '%s\t%s\n' "$candidate" "$info"
+        return 0
+      fi
+      rm -f "$inventory"
+    done
+    manifest="${LLM_BRAIN_GEMINI_ROOT:-$HOME/.gemini/extensions/llm-brain}/gemini-extension.json"
+    if command -v gemini >/dev/null 2>&1 && [ -f "$manifest" ]; then host=gemini; fi
+  fi
+  case "$host" in
+    codex|claude)
+      inventory="$(mktemp "${TMPDIR:-/tmp}/llm-brain-codex.XXXXXX")"
+      if [ "$host" = codex ]; then
+        codex plugin list --json >"$inventory" 2>/dev/null
+      else
+        claude plugin list --json >"$inventory" 2>/dev/null
+      fi || { rm -f "$inventory"; die 69 "unable to inspect $host plugins"; }
+      info="$(okf plugin-info "$inventory" llm-brain 2>/dev/null || true)"
+      rm -f "$inventory"
+      [ -n "$info" ] || die 66 "LLM-Brain is not installed in $host"
+      printf '%s\t%s\n' "$host" "$info"
+      ;;
+    gemini)
+      source="${LLM_BRAIN_GEMINI_ROOT:-$HOME/.gemini/extensions/llm-brain}"
+      manifest="$source/gemini-extension.json"
+      [ -f "$manifest" ] || die 66 "LLM-Brain is not installed in Gemini CLI"
+      IFS=$'\t' read -r name version _ <<<"$(okf manifest-info "$manifest")"
+      [ "$name" = llm-brain ] || die 65 "Gemini extension identity mismatch: $manifest"
+      metadata="$source/.gemini-extension-install.json"
+      install_type=unknown
+      if [ -f "$metadata" ]; then IFS=$'\t' read -r _ _ install_type <<<"$(okf manifest-info "$metadata")"; fi
+      printf 'gemini\tgemini:%s\t%s\t%s\n' "$install_type" "$version" "$source"
+      ;;
+    standalone)
+      source="${LLM_BRAIN_PACKAGE_ROOT:-$DETECTED_PACKAGE_ROOT}"
+      printf 'standalone\tnone\t%s\t%s\n' "$VERSION" "$source"
+      ;;
+    *) die 64 "unsupported upgrade host: $host" ;;
+  esac
+}
+
+upgrade_restart_requirement() {
+  case "$1" in
+    codex) printf 'new-session\n' ;;
+    claude) printf 'reload-or-restart\n' ;;
+    gemini) printf 'restart\n' ;;
+    standalone) printf 'none\n' ;;
+  esac
+}
+
+upgrade_validate_package_root() {
+  local host="$1" root="$2" expected="${3:-}" manifest name version
+  validate_scalar "$root" || die 65 "invalid installed package root"
+  case "$root" in /|"$HOME") die 65 "unsafe installed package root refused: $root" ;; esac
+  [ -n "$root" ] && [ "$root" != none ] && [ -d "$root" ] && [ ! -L "$root" ] ||
+    die 65 "installed package root is unavailable: $root"
+  case "$host" in
+    codex) manifest="$root/.codex-plugin/plugin.json" ;;
+    claude) manifest="$root/.claude-plugin/plugin.json" ;;
+    gemini) manifest="$root/gemini-extension.json" ;;
+    *) return 0 ;;
+  esac
+  [ -f "$manifest" ] || die 65 "installed package manifest missing: $manifest"
+  IFS=$'\t' read -r name version _ <<<"$(okf manifest-info "$manifest")"
+  [ "$name" = llm-brain ] && [ "$version" != unknown ] ||
+    die 65 "installed package manifest is invalid: $manifest"
+  [ -z "$expected" ] || [ "$version" = "$expected" ] ||
+    die 65 "installed package metadata disagrees with its manifest: $manifest"
+}
+
+upgrade_release_checksum() {
+  local target="$1" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" checksum repository url value
+  if [ -n "$source" ] && [ -f "$source/VERSION" ] && [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ]; then
+    checksum="$source/dist/llm-brain-${target}-standalone.tar.gz.sha256"
+    if [ -f "$checksum" ]; then awk '{print $1; exit}' "$checksum"; return 0; fi
+    find "$source" -type f \( -path '*/bin/llm-brain' -o -path '*/scripts/llm-brain' \) -print -quit | while IFS= read -r checksum; do sha256_file "$checksum"; done
+    return 0
+  fi
+  repository="$DETECTED_PACKAGE_ROOT"
+  if [ -f "$repository/VERSION" ] && [ "$(tr -d '[:space:]' <"$repository/VERSION")" = "$target" ] && [ -f "$repository/lib/okf.py" ]; then
+    checksum="$(upgrade_target_cli "$repository" || true)"
+    [ -n "$checksum" ] || die 66 "installed target package lacks the CLI"
+    sha256_file "$checksum"
+    return 0
+  fi
+  checksum="$repository/dist/llm-brain-${target}-standalone.tar.gz.sha256"
+  [ -f "$checksum" ] || checksum="$repository/dist/llm-brain-${target}.tar.gz.sha256"
+  if [ -f "$checksum" ]; then awk '{print $1; exit}' "$checksum"; return 0; fi
+  url="${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/llm-brain-${target}-standalone.tar.gz.sha256"
+  value="$(curl -fsSL "$url" 2>/dev/null | awk '{print $1; exit}' || true)"
+  printf '%s' "$value" | grep -Eq '^[a-f0-9]{64}$' || die 69 "unable to resolve target release checksum"
+  printf '%s\n' "$value"
+}
+
+upgrade_project_schemas() {
+  local root="$1" project
+  for project in "$root"/projects/*; do
+    [ -d "$project" ] || continue
+    cat "$project/schema.version" 2>/dev/null || printf '1\n'
+  done | sort -nu | paste -sd, -
+}
+
+build_upgrade_plan() {
+  local roots_file="$1" target="$2" requested_host="$3" material="$4" summary="$5"
+  local host_info host marketplace installed package_root installed_cli package_checksum release_checksum root manifest schemas locks lock_paths free_kb size_kb report backup root_token runtime_python yaml_current=unavailable adapter_target restart total_size_kb=0
+  host_info="$(upgrade_host_info "$requested_host")"
+  IFS=$'\t' read -r host marketplace installed package_root <<<"$host_info"
+  validate_scalar "$marketplace" || die 65 "invalid package source"
+  [ "$host" = standalone ] || upgrade_validate_package_root "$host" "$package_root" "$installed"
+  installed_cli="$(upgrade_target_cli "$package_root" || true)"
+  [ -n "$installed_cli" ] || die 66 "installed package lacks the CLI: $package_root"
+  package_checksum="$(sha256_file "$installed_cli")"
+  release_checksum="$(upgrade_release_checksum "$target")"
+  runtime_python="${XDG_DATA_HOME:-$HOME/.local/share}/llm-brain/runtimes/$installed/bin/python"
+  if [ -x "$runtime_python" ]; then yaml_current="$("$runtime_python" -c 'import yaml; print(yaml.__version__)' 2>/dev/null || printf unavailable)"; fi
+  adapter_target="${LLM_BRAIN_GENERIC_INSTRUCTIONS:-none}"
+  validate_scalar "$adapter_target" || die 65 "invalid generic adapter path"
+  restart="$(upgrade_restart_requirement "$host")"
+  {
+    printf 'format=llm-brain-upgrade-plan-v1\n'
+    printf 'target=%s\nhost=%s\npackage_source=%s\ninstalled=%s\npackage_root=%s\npackage_checksum=%s\ntarget_checksum=%s\nyaml_current=%s\nyaml_target=%s\nadapter_target=%s\nrestart=%s\n' \
+      "$target" "$host" "$marketplace" "$installed" "$package_root" "$package_checksum" "$release_checksum" "$yaml_current" "$PYYAML_VERSION" "$adapter_target" "$restart"
+  } >"$material"
+  {
+    printf 'upgrade_check=ok current=%s target=%s schema_target=%s okf_target=%s host=%s package_source=%s package_checksum=%s target_checksum=%s yaml_current=%s yaml_target=%s adapter_target=%s\n' \
+      "$installed" "$target" "$SCHEMA_VERSION" "$OKF_VERSION" "$host" "$marketplace" "$package_checksum" "$release_checksum" "$yaml_current" "$PYYAML_VERSION" "$adapter_target"
+  } >"$summary"
+  while IFS= read -r root; do
+    [ -d "$root/projects" ] && [ -d "$root/registry" ] || die 65 "configured vault is incomplete: $root"
+    [ ! -L "$root" ] || die 65 "symlinked vault root refused: $root"
+    validate_scalar "$root" || die 65 "invalid vault path"
+    manifest="$(upgrade_root_hash "$root")"
+    schemas="$(upgrade_project_schemas "$root")"; [ -n "$schemas" ] || schemas="none"
+    locks="$(find "$root/.locks" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    lock_paths="$(find "$root/.locks" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort | paste -sd, -)"; [ -n "$lock_paths" ] || lock_paths=none
+    free_kb="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
+    size_kb="$(du -sk "$root" | awk '{print $1}')"
+    total_size_kb=$((total_size_kb + size_kb))
+    root_token="$(sha256_text "$root" | cut -c1-12)"
+    backup="$BACKUP_ROOT/<upgrade-id>/$(basename "$root")-${root_token}.tar.gz"
+    report="$(migration_report "$root")"
+    printf 'vault=%s\nvault_manifest=%s\nvault_schemas=%s\nvault_locks=%s\nvault_backup=%s\n' "$root" "$manifest" "$schemas" "$lock_paths" "$backup" >>"$material"
+    printf 'vault root=%s schemas=%s manifest=%s active_locks=%s lock_paths=%s size_kb=%s free_kb=%s backup=%s %s\n' \
+      "$root" "$schemas" "$manifest" "$locks" "$lock_paths" "$size_kb" "$free_kb" "$backup" "$report" >>"$summary"
+  done <"$roots_file"
+  [ "$(wc -l <"$roots_file" | tr -d ' ')" -gt 0 ] || die 66 "no configured LLM-Brain vaults found"
+  printf 'expected_backup_kb=%s restart_required=%s rollback=%s/<upgrade-id>/receipt.tsv\n' "$total_size_kb" "$restart" "$BACKUP_ROOT" >>"$summary"
+}
+
+upgrade_prepare_source() {
+  local target="$1" work="$2" planned="$3" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" archive checksum expected actual extracted target_cli
+  if [ -n "$source" ]; then
+    [ -d "$source" ] && [ -f "$source/VERSION" ] || die 66 "upgrade source is incomplete: $source"
+    [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ] || die 65 "upgrade source version does not match target"
+    archive="$source/dist/llm-brain-${target}-standalone.tar.gz"
+    if [ -f "$archive" ]; then
+      actual="$(sha256_file "$archive")"
+      [ "$actual" = "$planned" ] || die 73 "target release changed after preflight"
+      tar -tzf "$archive" | awk 'BEGIN{bad=0} /^\// || /(^|\/)\.\.\// {bad=1} END{exit bad}' || die 65 "unsafe target archive"
+      extracted="$work/release"; mkdir -p "$extracted"; tar -xzf "$archive" -C "$extracted"
+      source="$(find "$extracted" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+      [ -n "$source" ] && [ -f "$source/VERSION" ] || die 65 "target archive layout is incomplete"
+      printf '%s\n' "$source"
+      return 0
+    fi
+    target_cli="$(upgrade_target_cli "$source" || true)"
+    [ -n "$target_cli" ] && [ "$(sha256_file "$target_cli")" = "$planned" ] ||
+      die 73 "target source changed after preflight"
+    printf '%s\n' "$source"
+    return 0
+  fi
+  source="$DETECTED_PACKAGE_ROOT"
+  if [ -f "$source/VERSION" ] && [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ] && [ -f "$source/lib/okf.py" ]; then
+    [ "$(sha256_file "$source/bin/llm-brain")" = "$planned" ] || die 73 "target source changed after preflight"
+    printf '%s\n' "$source"
+    return 0
+  fi
+  archive="$work/llm-brain-${target}-standalone.tar.gz"
+  checksum="${archive}.sha256"
+  curl -fsSL "${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/$(basename "$archive")" -o "$archive" || die 69 "target release download failed"
+  curl -fsSL "${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/$(basename "$checksum")" -o "$checksum" || die 69 "target checksum download failed"
+  expected="$(awk '{print $1; exit}' "$checksum")"; actual="$(sha256_file "$archive")"
+  [ "$expected" = "$planned" ] || die 73 "target release changed after preflight"
+  [ "$expected" = "$actual" ] || die 65 "target release checksum mismatch"
+  tar -tzf "$archive" | awk 'BEGIN{bad=0} /^\// || /(^|\/)\.\.\// {bad=1} END{exit bad}' || die 65 "unsafe target archive"
+  extracted="$work/release"; mkdir -p "$extracted"; tar -xzf "$archive" -C "$extracted"
+  source="$(find "$extracted" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+  [ -n "$source" ] && [ -f "$source/VERSION" ] || die 65 "target archive layout is incomplete"
+  printf '%s\n' "$source"
+}
+
+upgrade_install_runtime() {
+  local target="$1" source="$2" runtime_parent runtime final stage python previous=""
+  runtime_parent="${XDG_DATA_HOME:-$HOME/.local/share}/llm-brain/runtimes"
+  final="$runtime_parent/$target"
+  if [ -x "$final/bin/python" ] && "$final/bin/python" -c 'import sys, yaml; raise SystemExit(yaml.__version__ != sys.argv[1])' "$PYYAML_VERSION"; then
+    printf '%s\n' "$final"
+    return 0
+  fi
+  [ -f "$source/requirements-okf.lock" ] || die 66 "target release lacks requirements-okf.lock"
+  python="$(command -v python3 || true)"; [ -n "$python" ] || die 69 "Python 3 is required for the OKF runtime"
+  mkdir -p "$runtime_parent"
+  stage="$runtime_parent/.${target}.tmp.$$"; [ ! -e "$stage" ] || die 73 "runtime staging path exists"
+  "$python" -m venv "$stage" || { rm -rf "$stage"; die 69 "OKF runtime creation failed"; }
+  "$stage/bin/pip" install --require-hashes --no-binary PyYAML -r "$source/requirements-okf.lock" >/dev/null || { rm -rf "$stage"; die 69 "hash-locked PyYAML installation failed"; }
+  "$stage/bin/python" -c 'import sys, yaml; raise SystemExit(yaml.__version__ != sys.argv[1])' "$PYYAML_VERSION" || { rm -rf "$stage"; die 69 "OKF runtime verification failed"; }
+  if [ -e "$final" ]; then previous="${final}.previous.$$"; mv "$final" "$previous"; fi
+  if ! mv "$stage" "$final"; then
+    [ -z "$previous" ] || mv "$previous" "$final" 2>/dev/null || true
+    die 73 "OKF runtime cutover failed"
+  fi
+  printf '%s\n' "$final"
+}
+
+upgrade_target_cli() {
+  local source="$1"
+  for candidate in "$source/llm-brain" "$source/bin/llm-brain" "$source/scripts/llm-brain" "$source/skills/llm-brain/scripts/llm-brain"; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+upgrade_update_host() {
+  local host="$1" marketplace="$2" source="$3" target="$4" install_root link target_dir
+  case "$host" in
+    codex)
+      codex plugin marketplace upgrade "$marketplace"
+      codex plugin add "llm-brain@$marketplace"
+      ;;
+    claude) claude plugin update "llm-brain@$marketplace" ;;
+    gemini) gemini extensions update llm-brain ;;
+    standalone)
+      install_root="${LLM_BRAIN_STANDALONE_ROOT:-$HOME/.local/lib/llm-brain}"
+      target_dir="${install_root}/${target}"
+      [ ! -e "$target_dir" ] || die 73 "standalone target already exists: $target_dir"
+      mkdir -p "$target_dir" "$HOME/.local/bin"
+      install -m 0755 "$(upgrade_target_cli "$source")" "$target_dir/llm-brain"
+      mkdir -p "$target_dir/lib"
+      install -m 0644 "$source/lib/okf.py" "$target_dir/lib/okf.py"
+      install -m 0644 "$source/VERSION" "$source/requirements-okf.lock" "$target_dir/"
+      link="$HOME/.local/bin/llm-brain"
+      [ ! -e "$link" ] || [ -L "$link" ] || die 73 "refusing to replace non-symlink standalone launcher: $link"
+      ln -sfn "$target_dir/llm-brain" "${link}.tmp.$$"; mv -f "${link}.tmp.$$" "$link"
+      ;;
+  esac
+  if [ -n "${LLM_BRAIN_GENERIC_INSTRUCTIONS:-}" ]; then
+    [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic passive adapter"
+    mkdir -p "$(dirname "$LLM_BRAIN_GENERIC_INSTRUCTIONS")"
+    install -m 0644 "$source/adapters/generic.md" "$LLM_BRAIN_GENERIC_INSTRUCTIONS"
+  fi
+}
+
+upgrade_verify_host_version() {
+  local host="$1" target="$2" inventory info version manifest name
+  case "$host" in
+    standalone)
+      [ "$("$HOME/.local/bin/llm-brain" --version 2>/dev/null)" = "$target" ]
+      ;;
+    codex|claude)
+      inventory="$(mktemp "${TMPDIR:-/tmp}/llm-brain-host.XXXXXX")"
+      case "$host" in
+        codex) codex plugin list --json >"$inventory" 2>/dev/null ;;
+        claude) claude plugin list --json >"$inventory" 2>/dev/null ;;
+      esac || { rm -f "$inventory"; return 1; }
+      info="$(okf plugin-info "$inventory" llm-brain 2>/dev/null || true)"
+      rm -f "$inventory"
+      IFS=$'\t' read -r _ version _ <<<"$info"
+      [ "$version" = "$target" ]
+      ;;
+    gemini)
+      manifest="${LLM_BRAIN_GEMINI_ROOT:-$HOME/.gemini/extensions/llm-brain}/gemini-extension.json"
+      [ -f "$manifest" ] || return 1
+      IFS=$'\t' read -r name version _ <<<"$(okf manifest-info "$manifest" 2>/dev/null || true)"
+      [ "$name" = llm-brain ] && [ "$version" = "$target" ]
+      ;;
+  esac
+}
+
+upgrade_backup_adapter() {
+  local source="$1" receipt="$2" target="${LLM_BRAIN_GENERIC_INSTRUCTIONS:-}" backup
+  [ -n "$target" ] || return 0
+  case "$target" in /*) ;; *) die 64 "generic instruction target must be absolute" ;; esac
+  validate_scalar "$target" || die 65 "invalid generic instruction target"
+  [ ! -L "$target" ] || die 65 "symlinked generic instruction target refused: $target"
+  [ ! -d "$target" ] || die 65 "generic instruction target is a directory: $target"
+  backup="$(dirname "$receipt")/generic-adapter.previous"
+  if [ -f "$target" ]; then
+    cp -p "$target" "$backup"
+    printf 'adapter\t%s\tprevious\tpresent\tbackup\t%s\n' "$target" "$backup" >>"$receipt"
+  elif [ ! -e "$target" ]; then
+    printf 'adapter\t%s\tprevious\tabsent\tbackup\tnone\n' "$target" >>"$receipt"
+  else
+    die 65 "unsupported generic instruction target: $target"
+  fi
+  [ -f "$source/adapters/generic.md" ] || die 66 "target release lacks the generic passive adapter"
+  printf 'adapter_expected\t%s\n' "$(sha256_file "$source/adapters/generic.md")" >>"$receipt"
+}
+
+upgrade_verify_adapter() {
+  local source="$1" target="${LLM_BRAIN_GENERIC_INSTRUCTIONS:-}"
+  [ -n "$target" ] || return 0
+  [ -f "$target" ] && [ ! -L "$target" ] &&
+    [ "$(sha256_file "$target")" = "$(sha256_file "$source/adapters/generic.md")" ]
+}
+
+upgrade_verify_receipt_adapter() {
+  local receipt="$1" target expected
+  target="$(awk -F '\t' '$1 == "adapter" { print $2; exit }' "$receipt")"
+  [ -n "$target" ] || return 0
+  expected="$(awk -F '\t' '$1 == "adapter_expected" { print $2; exit }' "$receipt")"
+  [ -f "$target" ] && [ ! -L "$target" ] && [ -n "$expected" ] &&
+    [ "$(sha256_file "$target")" = "$expected" ]
+}
+
+upgrade_restore_adapter() {
+  local receipt="$1" target previous backup temporary
+  [ -f "$receipt" ] || return 0
+  IFS=$'\t' read -r _ target _ previous _ backup < <(awk -F '\t' '$1 == "adapter" { print; exit }' "$receipt") || return 0
+  [ -n "$target" ] || return 0
+  case "$target" in /*) ;; *) return 1 ;; esac
+  if [ "$previous" = present ]; then
+    [ -f "$backup" ] || return 1
+    mkdir -p "$(dirname "$target")"
+    temporary="${target}.restore.$$"
+    cp -p "$backup" "$temporary" && mv -f "$temporary" "$target"
+  elif [ "$previous" = absent ]; then
+    [ ! -d "$target" ] || return 1
+    rm -f "$target"
+  else
+    return 1
+  fi
+}
+
+upgrade_restore_package() {
+  local package_root="$1" backup="$2" host="$3" marketplace="$4" receipt="${5:-}" failed parent launcher previous target_dir restore_root restore_stage restored
+  if [ "$host" = standalone ] && [ -f "$receipt" ]; then
+    IFS=$'\t' read -r _ launcher _ previous _ target_dir < <(awk -F '\t' '$1 == "standalone" { print; exit }' "$receipt") || return 0
+    if [ -n "$target_dir" ] && [ -d "$target_dir" ]; then
+      failed="${target_dir}.failed.$(date -u '+%Y%m%dT%H%M%SZ')"
+      [ ! -e "$failed" ] || return 1
+      mv "$target_dir" "$failed" || return 1
+    fi
+    if [ -n "$launcher" ] && [ -L "$launcher" ]; then
+      rm -f "$launcher" || return 1
+    elif [ -n "$launcher" ] && [ -e "$launcher" ]; then
+      return 1
+    fi
+    if [ -n "$previous" ] && [ "$previous" != none ]; then
+      ln -s "$previous" "${launcher}.tmp.$$" && mv -f "${launcher}.tmp.$$" "$launcher" || return 1
+    fi
+    return 0
+  fi
+  [ -n "$package_root" ] && [ "$package_root" != none ] && [ -f "$backup" ] || return 0
+  restore_root="$(awk -F '\t' '$1 == "package" && $2 == "target_root" { print $3; exit }' "$receipt")"
+  [ -n "$restore_root" ] || restore_root="$package_root"
+  case "$restore_root" in ""|none|/|"$HOME") return 1 ;; esac
+  [ ! -L "$restore_root" ] || return 1
+  parent="$(dirname "$restore_root")"; mkdir -p "$parent"
+  restore_stage="$(mktemp -d "$parent/.llm-brain-package-restore.XXXXXX")"
+  tar -xzf "$backup" -C "$restore_stage" || { rm -rf "$restore_stage"; return 1; }
+  restored="$restore_stage/$(basename "$package_root")"
+  [ -d "$restored" ] || { rm -rf "$restore_stage"; return 1; }
+  failed="${restore_root}.failed.$(date -u '+%Y%m%dT%H%M%SZ')"
+  [ ! -e "$failed" ] || { rm -rf "$restore_stage"; return 1; }
+  if [ -d "$restore_root" ]; then mv "$restore_root" "$failed" || { rm -rf "$restore_stage"; return 1; }; fi
+  if ! mv "$restored" "$restore_root"; then
+    [ ! -d "$failed" ] || mv "$failed" "$restore_root" 2>/dev/null || true
+    rm -rf "$restore_stage"
+    return 1
+  fi
+  rmdir "$restore_stage" 2>/dev/null || true
+}
+
+upgrade_restore_installation() {
+  local package_root="$1" backup="$2" host="$3" marketplace="$4" receipt="$5" status=0
+  upgrade_restore_package "$package_root" "$backup" "$host" "$marketplace" "$receipt" || status=1
+  upgrade_restore_adapter "$receipt" || status=1
+  return "$status"
+}
+
+upgrade_release_locks() {
+  local locks="$1" lock
+  [ -f "$locks" ] || return 0
+  while IFS= read -r lock; do [ -n "$lock" ] && rmdir "$lock" 2>/dev/null || true; done <"$locks"
+}
+
+upgrade_failpoint() {
+  [ -n "${LLM_BRAIN_UPGRADE_FAIL_AT:-}" ] && [ "$LLM_BRAIN_UPGRADE_FAIL_AT" = "$1" ]
+}
+
+upgrade_require_capacity() {
+  local roots="$1" root size free required total=0 backup_free
+  while IFS= read -r root; do
+    size="$(du -sk "$root" | awk '{print $1}')"
+    free="$(df -Pk "$root" | awk 'NR == 2 { print $4}')"
+    required=$((size * 2))
+    [ "$free" -ge "$required" ] || die 73 "insufficient staging capacity root=$root required_kb=$required free_kb=$free"
+    total=$((total + size))
+  done <"$roots"
+  mkdir -p "$BACKUP_ROOT"
+  backup_free="$(df -Pk "$BACKUP_ROOT" | awk 'NR == 2 { print $4}')"
+  required=$((total * 2))
+  [ "$backup_free" -ge "$required" ] || die 73 "insufficient backup capacity root=$BACKUP_ROOT required_kb=$required free_kb=$backup_free"
+}
+
+upgrade_restore_vaults() {
+  local receipt="$1" force="${2:-0}" line root rollback pre_hash post_hash stage backup current failed status=0 stamp changes
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  changes="$(mktemp "${TMPDIR:-/tmp}/llm-brain-rollback.XXXXXX")"
+  if [ "$force" = 0 ]; then
+    while IFS=$'\t' read -r line root rollback pre_hash post_hash stage backup; do
+      [ "$line" = vault ] || continue
+      [ -d "$rollback" ] || { say_error "rollback tree missing: $rollback"; rm -f "$changes"; return 1; }
+      current="$(upgrade_root_hash "$root" 2>/dev/null || true)"
+      if [ -n "$post_hash" ] && [ "$post_hash" != pending ] && [ "$current" != "$post_hash" ]; then
+        say_error "rollback refused changed vault: $root"
+        rm -f "$changes"
+        return 1
+      fi
+      failed="${root}.failed.${stamp}"
+      [ ! -e "$failed" ] || { say_error "rollback failed path already exists: $failed"; rm -f "$changes"; return 1; }
+    done < <(awk -F '\t' '$1 == "vault" { print }' "$receipt")
+  fi
+  while IFS=$'\t' read -r line root rollback pre_hash post_hash stage backup; do
+    [ "$line" = vault ] || continue
+    [ -d "$rollback" ] || continue
+    failed="${root}.failed.${stamp}"
+    if [ -e "$failed" ]; then say_error "rollback failed path already exists: $failed"; status=1; break; fi
+    if ! mv "$root" "$failed"; then say_error "rollback move failed: $root"; status=1; break; fi
+    if ! mv "$rollback" "$root"; then
+      mv "$failed" "$root" 2>/dev/null || true
+      say_error "rollback move failed: $root"
+      status=1
+      break
+    fi
+    printf '%s\t%s\t%s\n' "$root" "$rollback" "$failed" >>"$changes"
+    if [ "$(upgrade_root_hash "$root")" != "$pre_hash" ]; then
+      say_error "rollback hash mismatch: $root"
+      status=1
+      break
+    fi
+  done < <(awk -F '\t' '$1 == "vault" { rows[++n]=$0 } END { for (i=n;i>=1;i--) print rows[i] }' "$receipt")
+  if [ "$status" != 0 ]; then
+    while IFS=$'\t' read -r root rollback failed; do
+      mv "$root" "$rollback" 2>/dev/null && mv "$failed" "$root" 2>/dev/null || true
+    done < <(awk -F '\t' '{ rows[++n]=$0 } END { for (i=n;i>=1;i--) print rows[i] }' "$changes")
+  fi
+  rm -f "$changes"
+  return "$status"
+}
+
+upgrade_emergency_cleanup() {
+  [ "$UPGRADE_ACTIVE" = 1 ] || return 0
+  UPGRADE_ACTIVE=0
+  [ ! -f "$UPGRADE_RECEIPT" ] || upgrade_restore_vaults "$UPGRADE_RECEIPT" 1 || true
+  upgrade_restore_installation "$UPGRADE_PACKAGE_ROOT" "$UPGRADE_PACKAGE_BACKUP" "$UPGRADE_HOST" "$UPGRADE_MARKETPLACE" "$UPGRADE_RECEIPT" || true
+  upgrade_release_locks "$UPGRADE_LOCKS"
+  case "$UPGRADE_WORK" in */llm-brain-upgrade.*) rm -rf "$UPGRADE_WORK" ;; esac
+}
+
+upgrade_abort() {
+  local code="$1"; shift
+  upgrade_emergency_cleanup
+  die "$code" "$@"
+}
+
+cmd_upgrade_check() {
+  local target="$VERSION" host=auto all=0 extra roots material summary hash
+  extra="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-roots.XXXXXX")"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --host) host="${2:-}"; shift 2 ;;
+      --target) target="${2:-}"; shift 2 ;;
+      --root) printf '%s\n' "${2:-}" >>"$extra"; shift 2 ;;
+      *) rm -f "$extra"; die 64 "unknown upgrade check option: $1" ;;
+    esac
+  done
+  [ "$all" = 1 ] || { rm -f "$extra"; die 64 "upgrade check requires --all"; }
+  roots="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-roots.XXXXXX")"
+  material="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-plan.XXXXXX")"
+  summary="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-summary.XXXXXX")"
+  upgrade_roots "$extra" >"$roots"
+  build_upgrade_plan "$roots" "$target" "$host" "$material" "$summary"
+  hash="$(sha256_file "$material")"
+  cat "$summary"
+  printf 'plan_hash=%s\n' "$hash"
+  rm -f "$extra" "$roots" "$material" "$summary"
+}
+
+cmd_upgrade_apply() {
+  local target="" host=auto plan_hash="" all=0 extra roots material summary actual_hash current_checksum target_checksum work source target_cli host_info detected_host marketplace installed package_root runtime upgrade_id receipt locks package_backup root parent base stage rollback pre_hash post_hash vault_backup root_token stage_index=0 cutover_index=0 launcher previous target_dir install_root updated_host_info updated_host updated_source updated_version updated_package_root updated_cli
+  extra="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-roots.XXXXXX")"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --host) host="${2:-}"; shift 2 ;;
+      --target) target="${2:-}"; shift 2 ;;
+      --plan-hash) plan_hash="${2:-}"; shift 2 ;;
+      --root) printf '%s\n' "${2:-}" >>"$extra"; shift 2 ;;
+      *) rm -f "$extra"; die 64 "unknown upgrade apply option: $1" ;;
+    esac
+  done
+  [ "$all" = 1 ] && [ -n "$target" ] && [ -n "$plan_hash" ] || { rm -f "$extra"; die 64 "upgrade apply requires --all --target VERSION --plan-hash HASH"; }
+  printf '%s' "$plan_hash" | grep -Eq '^[a-f0-9]{64}$' || { rm -f "$extra"; die 64 "invalid plan hash"; }
+  roots="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-roots.XXXXXX")"; material="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-plan.XXXXXX")"; summary="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-summary.XXXXXX")"
+  upgrade_roots "$extra" >"$roots"; build_upgrade_plan "$roots" "$target" "$host" "$material" "$summary"; actual_hash="$(sha256_file "$material")"
+  [ "$actual_hash" = "$plan_hash" ] || { rm -f "$extra" "$roots" "$material" "$summary"; die 73 "upgrade plan drifted; run upgrade check again"; }
+  current_checksum="$(awk -F= '$1 == "package_checksum" { print $2; exit }' "$material")"
+  target_checksum="$(awk -F= '$1 == "target_checksum" { print $2; exit }' "$material")"
+  upgrade_require_capacity "$roots"
+  host_info="$(upgrade_host_info "$host")"; IFS=$'\t' read -r detected_host marketplace installed package_root <<<"$host_info"
+  upgrade_id="upgrade-${target}-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-upgrade.XXXXXX")"; mkdir -p "$BACKUP_ROOT/$upgrade_id"
+  receipt="$BACKUP_ROOT/$upgrade_id/receipt.tsv"; locks="$work/locks"
+  printf 'receipt\tformat\tllm-brain-upgrade-receipt-v1\nreceipt\tstatus\tapplying\nreceipt\tplan_hash\t%s\nreceipt\tfrom_version\t%s\nreceipt\tto_version\t%s\nreceipt\thost\t%s\nreceipt\tmarketplace\t%s\nreceipt\tcurrent_package_checksum\t%s\nreceipt\ttarget_package_checksum\t%s\n' "$plan_hash" "$installed" "$target" "$detected_host" "$marketplace" "$current_checksum" "$target_checksum" >"$receipt"
+  UPGRADE_ACTIVE=1
+  UPGRADE_RECEIPT="$receipt"
+  UPGRADE_LOCKS="$locks"
+  UPGRADE_WORK="$work"
+  UPGRADE_PACKAGE_ROOT="$package_root"
+  UPGRADE_PACKAGE_BACKUP=none
+  UPGRADE_HOST="$detected_host"
+  UPGRADE_MARKETPLACE="$marketplace"
+  trap upgrade_emergency_cleanup EXIT
+  trap 'exit 130' HUP INT TERM
+  while IFS= read -r root; do
+    parent="$(dirname "$root")"; base="$(basename "$root")"; local external_lock="$parent/.${base}.upgrade.lock"
+    if ! mkdir "$external_lock" 2>/dev/null; then upgrade_abort 73 "upgrade lock held: $external_lock"; fi
+    printf '%s\n' "$external_lock" >>"$locks"
+  done <"$roots"
+  if ! source="$(upgrade_prepare_source "$target" "$work" "$target_checksum")"; then upgrade_abort 69 "target release preparation failed; vaults untouched"; fi
+  target_cli="$(upgrade_target_cli "$source" || true)"; [ -n "$target_cli" ] || upgrade_abort 66 "target release lacks the CLI"
+  if upgrade_failpoint dependency-install; then upgrade_abort 69 "injected dependency installation failure; vaults untouched"; fi
+  runtime="$(upgrade_install_runtime "$target" "$source")" || upgrade_abort 69 "dependency installation failed; vaults untouched"
+  printf 'runtime\tpath\t%s\n' "$runtime" >>"$receipt"
+  package_backup="$BACKUP_ROOT/$upgrade_id/package.tar.gz"
+  if [ "$detected_host" = standalone ]; then
+    install_root="${LLM_BRAIN_STANDALONE_ROOT:-$HOME/.local/lib/llm-brain}"
+    target_dir="$install_root/$target"
+    launcher="$HOME/.local/bin/llm-brain"
+    previous=none
+    [ ! -L "$launcher" ] || previous="$(readlink "$launcher")"
+    [ ! -e "$launcher" ] || [ -L "$launcher" ] || upgrade_abort 73 "refusing to replace non-symlink standalone launcher: $launcher"
+    printf 'standalone\t%s\tprevious\t%s\ttarget\t%s\n' "$launcher" "$previous" "$target_dir" >>"$receipt"
+    package_backup=none
+  elif [ -n "$package_root" ] && [ "$package_root" != none ] && [ -d "$package_root" ]; then
+    tar -czf "$package_backup" -C "$(dirname "$package_root")" "$(basename "$package_root")" || upgrade_abort 73 "installed package backup failed"
+    tar -tzf "$package_backup" >/dev/null || upgrade_abort 73 "installed package backup verification failed"
+  else
+    package_backup=none
+  fi
+  UPGRADE_PACKAGE_BACKUP="$package_backup"
+  printf 'package\troot\t%s\tbackup\t%s\n' "$package_root" "$package_backup" >>"$receipt"
+  [ "$package_backup" = none ] || printf 'backup\tpackage\t%s\t%s\n' "$package_backup" "$(sha256_file "$package_backup")" >>"$receipt"
+  (upgrade_backup_adapter "$source" "$receipt") || upgrade_abort 73 "generic adapter backup failed; vaults untouched"
+  if upgrade_failpoint package-update || ! (upgrade_update_host "$detected_host" "$marketplace" "$source" "$target") || ! upgrade_verify_host_version "$detected_host" "$target" || ! upgrade_verify_adapter "$source"; then
+    upgrade_abort 69 "package update failed; prior package restored and vaults untouched"
+  fi
+  if [ "$detected_host" = standalone ]; then
+    updated_package_root="$target_dir"
+  else
+    if ! updated_host_info="$(upgrade_host_info "$detected_host")"; then upgrade_abort 69 "unable to inspect updated package metadata"; fi
+    IFS=$'\t' read -r updated_host updated_source updated_version updated_package_root <<<"$updated_host_info"
+    [ "$updated_version" = "$target" ] || upgrade_abort 69 "updated package metadata drifted"
+    upgrade_validate_package_root "$updated_host" "$updated_package_root" "$updated_version" || upgrade_abort 69 "updated package manifest drifted"
+  fi
+  updated_cli="$(upgrade_target_cli "$updated_package_root" || true)"
+  [ -n "$updated_cli" ] && [ "$(sha256_file "$updated_cli")" = "$(sha256_file "$target_cli")" ] ||
+    upgrade_abort 69 "updated package CLI does not match the checked release"
+  printf 'package\ttarget_root\t%s\n' "$updated_package_root" >>"$receipt"
+  printf 'package\ttarget_cli_checksum\t%s\n' "$(sha256_file "$updated_cli")" >>"$receipt"
+  while IFS= read -r root; do
+    stage_index=$((stage_index + 1))
+    parent="$(dirname "$root")"; base="$(basename "$root")"; stage="$parent/${base}.upgrade-stage.${upgrade_id}"; rollback="$parent/${base}.rollback.${upgrade_id}"
+    pre_hash="$(upgrade_root_hash "$root")" || upgrade_abort 73 "unable to hash vault before staging: $root"
+    root_token="$(sha256_text "$root" | cut -c1-12)"; vault_backup="$BACKUP_ROOT/$upgrade_id/${base}-${root_token}.tar.gz"
+    tar -czf "$vault_backup" -C "$parent" "$base" || upgrade_abort 73 "vault backup failed; vaults untouched"
+    tar -tzf "$vault_backup" >/dev/null || upgrade_abort 73 "vault backup verification failed; vaults untouched"
+    printf 'backup\tvault\t%s\t%s\n' "$vault_backup" "$(sha256_file "$vault_backup")" >>"$receipt"
+    if ! LLM_BRAIN_OKF_PYTHON="$runtime/bin/python" LLM_BRAIN_BACKUP_ROOT="$BACKUP_ROOT" "$target_cli" --root "$root" migrate stage --all --output "$stage"; then
+      upgrade_abort 73 "vault staging failed; prior package restored and vaults untouched"
+    fi
+    if upgrade_failpoint "staging-verification:$stage_index" || upgrade_failpoint staging-verification || ! LLM_BRAIN_OKF_PYTHON="$runtime/bin/python" "$target_cli" --root "$stage" migrate verify >/dev/null; then
+      upgrade_abort 73 "staging verification failed; prior package restored and vaults untouched"
+    fi
+    post_hash="$(upgrade_root_hash "$stage")"
+    printf 'vault\t%s\t%s\t%s\t%s\t%s\t%s\n' "$root" "$rollback" "$pre_hash" "$post_hash" "$stage" "$vault_backup" >>"$receipt"
+  done <"$roots"
+  while IFS=$'\t' read -r _ root rollback pre_hash post_hash stage vault_backup; do
+    cutover_index=$((cutover_index + 1))
+    [ "$(upgrade_root_hash "$root")" = "$pre_hash" ] || upgrade_abort 73 "live vault drifted before cutover; changed vaults restored"
+    if upgrade_failpoint "cutover:$cutover_index"; then upgrade_abort 73 "injected vault cutover failure; changed vaults restored"; fi
+    if ! mv "$root" "$rollback" || ! mv "$stage" "$root"; then
+      [ -d "$root" ] || mv "$rollback" "$root" 2>/dev/null || true
+      upgrade_abort 73 "vault cutover failed; changed vaults restored"
+    fi
+    if [ "$(upgrade_root_hash "$root")" != "$post_hash" ] || ! LLM_BRAIN_OKF_PYTHON="$runtime/bin/python" "$target_cli" --root "$root" migrate verify >/dev/null; then
+      upgrade_abort 73 "post-cutover verification failed; changed vaults and package restored"
+    fi
+  done < <(awk -F '\t' '$1 == "vault" { print }' "$receipt")
+  if upgrade_failpoint unexpected-exit; then exit 74; fi
+  if upgrade_failpoint final-verification; then
+    upgrade_abort 73 "injected final verification failure; changed vaults and package restored"
+  fi
+  printf 'receipt\tstatus\tverified\n' >>"$receipt"
+  upgrade_release_locks "$locks"
+  rm -rf "$work" "$extra" "$roots" "$material" "$summary"
+  UPGRADE_ACTIVE=0
+  trap - EXIT HUP INT TERM
+  printf 'upgrade=ok receipt=%s restart_required=%s\n' "$receipt" "$(upgrade_restart_requirement "$detected_host")"
+}
+
+cmd_upgrade_verify() {
+  local receipt="" status_line target runtime root rollback pre_hash post_hash stage backup package_version project failures=0 host host_info installed_host source installed_version package_root launcher
+  [ "${1:-}" = "--receipt" ] && receipt="${2:-}"
+  [ -f "$receipt" ] || die 66 "upgrade receipt missing"
+  status_line="$(awk -F '\t' '$1 == "receipt" && $2 == "status" { value=$3 } END { print value }' "$receipt")"
+  [ "$status_line" = verified ] || die 65 "upgrade receipt is not verified"
+  target="$(awk -F '\t' '$1 == "receipt" && $2 == "to_version" { print $3; exit }' "$receipt")"
+  host="$(awk -F '\t' '$1 == "receipt" && $2 == "host" { print $3; exit }' "$receipt")"
+  runtime="$(awk -F '\t' '$1 == "runtime" && $2 == "path" { print $3; exit }' "$receipt")"
+  [ -x "$runtime/bin/python" ] && "$runtime/bin/python" -c 'import sys, yaml; raise SystemExit(yaml.__version__ != sys.argv[1])' "$PYYAML_VERSION" || failures=1
+  if [ "$host" = standalone ]; then
+    launcher="$(awk -F '\t' '$1 == "standalone" { print $2; exit }' "$receipt")"
+    package_version="$("$launcher" --version 2>/dev/null || printf unavailable)"
+  else
+    host_info="$(upgrade_host_info "$host" 2>/dev/null || true)"
+    IFS=$'\t' read -r installed_host source installed_version package_root <<<"$host_info"
+    package_version="${installed_version:-unavailable}"
+  fi
+  [ "$package_version" = "$target" ] || failures=1
+  upgrade_verify_receipt_adapter "$receipt" || failures=1
+  while IFS=$'\t' read -r _ root rollback pre_hash post_hash stage backup; do
+    [ "$(upgrade_root_hash "$root")" = "$post_hash" ] || failures=1
+    "$0" --root "$root" lint --strict >/dev/null || failures=1
+    "$0" --root "$root" doctor --strict >/dev/null || failures=1
+    for project in "$root"/projects/*; do
+      [ -d "$project" ] || continue
+      "$0" --root "$root" index status "$(basename "$project")" >/dev/null || failures=1
+    done
+  done < <(awk -F '\t' '$1 == "vault" { print }' "$receipt")
+  printf 'upgrade_verify=%s receipt=%s package=%s helper=PyYAML-%s passive_contract=packaged restart_required=%s\n' "$([ "$failures" = 0 ] && printf ok || printf findings)" "$receipt" "$package_version" "$PYYAML_VERSION" "$(upgrade_restart_requirement "$host")"
+  [ "$failures" = 0 ]
+}
+
+cmd_upgrade_rollback() {
+  local receipt="" package_root package_backup host marketplace status_line
+  [ "${1:-}" = "--receipt" ] && receipt="${2:-}"
+  [ -f "$receipt" ] || die 66 "upgrade receipt missing"
+  status_line="$(awk -F '\t' '$1 == "receipt" && $2 == "status" { value=$3 } END { print value }' "$receipt")"
+  [ "$status_line" = verified ] || die 65 "only a verified upgrade receipt can be rolled back"
+  package_root="$(awk -F '\t' '$1 == "package" && $2 == "root" { print $3; exit }' "$receipt")"
+  package_backup="$(awk -F '\t' '$1 == "package" && $4 == "backup" { print $5; exit }' "$receipt")"
+  host="$(awk -F '\t' '$1 == "receipt" && $2 == "host" { print $3; exit }' "$receipt")"
+  marketplace="$(awk -F '\t' '$1 == "receipt" && $2 == "marketplace" { print $3; exit }' "$receipt")"
+  upgrade_restore_vaults "$receipt" || die 73 "one or more vaults could not be rolled back"
+  upgrade_restore_installation "$package_root" "$package_backup" "$host" "$marketplace" "$receipt" || die 73 "package or adapter rollback failed"
+  printf 'receipt\tstatus\trolled-back\n' >>"$receipt"
+  printf 'upgrade_rollback=ok receipt=%s\n' "$receipt"
+}
+
+cmd_upgrade() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    check) cmd_upgrade_check "$@" ;;
+    apply) cmd_upgrade_apply "$@" ;;
+    verify) cmd_upgrade_verify "$@" ;;
+    rollback) cmd_upgrade_rollback "$@" ;;
+    *) die 64 "upgrade requires check, apply, verify, or rollback" ;;
+  esac
+}
+
 main() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --root) ROOT="${2:-}"; [ -n "$ROOT" ] || die 64 "--root requires PATH"; shift 2 ;;
+      --root) ROOT="${2:-}"; [ -n "$ROOT" ] || die 64 "--root requires PATH"; ROOT_EXPLICIT=1; shift 2 ;;
       --cwd) CWD="${2:-}"; [ -n "$CWD" ] || die 64 "--cwd requires DIR"; shift 2 ;;
       --project-id) PROJECT_OVERRIDE="${2:-}"; shift 2 ;;
       --version) printf '%s\n' "$VERSION"; return 0 ;;
@@ -2288,6 +3203,7 @@ main() {
     doctor) cmd_doctor "$@" ;;
     lint) cmd_lint "$@" ;;
     migrate) cmd_migrate "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
     *) usage >&2; die 64 "unknown command: $command" ;;
   esac
 }

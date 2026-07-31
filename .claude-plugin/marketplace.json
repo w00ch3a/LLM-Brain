@@ -1,0 +1,16 @@
+{
+  "$schema": "https://www.schemastore.org/claude-code-marketplace.json",
+  "name": "llm-brain",
+  "description": "Passive, inspectable and governed durable memory for coding agents.",
+  "owner": {
+    "name": "LLM-Brain Maintainers"
+  },
+  "plugins": [
+    {
+      "name": "llm-brain",
+      "description": "Use project memory naturally and provide a transactional upgrade ability.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

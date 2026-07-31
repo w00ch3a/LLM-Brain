@@ -1,38 +1,40 @@
 # Releasing LLM-Brain
 
-`VERSION` is the only package-version authority. Storage schema is independent and lives in project `schema.version` files.
+`VERSION` is the only package-version authority. Storage schema and OKF version are independent.
 
 ## Local release gate
 
 ```bash
+codex_skills="${CODEX_SKILLS_ROOT:-${CODEX_HOME:-$HOME/.codex}/skills}"
 bash -n bin/llm-brain
-bash -n tests/self-check.sh
-bash -n tests/v2-self-check.sh
-tests/self-check.sh
-tests/v2-self-check.sh
+bash tests/self-check.sh
+bash tests/okf-self-check.sh
+bash tests/v3-self-check.sh
+bash tests/upgrade-self-check.sh
+python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/llm-brain
+python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/llm-brain-upgrade
+python3 "$codex_skills/.system/plugin-creator/scripts/validate_plugin.py" .
+bash scripts/package-ai-skill.sh
+bash tests/passive-self-check.sh
 git diff --check
-scripts/package-ai-skill.sh
 ```
 
-Run ShellCheck when available:
+Verify both archives are byte-reproducible, their checksums match, every Codex/Claude/Gemini manifest equals `VERSION`, and each packaged CLI prints exactly `VERSION`.
 
-```bash
-shellcheck bin/llm-brain scripts/package-ai-skill.sh tests/*.sh
-```
-
-The package command produces each archive twice, requires byte-identical bytes, verifies safe members, extracts it and checks the packaged CLI. Inspect the generated checksum files in `dist/`.
+After installing the published release, start one fresh Codex, Claude and Gemini session with an ordinary non-trivial project request that does not mention LLM-Brain. Acceptance requires relevant memory retrieval, an authorised closeout capture, the documented opt-out, and one end-user confirmation. Static package checks do not replace this host-session proof.
 
 ## Vault migration gate
 
-Before a live migration, obtain explicit authority and run:
+Live migration is a separate operator-approved action:
 
 ```bash
-bin/llm-brain --root /Volumes/home/Vaults/llm-brain migrate check
-bin/llm-brain --root /Volumes/home/Vaults/llm-brain lint
+brain_root="${LLM_BRAIN_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/vault}"
+bin/llm-brain --root "$brain_root" migrate check
+bin/llm-brain --root "$brain_root" lint
 ```
 
-`migrate apply --all` makes sibling snapshot/staging/rollback trees and a local tar backup before cutover. Keep snapshot, rollback and backup paths until post-release acceptance. Never claim a migration completed without its strict post-cutover verification output.
+Present every review, scaffold, custody-gap and OKF transformation count. Never run `migrate apply --all` or `upgrade apply` against the live vault without explicit confirmation of that preflight.
 
-## External publication
+## Publication
 
-Commit, push, tag or publish an archive only with explicit authority. After publication, download or extract the published artefact and repeat the packaged CLI check in a fresh task.
+Commit, push, tag `v0.4.0`, publish GitHub archives, update public marketplaces or synchronise the configured personal marketplace source only after explicit release authority. After publication, download the published artefacts and repeat checksum, extraction, manifest and packaged-CLI verification in a fresh task.

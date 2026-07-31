@@ -1,6 +1,6 @@
 ---
 name: llm-brain
-description: Build, inspect, repair, migrate, or use filesystem-first LLM-Brain memory for a project. Use for durable project memory, OKF knowledge, provider reflection, review policy, retrieval indexes, context packs, adapters, exports, or safe vault migration. Do not use for ordinary one-off chat context or as a replacement for the active repository authority.
+description: Automatically use filesystem-first LLM-Brain memory before and after every non-trivial project task, without waiting for the user to name it. Also use when asked to build, inspect, repair, migrate or retrieve durable project memory, OKF knowledge, reviews, indexes, context packs, adapters or exports. Skip passive use only when LLM_BRAIN_PASSIVE=0. Never replace current repository authority with an older memory record.
 ---
 
 # LLM-Brain operating skill
@@ -11,7 +11,19 @@ Its normal lifecycle is:
 
 `capture → local provider reflection → deterministic policy → safe automatic promotion → indexed retrieval → scoped pack`
 
-Canonical semantic memory is filesystem-backed OKF Markdown. Episodes, candidate reviews, indexes, packs, adapters and exports are supporting or derived layers.
+Canonical semantic memory is a conformant Open Knowledge Format v0.2 bundle under `okf/`. Episodes, candidate reviews, indexes, packs, adapters and exports are supporting or derived layers.
+
+## Passive contract
+
+For every non-trivial project task, unless `LLM_BRAIN_PASSIVE=0`:
+
+1. Resolve the project from the configured vault registry using the current Git root, origin and physical path.
+2. Retrieve relevant effective OKF records before work when earlier requirements, decisions, procedures or failures may matter.
+3. Treat retrieved memory as context below current source, governing instructions, explicit user direction and live proof.
+4. At closeout, capture an auditable episode and source custody for the task when writes are authorised.
+5. Route durable requirements, decisions, lessons and reusable procedures through review and promotion policy. Never silently auto-promote protected material.
+
+Do this naturally. Do not require the user to say “use LLM-Brain”, and do not narrate routine retrieval unless it affects the result or is blocked.
 
 ## Permission gate
 
@@ -40,7 +52,7 @@ For an authorised change, establish project identity from the Git root, normalis
 
 ## Core commands
 
-The reference CLI runs on Bash 3.2+ with standard macOS/Linux utilities. Its default root is `/Volumes/home/Vaults/llm-brain`; pass `--root` for another vault.
+The reference CLI runs on Bash 3.2+ with standard macOS/Linux utilities. Its default root is `LLM_BRAIN_ROOT` when set, otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/vault`; pass `--root` for another vault.
 
 ```bash
 # Read-only orientation

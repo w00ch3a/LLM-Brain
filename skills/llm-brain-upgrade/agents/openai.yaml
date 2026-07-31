@@ -1,0 +1,4 @@
+interface:
+  display_name: "Upgrade LLM-Brain"
+  short_description: "Safely update the package and every vault"
+  default_prompt: "Use $llm-brain-upgrade to preflight and upgrade LLM-Brain with verified rollback."

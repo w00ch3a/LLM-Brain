@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 - 2026-07-31
+
+- Upgraded canonical storage to schema 3 and Google Open Knowledge Format v0.2.
+- Added strict PyYAML validation, legacy timestamp/citation migration, standard trust/lifecycle/freshness fields and Attested Computation interoperability.
+- Added passive Codex, Claude Code, Gemini CLI and generic-agent packaging with an explicit opt-out.
+- Added the callable `llm-brain-upgrade` skill and deterministic package-and-all-vault upgrade, verification and rollback commands.
+- Added reproducible polyglot-plugin and standalone archives with pinned dependency checksums.
+- Removed machine-specific paths from public defaults and release documentation.
+
 ## 0.3.0 - 2026-07-14
 
 - Made index freshness and retrieval metadata truthful.

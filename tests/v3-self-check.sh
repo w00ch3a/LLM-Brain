@@ -5,8 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cli="$repo_root/bin/llm-brain"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+export LLM_BRAIN_BACKUP_ROOT="$fixture/backups"
 
-fail() { printf 'v2 self-check: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'v3 self-check: %s\n' "$*" >&2; exit 1; }
 assert_file() { [ -f "$1" ] || fail "missing file: $1"; }
 assert_contains() { printf '%s' "$1" | grep -Fq "$2" || fail "expected output to contain: $2"; }
 
@@ -456,7 +457,7 @@ if ! migration="$($cli --root "$vault" migrate apply --all 2>&1)"; then
   fail "migration failed: $migration"
 fi
 assert_contains "$migration" 'migration=ok'
-assert_contains "$(cat "$vault/projects/$project_id/schema.version")" '2'
+assert_contains "$(cat "$vault/projects/$project_id/schema.version")" '3'
 [ "$(grep -Fc "$duplicate_root_line" "$vault/registry/roots.tsv")" = "1" ] || fail "migration did not remove exact duplicate root row"
 assert_contains "$(cat "$vault/projects/$project_id/review/claim_scaffold.md")" 'brain_review_state: superseded'
 assert_file "$vault/projects/$project_id/okf/retractions/claim_scaffold.md"
@@ -478,4 +479,4 @@ if "$cli" --root "$vault" lint >"$fixture/tamper.out" 2>&1; then
 fi
 assert_contains "$(cat "$fixture/tamper.out")" 'truncated audit event'
 
-printf 'llm-brain v2 self-check passed\n'
+printf 'llm-brain v3 self-check passed\n'
