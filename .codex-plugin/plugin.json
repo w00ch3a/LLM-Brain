@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/w00ch3a/LLM-Brain",
   "repository": "https://github.com/w00ch3a/LLM-Brain",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": [
     "memory",
     "okf",
