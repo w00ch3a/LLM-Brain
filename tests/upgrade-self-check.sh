@@ -146,7 +146,8 @@ upgrade_env "$cli" upgrade rollback --receipt "$receipt" >/dev/null
 contains_file "$receipt" $'receipt\tstatus\trolled-back'
 
 make_host_stub() {
-  local host="$1" stub="$case_dir/bin/$host"
+  local host="$1" source_type="$2" stub
+  stub="$case_dir/bin/$host"
   mkdir -p "$(dirname "$stub")" "$case_dir/current-package/skills/llm-brain/scripts"
   cp "$cli" "$case_dir/current-package/skills/llm-brain/scripts/llm-brain"
   chmod +x "$case_dir/current-package/skills/llm-brain/scripts/llm-brain"
@@ -182,7 +183,7 @@ case "$host:$*" in
       manifest="$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json"
     fi
     version="$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' "$manifest")"
-    printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"%s","source":{"path":"%s"}}]}\n' "$version" "$LLM_BRAIN_TEST_PACKAGE_ROOT"
+    printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"%s","source":{"source":"%s","path":"%s"}}]}\n' "$version" "$LLM_BRAIN_TEST_SOURCE_TYPE" "$LLM_BRAIN_TEST_PACKAGE_ROOT"
     ;;
   "codex:plugin add llm-brain@personal"|"claude:plugin update llm-brain@personal")
     if [ "$host" = codex ]; then
@@ -200,13 +201,14 @@ STUB
 }
 
 assert_host_commands() {
-  local host="$1" update="$2" list="$3" hash before
-  make_case "host-$host"
+  local host="$1" source_type="$2" hash before
+  make_case "host-$host-$source_type"
   mkdir -p "$case_dir/bin"
-  make_host_stub "$host"
+  make_host_stub "$host" "$source_type"
   before="$(tree_hash "$case_vault1")"
   export LLM_BRAIN_TEST_HOST_LOG="$case_dir/host.log"
   export LLM_BRAIN_TEST_HOST_STATE="$case_dir/host.state"
+  export LLM_BRAIN_TEST_SOURCE_TYPE="$source_type"
   if [ "$host" != gemini ]; then LLM_BRAIN_TEST_PACKAGE_ROOT="$case_dir/current-package"; fi
   export LLM_BRAIN_TEST_PACKAGE_ROOT
   PATH="$case_dir/bin:$PATH"
@@ -224,13 +226,58 @@ assert_host_commands() {
     claude) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json" '"version":"0.3.1"' ;;
     gemini) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json" '"version":"0.3.1"' ;;
   esac
-  contains_file "$case_dir/host.log" "$update"
-  [ -z "$list" ] || contains_file "$case_dir/host.log" "$list"
-  unset LLM_BRAIN_TEST_HOST_LOG LLM_BRAIN_TEST_HOST_STATE LLM_BRAIN_TEST_PACKAGE_ROOT
+  case "$host:$source_type" in
+    codex:local)
+      contains_file "$case_dir/host.log" 'plugin add llm-brain@personal'
+      if grep -Fq 'plugin marketplace upgrade' "$case_dir/host.log"; then fail "local Codex marketplace used a Git refresh"; fi
+      ;;
+    codex:git)
+      contains_file "$case_dir/host.log" 'plugin marketplace upgrade personal'
+      contains_file "$case_dir/host.log" 'plugin add llm-brain@personal'
+      ;;
+    claude:*) contains_file "$case_dir/host.log" 'plugin update llm-brain@personal' ;;
+    gemini:*) contains_file "$case_dir/host.log" 'extensions update llm-brain' ;;
+  esac
+  [ "$host" = gemini ] || contains_file "$case_dir/host.log" 'plugin list --json'
+  unset LLM_BRAIN_TEST_HOST_LOG LLM_BRAIN_TEST_HOST_STATE LLM_BRAIN_TEST_PACKAGE_ROOT LLM_BRAIN_TEST_SOURCE_TYPE
 }
 
-assert_host_commands codex 'plugin marketplace upgrade personal' 'plugin list --json'
-assert_host_commands claude 'plugin update llm-brain@personal' 'plugin list --json'
-assert_host_commands gemini 'extensions update llm-brain' ''
+assert_host_commands codex local
+assert_host_commands codex git
+assert_host_commands claude local
+assert_host_commands gemini git
+
+make_case host-codex-git-cache-discovery
+cache_root="$case_home/.codex/plugins/cache/personal/llm-brain/0.3.1"
+mkdir -p "$case_dir/bin" "$cache_root/.codex-plugin" "$cache_root/skills/llm-brain/scripts"
+cp "$cli" "$cache_root/skills/llm-brain/scripts/llm-brain"
+chmod +x "$cache_root/skills/llm-brain/scripts/llm-brain"
+printf '0.3.1\n' >"$cache_root/VERSION"
+printf '{"name":"llm-brain","version":"0.3.1"}\n' >"$cache_root/.codex-plugin/plugin.json"
+cat >"$case_dir/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"0.3.1","source":{"source":"git","url":"https://example.invalid/llm-brain.git"}}]}\n'
+STUB
+chmod +x "$case_dir/bin/codex"
+PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target 0.4.0 >"$case_dir/cache.out"
+contains_file "$case_dir/cache.out" 'package_source_type=git'
+contains_file "$case_dir/cache.out" 'target_archive_kind=plugin'
+mv "$cache_root" "${cache_root}.missing"
+if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target 0.4.0 >"$case_dir/cache-missing.out" 2>&1; then
+  fail "missing Codex Git cache passed preflight"
+fi
+contains_file "$case_dir/cache-missing.out" 'Codex plugin cache is missing'
+
+make_case host-auto-inventory-failure
+mkdir -p "$case_dir/bin"
+cat >"$case_dir/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$case_dir/bin/codex"
+if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host auto --target 0.4.0 >"$case_dir/auto.out" 2>&1; then
+  fail "automatic host detection ignored a Codex inventory failure"
+fi
+contains_file "$case_dir/auto.out" 'unable to inspect codex plugins'
 
 printf 'llm-brain upgrade self-check passed\n'

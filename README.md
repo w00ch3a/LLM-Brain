@@ -63,7 +63,10 @@ Upgrade the installed package and every configured vault:
 Existing v0.3.1 users need one native host refresh to receive the `llm-brain-upgrade` skill. Live-vault migration is never performed by installation or ordinary memory use.
 
 ```bash
+# Git-backed Codex marketplace:
 codex plugin marketplace upgrade MARKETPLACE
+codex plugin add llm-brain@MARKETPLACE
+# Local Codex marketplace (no Git refresh):
 codex plugin add llm-brain@MARKETPLACE
 # or
 claude plugin update llm-brain@MARKETPLACE
@@ -71,6 +74,6 @@ claude plugin update llm-brain@MARKETPLACE
 gemini extensions update llm-brain
 ```
 
-Keep the existing trusted marketplace or extension source; do not silently switch sources during an upgrade. Start a new or reloaded host session, then ask the agent to “upgrade LLM-Brain” for the single-confirmation workflow.
+Keep the existing trusted marketplace or extension source; do not silently switch sources during an upgrade. The transactional upgrader detects whether a Codex marketplace is local or Git-backed, atomically refreshes a local plugin source from the verified plugin archive, and uses native marketplace refresh only for Git sources. Start a new or reloaded host session, then ask the agent to “upgrade LLM-Brain” for the single-confirmation workflow.
 
 See [the architecture reference](references/architecture.md) for storage and safety boundaries and [the release guide](RELEASING.md) for validation and publication.

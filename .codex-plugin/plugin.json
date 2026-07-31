@@ -1,7 +1,7 @@
 {
   "name": "llm-brain",
   "version": "0.4.0",
-  "description": "Passive, filesystem-first durable memory using Google Open Knowledge Format v0.2.",
+  "description": "Automatic filesystem-first durable memory using Google Open Knowledge Format v0.2.",
   "author": {
     "name": "LLM-Brain Maintainers",
     "url": "https://github.com/w00ch3a"
@@ -19,7 +19,7 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "LLM-Brain",
-    "shortDescription": "Passive durable memory for project agents",
+    "shortDescription": "Automatic durable memory for project agents",
     "longDescription": "Retrieve and maintain inspectable project memory automatically, with Google OKF v0.2, governed review, source custody, verified migration and receipt-based rollback.",
     "developerName": "LLM-Brain Maintainers",
     "category": "Productivity",

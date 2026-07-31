@@ -2,12 +2,16 @@
 
 ## 0.4.0 - 2026-07-31
 
+See the [v0.4.0 release review](docs/releases/v0.4.0.md) for defect classification, root causes, verification and lessons learned.
+
 - Upgraded canonical storage to schema 3 and Google Open Knowledge Format v0.2.
 - Added strict PyYAML validation, legacy timestamp/citation migration, standard trust/lifecycle/freshness fields and Attested Computation interoperability.
 - Added automatic Codex, Claude Code, Gemini CLI and generic-agent integration, giving users hands-off memory with an explicit opt-out.
 - Added the callable `llm-brain-upgrade` skill and deterministic package-and-all-vault upgrade, verification and rollback commands.
 - Blocked normal vault writes while an upgrade or migration owns the vault-wide transition lock.
 - Preserved terminal unrecoverable source-reconciliation records exactly when migration rebuilds project ledgers.
+- Made Codex upgrades source-aware: local marketplaces consume the verified plugin archive, Git marketplaces refresh natively, and failed host inspection aborts safely.
+- Clarified in every host manifest that LLM-Brain operates automatically while only the user experience is passive.
 - Added reproducible polyglot-plugin and standalone archives with pinned dependency checksums.
 - Removed machine-specific paths from public defaults and release documentation.
 

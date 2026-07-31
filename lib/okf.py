@@ -722,6 +722,20 @@ def command_plugin_info(args: argparse.Namespace) -> int:
             or plugin.get("path")
             or plugin.get("cachePath")
         )
+        source_type = ""
+        if isinstance(source, dict):
+            source_type = scalar_text(
+                source.get("sourceType") or source.get("source") or source.get("type")
+            )
+        marketplace_source = plugin.get("marketplaceSource")
+        if not source_type and isinstance(marketplace_source, dict):
+            source_type = scalar_text(
+                marketplace_source.get("sourceType")
+                or marketplace_source.get("source")
+                or marketplace_source.get("type")
+            )
+        if not source_type and source_path:
+            source_type = "local"
         marketplace = scalar_text(
             plugin.get("marketplaceName") or plugin.get("marketplace")
         )
@@ -733,6 +747,7 @@ def command_plugin_info(args: argparse.Namespace) -> int:
                     marketplace or "none",
                     scalar_text(plugin.get("version")) or "unknown",
                     scalar_text(source_path) or "none",
+                    source_type or "unknown",
                 )
             )
         )

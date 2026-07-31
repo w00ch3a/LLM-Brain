@@ -1247,13 +1247,15 @@ canonical_signature() {
 }
 
 index_manifest_hash() {
-  local dir="$1" manifest="$dir/indexes/manifest.tsv"
+  local dir="$1" manifest
+  manifest="$dir/indexes/manifest.tsv"
   if [ -f "$manifest" ]; then sha256_file "$manifest"; fi
   return 0
 }
 
 index_documents_state() {
-  local dir="$1" file="$dir/indexes/documents.tsv" expected actual
+  local dir="$1" file expected actual
+  file="$dir/indexes/documents.tsv"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
   actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
@@ -1261,7 +1263,8 @@ index_documents_state() {
 }
 
 index_manifest_state() {
-  local dir="$1" file="$dir/indexes/manifest.tsv" expected actual
+  local dir="$1" file expected actual
+  file="$dir/indexes/manifest.tsv"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
   actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
@@ -1269,7 +1272,8 @@ index_manifest_state() {
 }
 
 index_graph_state() {
-  local dir="$1" file="$dir/indexes/graph.tsv" header docs manifest
+  local dir="$1" file header docs manifest
+  file="$dir/indexes/graph.tsv"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   header="$(sed -n '1p' "$file")"
   [ "$header" = $'source\trelation\ttarget' ] || { printf 'stale\n'; return; }
@@ -1294,7 +1298,8 @@ valid_embedding_row() {
 }
 
 index_vectors_state() {
-  local dir="$1" file="$dir/indexes/vectors.tsv" manifest_state expected_count actual_count path hash model dimensions vector first_model="" first_dimensions=""
+  local dir="$1" file manifest_state expected_count actual_count path hash model dimensions vector first_model="" first_dimensions=""
+  file="$dir/indexes/vectors.tsv"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   [ "$(sed -n '1p' "$file")" = $'path\thash\tmodel\tdimensions\tvector' ] || { printf 'stale\n'; return; }
   manifest_state="$(index_manifest_state "$dir")"
@@ -1727,20 +1732,18 @@ cmd_pack() {
 cmd_adapters() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "adapters requires build"
-  local agent="all" dir
+  local agent="all" dir name=generic file
   [ "${1:-}" = "--agent" ] && agent="${2:-all}"
+  case "$agent" in all|generic) ;; *) die 64 "unsupported adapter: $agent" ;; esac
   dir="$(require_project "$project_id")"
   acquire_lock "project-$project_id"
-  for name in generic; do
-    [ "$agent" = "all" ] || [ "$agent" = "$name" ] || continue
-    local file="$dir/adapters/${name}.md"
-    if [ -f "$file" ] && ! grep -Fq "$GENERATED_MARKER" "$file"; then
-      if [ "$agent" = "all" ]; then
-        continue
-      fi
+  file="$dir/adapters/${name}.md"
+  if [ -f "$file" ] && ! grep -Fq "$GENERATED_MARKER" "$file"; then
+    if [ "$agent" != "all" ]; then
       release_lock
       die 73 "refusing to overwrite human adapter: $file"
     fi
+  else
     cat >"${file}.tmp.$$" <<EOF
 $GENERATED_MARKER
 # LLM-Brain $name Adapter
@@ -1748,7 +1751,7 @@ $GENERATED_MARKER
 Canonical memory: okf/index.md. Build a scoped pack with llm-brain pack build $project_id --task "...". Raw sources and unresolved review items are not canonical truth.
 EOF
     mv "${file}.tmp.$$" "$file"
-  done
+  fi
   audit_v2 "$dir" "adapters-build" "$agent" "" "built" "" ""
   release_lock
   printf 'adapters=ok project_id=%s agent=%s\n' "$project_id" "$agent"
@@ -2178,7 +2181,7 @@ source_has_active_canonical_dependency() {
 }
 
 reconcile_project_sources() {
-  local project_id="$1" finalise_missing="$2" reason="$3" dir ledger temp line episode hash pointer old_status resolved method
+  local project_id="$1" finalise_missing="$2" reason="$3" dir ledger temp line episode hash pointer old_status
   local episode_file episode_id algorithm custody_hash dest new_status recovered=0 finalised=0 unchanged=0 existing_state existing_hash custody_candidate
   dir="$(require_project "$project_id")"
   ledger="$dir/migrations/source-reconciliation.tsv"
@@ -2192,8 +2195,6 @@ reconcile_project_sources() {
     hash="$(printf '%s\n' "$line" | cut -f2)"
     pointer="$(printf '%s\n' "$line" | cut -f3)"
     old_status="$(printf '%s\n' "$line" | cut -f4)"
-    resolved="$(printf '%s\n' "$line" | cut -f5)"
-    method="$(printf '%s\n' "$line" | cut -f6)"
     case "$old_status" in recovered|recovered-legacy-md5|already-present|unrecoverable|no-recorded-hash)
       printf '%s\n' "$line" >>"$temp"; printf 'unchanged\n' >>"${temp}.counts"; continue ;;
     esac
@@ -2504,12 +2505,13 @@ upgrade_host_info() {
       command -v "$candidate" >/dev/null 2>&1 || continue
       inventory="$(mktemp "${TMPDIR:-/tmp}/llm-brain-codex.XXXXXX")"
       if [ "$candidate" = codex ]; then
-        codex plugin list --json >"$inventory" 2>/dev/null || true
+        codex plugin list --json >"$inventory" 2>/dev/null || { rm -f "$inventory"; die 69 "unable to inspect codex plugins"; }
       else
-        claude plugin list --json >"$inventory" 2>/dev/null || true
+        claude plugin list --json >"$inventory" 2>/dev/null || { rm -f "$inventory"; die 69 "unable to inspect claude plugins"; }
       fi
       if info="$(okf plugin-info "$inventory" llm-brain 2>/dev/null)"; then
         rm -f "$inventory"
+        info="$(upgrade_resolve_host_package_root "$candidate" "$info")" || return $?
         printf '%s\t%s\n' "$candidate" "$info"
         return 0
       fi
@@ -2529,6 +2531,7 @@ upgrade_host_info() {
       info="$(okf plugin-info "$inventory" llm-brain 2>/dev/null || true)"
       rm -f "$inventory"
       [ -n "$info" ] || die 66 "LLM-Brain is not installed in $host"
+      info="$(upgrade_resolve_host_package_root "$host" "$info")" || return $?
       printf '%s\t%s\n' "$host" "$info"
       ;;
     gemini)
@@ -2540,14 +2543,26 @@ upgrade_host_info() {
       metadata="$source/.gemini-extension-install.json"
       install_type=unknown
       if [ -f "$metadata" ]; then IFS=$'\t' read -r _ _ install_type <<<"$(okf manifest-info "$metadata")"; fi
-      printf 'gemini\tgemini:%s\t%s\t%s\n' "$install_type" "$version" "$source"
+      printf 'gemini\tgemini:%s\t%s\t%s\t%s\n' "$install_type" "$version" "$source" "$install_type"
       ;;
     standalone)
       source="${LLM_BRAIN_PACKAGE_ROOT:-$DETECTED_PACKAGE_ROOT}"
-      printf 'standalone\tnone\t%s\t%s\n' "$VERSION" "$source"
+      printf 'standalone\tnone\t%s\t%s\tstandalone\n' "$VERSION" "$source"
       ;;
     *) die 64 "unsupported upgrade host: $host" ;;
   esac
+}
+
+upgrade_resolve_host_package_root() {
+  local host="$1" info="$2" marketplace version source source_type
+  IFS=$'\t' read -r marketplace version source source_type <<<"$info"
+  if [ "$host" = codex ] && [ "$source_type" = git ] && [ "$source" = none ]; then
+    case "$marketplace" in ""|.|..|*[!A-Za-z0-9._-]*) die 65 "invalid Codex marketplace name" ;; esac
+    case "$version" in ""|.|..|*[!A-Za-z0-9.+_-]*) die 65 "invalid Codex plugin version" ;; esac
+    source="${CODEX_HOME:-$HOME/.codex}/plugins/cache/$marketplace/llm-brain/$version"
+    [ -d "$source" ] || die 66 "Codex plugin cache is missing: $source"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$marketplace" "$version" "$source" "$source_type"
 }
 
 upgrade_restart_requirement() {
@@ -2579,25 +2594,31 @@ upgrade_validate_package_root() {
     die 65 "installed package metadata disagrees with its manifest: $manifest"
 }
 
+upgrade_archive_kind() {
+  case "$1" in standalone) printf 'standalone\n' ;; *) printf 'plugin\n' ;; esac
+}
+
 upgrade_release_checksum() {
-  local target="$1" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" checksum repository url value
+  local target="$1" host="$2" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" checksum repository url value kind
+  kind="$(upgrade_archive_kind "$host")"
   if [ -n "$source" ] && [ -f "$source/VERSION" ] && [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ]; then
-    checksum="$source/dist/llm-brain-${target}-standalone.tar.gz.sha256"
+    checksum="$source/dist/llm-brain-${target}-${kind}.tar.gz.sha256"
     if [ -f "$checksum" ]; then awk '{print $1; exit}' "$checksum"; return 0; fi
+    [ "$kind" = standalone ] || die 66 "target plugin archive checksum is missing"
     find "$source" -type f \( -path '*/bin/llm-brain' -o -path '*/scripts/llm-brain' \) -print -quit | while IFS= read -r checksum; do sha256_file "$checksum"; done
     return 0
   fi
   repository="$DETECTED_PACKAGE_ROOT"
-  if [ -f "$repository/VERSION" ] && [ "$(tr -d '[:space:]' <"$repository/VERSION")" = "$target" ] && [ -f "$repository/lib/okf.py" ]; then
+  if [ "$kind" = standalone ] && [ -f "$repository/VERSION" ] && [ "$(tr -d '[:space:]' <"$repository/VERSION")" = "$target" ] && [ -f "$repository/lib/okf.py" ]; then
     checksum="$(upgrade_target_cli "$repository" || true)"
     [ -n "$checksum" ] || die 66 "installed target package lacks the CLI"
     sha256_file "$checksum"
     return 0
   fi
-  checksum="$repository/dist/llm-brain-${target}-standalone.tar.gz.sha256"
+  checksum="$repository/dist/llm-brain-${target}-${kind}.tar.gz.sha256"
   [ -f "$checksum" ] || checksum="$repository/dist/llm-brain-${target}.tar.gz.sha256"
   if [ -f "$checksum" ]; then awk '{print $1; exit}' "$checksum"; return 0; fi
-  url="${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/llm-brain-${target}-standalone.tar.gz.sha256"
+  url="${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/llm-brain-${target}-${kind}.tar.gz.sha256"
   value="$(curl -fsSL "$url" 2>/dev/null | awk '{print $1; exit}' || true)"
   printf '%s' "$value" | grep -Eq '^[a-f0-9]{64}$' || die 69 "unable to resolve target release checksum"
   printf '%s\n' "$value"
@@ -2613,15 +2634,17 @@ upgrade_project_schemas() {
 
 build_upgrade_plan() {
   local roots_file="$1" target="$2" requested_host="$3" material="$4" summary="$5"
-  local host_info host marketplace installed package_root installed_cli package_checksum release_checksum root manifest schemas locks lock_paths free_kb size_kb report backup root_token runtime_python yaml_current=unavailable adapter_target restart total_size_kb=0
+  local host_info host marketplace installed package_root package_source_type installed_cli package_checksum release_checksum archive_kind root manifest schemas locks lock_paths free_kb size_kb report backup root_token runtime_python yaml_current=unavailable adapter_target restart total_size_kb=0
   host_info="$(upgrade_host_info "$requested_host")"
-  IFS=$'\t' read -r host marketplace installed package_root <<<"$host_info"
+  IFS=$'\t' read -r host marketplace installed package_root package_source_type <<<"$host_info"
   validate_scalar "$marketplace" || die 65 "invalid package source"
+  validate_scalar "$package_source_type" || die 65 "invalid package source type"
   [ "$host" = standalone ] || upgrade_validate_package_root "$host" "$package_root" "$installed"
   installed_cli="$(upgrade_target_cli "$package_root" || true)"
   [ -n "$installed_cli" ] || die 66 "installed package lacks the CLI: $package_root"
   package_checksum="$(sha256_file "$installed_cli")"
-  release_checksum="$(upgrade_release_checksum "$target")"
+  release_checksum="$(upgrade_release_checksum "$target" "$host")"
+  archive_kind="$(upgrade_archive_kind "$host")"
   runtime_python="${XDG_DATA_HOME:-$HOME/.local/share}/llm-brain/runtimes/$installed/bin/python"
   if [ -x "$runtime_python" ]; then yaml_current="$("$runtime_python" -c 'import yaml; print(yaml.__version__)' 2>/dev/null || printf unavailable)"; fi
   adapter_target="${LLM_BRAIN_GENERIC_INSTRUCTIONS:-none}"
@@ -2629,12 +2652,12 @@ build_upgrade_plan() {
   restart="$(upgrade_restart_requirement "$host")"
   {
     printf 'format=llm-brain-upgrade-plan-v1\n'
-    printf 'target=%s\nhost=%s\npackage_source=%s\ninstalled=%s\npackage_root=%s\npackage_checksum=%s\ntarget_checksum=%s\nyaml_current=%s\nyaml_target=%s\nadapter_target=%s\nrestart=%s\n' \
-      "$target" "$host" "$marketplace" "$installed" "$package_root" "$package_checksum" "$release_checksum" "$yaml_current" "$PYYAML_VERSION" "$adapter_target" "$restart"
+    printf 'target=%s\nhost=%s\npackage_source=%s\npackage_source_type=%s\ninstalled=%s\npackage_root=%s\npackage_checksum=%s\ntarget_checksum=%s\ntarget_archive_kind=%s\nyaml_current=%s\nyaml_target=%s\nadapter_target=%s\nrestart=%s\n' \
+      "$target" "$host" "$marketplace" "$package_source_type" "$installed" "$package_root" "$package_checksum" "$release_checksum" "$archive_kind" "$yaml_current" "$PYYAML_VERSION" "$adapter_target" "$restart"
   } >"$material"
   {
-    printf 'upgrade_check=ok current=%s target=%s schema_target=%s okf_target=%s host=%s package_source=%s package_checksum=%s target_checksum=%s yaml_current=%s yaml_target=%s adapter_target=%s\n' \
-      "$installed" "$target" "$SCHEMA_VERSION" "$OKF_VERSION" "$host" "$marketplace" "$package_checksum" "$release_checksum" "$yaml_current" "$PYYAML_VERSION" "$adapter_target"
+    printf 'upgrade_check=ok current=%s target=%s schema_target=%s okf_target=%s host=%s package_source=%s package_source_type=%s package_checksum=%s target_checksum=%s target_archive_kind=%s yaml_current=%s yaml_target=%s adapter_target=%s\n' \
+      "$installed" "$target" "$SCHEMA_VERSION" "$OKF_VERSION" "$host" "$marketplace" "$package_source_type" "$package_checksum" "$release_checksum" "$archive_kind" "$yaml_current" "$PYYAML_VERSION" "$adapter_target"
   } >"$summary"
   while IFS= read -r root; do
     [ -d "$root/projects" ] && [ -d "$root/registry" ] || die 65 "configured vault is incomplete: $root"
@@ -2659,11 +2682,12 @@ build_upgrade_plan() {
 }
 
 upgrade_prepare_source() {
-  local target="$1" work="$2" planned="$3" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" archive checksum expected actual extracted target_cli
+  local target="$1" work="$2" planned="$3" host="$4" source="${LLM_BRAIN_UPGRADE_SOURCE:-}" archive checksum expected actual extracted target_cli kind
+  kind="$(upgrade_archive_kind "$host")"
   if [ -n "$source" ]; then
     [ -d "$source" ] && [ -f "$source/VERSION" ] || die 66 "upgrade source is incomplete: $source"
     [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ] || die 65 "upgrade source version does not match target"
-    archive="$source/dist/llm-brain-${target}-standalone.tar.gz"
+    archive="$source/dist/llm-brain-${target}-${kind}.tar.gz"
     if [ -f "$archive" ]; then
       actual="$(sha256_file "$archive")"
       [ "$actual" = "$planned" ] || die 73 "target release changed after preflight"
@@ -2681,12 +2705,12 @@ upgrade_prepare_source() {
     return 0
   fi
   source="$DETECTED_PACKAGE_ROOT"
-  if [ -f "$source/VERSION" ] && [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ] && [ -f "$source/lib/okf.py" ]; then
+  if [ "$kind" = standalone ] && [ -f "$source/VERSION" ] && [ "$(tr -d '[:space:]' <"$source/VERSION")" = "$target" ] && [ -f "$source/lib/okf.py" ]; then
     [ "$(sha256_file "$source/bin/llm-brain")" = "$planned" ] || die 73 "target source changed after preflight"
     printf '%s\n' "$source"
     return 0
   fi
-  archive="$work/llm-brain-${target}-standalone.tar.gz"
+  archive="$work/llm-brain-${target}-${kind}.tar.gz"
   checksum="${archive}.sha256"
   curl -fsSL "${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/$(basename "$archive")" -o "$archive" || die 69 "target release download failed"
   curl -fsSL "${LLM_BRAIN_RELEASE_BASE_URL:-https://github.com/w00ch3a/LLM-Brain/releases/download}/v${target}/$(basename "$checksum")" -o "$checksum" || die 69 "target checksum download failed"
@@ -2731,11 +2755,31 @@ upgrade_target_cli() {
   return 1
 }
 
+upgrade_replace_local_plugin_source() {
+  local source="$1" target_root="$2" target="$3" parent base stage previous
+  upgrade_validate_package_root codex "$source" "$target"
+  [ ! -e "$target_root/.git" ] || die 73 "refusing to replace a Git checkout configured as a local plugin source"
+  parent="$(dirname "$target_root")"; base="$(basename "$target_root")"
+  stage="$parent/.${base}.upgrade.$$"; previous="$parent/.${base}.previous.$$"
+  [ ! -e "$stage" ] && [ ! -e "$previous" ] || die 73 "local plugin staging path exists"
+  clone_tree "$source" "$stage"
+  mv "$target_root" "$previous" || die 73 "local plugin source backup move failed"
+  if ! mv "$stage" "$target_root"; then
+    mv "$previous" "$target_root" 2>/dev/null || true
+    die 73 "local plugin source cutover failed"
+  fi
+  rm -rf "$previous"
+}
+
 upgrade_update_host() {
-  local host="$1" marketplace="$2" source="$3" target="$4" install_root link target_dir
+  local host="$1" marketplace="$2" source="$3" target="$4" package_root="$5" package_source_type="$6" install_root link target_dir
   case "$host" in
     codex)
-      codex plugin marketplace upgrade "$marketplace"
+      case "$package_source_type" in
+        git) codex plugin marketplace upgrade "$marketplace" ;;
+        local) upgrade_replace_local_plugin_source "$source" "$package_root" "$target" ;;
+        *) die 65 "unsupported Codex marketplace source type: $package_source_type" ;;
+      esac
       codex plugin add "llm-brain@$marketplace"
       ;;
     claude) claude plugin update "llm-brain@$marketplace" ;;
@@ -3000,7 +3044,7 @@ cmd_upgrade_check() {
 }
 
 cmd_upgrade_apply() {
-  local target="" host=auto plan_hash="" all=0 extra roots material summary actual_hash current_checksum target_checksum work source target_cli host_info detected_host marketplace installed package_root runtime upgrade_id receipt locks package_backup root parent base stage rollback pre_hash post_hash vault_backup root_token stage_index=0 cutover_index=0 launcher previous target_dir install_root updated_host_info updated_host updated_source updated_version updated_package_root updated_cli
+  local target="" host=auto plan_hash="" all=0 extra roots material summary actual_hash current_checksum target_checksum work source target_cli host_info detected_host marketplace installed package_root package_source_type runtime upgrade_id receipt locks package_backup root parent base stage rollback pre_hash post_hash vault_backup root_token stage_index=0 cutover_index=0 launcher previous target_dir install_root updated_host_info updated_host updated_version updated_package_root updated_cli
   extra="$(mktemp "${TMPDIR:-/tmp}/llm-brain-upgrade-roots.XXXXXX")"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3020,11 +3064,11 @@ cmd_upgrade_apply() {
   current_checksum="$(awk -F= '$1 == "package_checksum" { print $2; exit }' "$material")"
   target_checksum="$(awk -F= '$1 == "target_checksum" { print $2; exit }' "$material")"
   upgrade_require_capacity "$roots"
-  host_info="$(upgrade_host_info "$host")"; IFS=$'\t' read -r detected_host marketplace installed package_root <<<"$host_info"
+  host_info="$(upgrade_host_info "$host")"; IFS=$'\t' read -r detected_host marketplace installed package_root package_source_type <<<"$host_info"
   upgrade_id="upgrade-${target}-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   work="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-upgrade.XXXXXX")"; mkdir -p "$BACKUP_ROOT/$upgrade_id"
   receipt="$BACKUP_ROOT/$upgrade_id/receipt.tsv"; locks="$work/locks"
-  printf 'receipt\tformat\tllm-brain-upgrade-receipt-v1\nreceipt\tstatus\tapplying\nreceipt\tplan_hash\t%s\nreceipt\tfrom_version\t%s\nreceipt\tto_version\t%s\nreceipt\thost\t%s\nreceipt\tmarketplace\t%s\nreceipt\tcurrent_package_checksum\t%s\nreceipt\ttarget_package_checksum\t%s\n' "$plan_hash" "$installed" "$target" "$detected_host" "$marketplace" "$current_checksum" "$target_checksum" >"$receipt"
+  printf 'receipt\tformat\tllm-brain-upgrade-receipt-v1\nreceipt\tstatus\tapplying\nreceipt\tplan_hash\t%s\nreceipt\tfrom_version\t%s\nreceipt\tto_version\t%s\nreceipt\thost\t%s\nreceipt\tmarketplace\t%s\nreceipt\tpackage_source_type\t%s\nreceipt\tcurrent_package_checksum\t%s\nreceipt\ttarget_package_checksum\t%s\n' "$plan_hash" "$installed" "$target" "$detected_host" "$marketplace" "$package_source_type" "$current_checksum" "$target_checksum" >"$receipt"
   UPGRADE_ACTIVE=1
   UPGRADE_RECEIPT="$receipt"
   UPGRADE_LOCKS="$locks"
@@ -3040,7 +3084,7 @@ cmd_upgrade_apply() {
     if ! mkdir "$external_lock" 2>/dev/null; then upgrade_abort 73 "upgrade lock held: $external_lock"; fi
     printf '%s\n' "$external_lock" >>"$locks"
   done <"$roots"
-  if ! source="$(upgrade_prepare_source "$target" "$work" "$target_checksum")"; then upgrade_abort 69 "target release preparation failed; vaults untouched"; fi
+  if ! source="$(upgrade_prepare_source "$target" "$work" "$target_checksum" "$detected_host")"; then upgrade_abort 69 "target release preparation failed; vaults untouched"; fi
   target_cli="$(upgrade_target_cli "$source" || true)"; [ -n "$target_cli" ] || upgrade_abort 66 "target release lacks the CLI"
   if upgrade_failpoint dependency-install; then upgrade_abort 69 "injected dependency installation failure; vaults untouched"; fi
   runtime="$(upgrade_install_runtime "$target" "$source")" || upgrade_abort 69 "dependency installation failed; vaults untouched"
@@ -3065,14 +3109,14 @@ cmd_upgrade_apply() {
   printf 'package\troot\t%s\tbackup\t%s\n' "$package_root" "$package_backup" >>"$receipt"
   [ "$package_backup" = none ] || printf 'backup\tpackage\t%s\t%s\n' "$package_backup" "$(sha256_file "$package_backup")" >>"$receipt"
   (upgrade_backup_adapter "$source" "$receipt") || upgrade_abort 73 "generic adapter backup failed; vaults untouched"
-  if upgrade_failpoint package-update || ! (upgrade_update_host "$detected_host" "$marketplace" "$source" "$target") || ! upgrade_verify_host_version "$detected_host" "$target" || ! upgrade_verify_adapter "$source"; then
+  if upgrade_failpoint package-update || ! (upgrade_update_host "$detected_host" "$marketplace" "$source" "$target" "$package_root" "$package_source_type") || ! upgrade_verify_host_version "$detected_host" "$target" || ! upgrade_verify_adapter "$source"; then
     upgrade_abort 69 "package update failed; prior package restored and vaults untouched"
   fi
   if [ "$detected_host" = standalone ]; then
     updated_package_root="$target_dir"
   else
     if ! updated_host_info="$(upgrade_host_info "$detected_host")"; then upgrade_abort 69 "unable to inspect updated package metadata"; fi
-    IFS=$'\t' read -r updated_host updated_source updated_version updated_package_root <<<"$updated_host_info"
+    IFS=$'\t' read -r updated_host _ updated_version updated_package_root _ <<<"$updated_host_info"
     [ "$updated_version" = "$target" ] || upgrade_abort 69 "updated package metadata drifted"
     upgrade_validate_package_root "$updated_host" "$updated_package_root" "$updated_version" || upgrade_abort 69 "updated package manifest drifted"
   fi
@@ -3123,7 +3167,7 @@ cmd_upgrade_apply() {
 }
 
 cmd_upgrade_verify() {
-  local receipt="" status_line target runtime root rollback pre_hash post_hash stage backup package_version project failures=0 host host_info installed_host source installed_version package_root launcher
+  local receipt="" status_line target runtime root rollback pre_hash post_hash stage backup package_version project failures=0 host host_info installed_version launcher
   [ "${1:-}" = "--receipt" ] && receipt="${2:-}"
   [ -f "$receipt" ] || die 66 "upgrade receipt missing"
   status_line="$(awk -F '\t' '$1 == "receipt" && $2 == "status" { value=$3 } END { print value }' "$receipt")"
@@ -3137,7 +3181,7 @@ cmd_upgrade_verify() {
     package_version="$("$launcher" --version 2>/dev/null || printf unavailable)"
   else
     host_info="$(upgrade_host_info "$host" 2>/dev/null || true)"
-    IFS=$'\t' read -r installed_host source installed_version package_root <<<"$host_info"
+    IFS=$'\t' read -r _ _ installed_version _ _ <<<"$host_info"
     package_version="${installed_version:-unavailable}"
   fi
   [ "$package_version" = "$target" ] || failures=1
