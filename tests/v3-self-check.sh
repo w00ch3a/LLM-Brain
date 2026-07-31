@@ -29,6 +29,19 @@ assert_contains "$invalid_project_output" 'invalid project id'
 [ ! -d "$vault/.locks/registry.lock" ] || fail "failed project ensure left registry lock behind"
 assert_contains "$($cli --root "$vault" project ensure "$repo")" 'changed=0'
 
+vault_parent="$(dirname "$vault")"
+vault_base="$(basename "$vault")"
+for transition in upgrade migration; do
+  transition_lock="$vault_parent/.${vault_base}.${transition}.lock"
+  mkdir "$transition_lock"
+  if transition_output="$($cli --root "$vault" topic add "$project_id" "Blocked During $transition" 2>&1)"; then
+    fail "$transition lock allowed a concurrent write"
+  fi
+  assert_contains "$transition_output" 'vault transition lock held:'
+  [ ! -d "$vault/.locks/project-$project_id.lock" ] || fail "$transition refusal left a project lock behind"
+  rmdir "$transition_lock"
+done
+
 topic_output="$($cli --root "$vault" topic add "$project_id" "Automatic Memory")"
 topic_id="$(printf '%s\n' "$topic_output" | sed -n 's/.*topic_id=\([^ ]*\).*/\1/p')"
 [ -n "$topic_id" ] || fail "topic id missing"

@@ -261,8 +261,18 @@ remove_frontmatter_field() {
 
 ensure_dir() { [ -d "$1" ] || mkdir -p "$1"; }
 
+require_no_root_transition() {
+  local parent base transition_lock
+  parent="$(dirname "$ROOT")"
+  base="$(basename "$ROOT")"
+  for transition_lock in "$parent/.${base}.upgrade.lock" "$parent/.${base}.migration.lock"; do
+    [ ! -d "$transition_lock" ] || die 73 "vault transition lock held: $transition_lock"
+  done
+}
+
 acquire_lock() {
   local scope="$1" lock_dir
+  require_no_root_transition
   lock_dir="$ROOT/.locks/${scope}.lock"
   ensure_dir "$ROOT/.locks"
   if ! mkdir "$lock_dir" 2>/dev/null; then
