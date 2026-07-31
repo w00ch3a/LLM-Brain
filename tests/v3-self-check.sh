@@ -423,6 +423,28 @@ brain_review_state: captured
 ---
 # Drifted source episode
 EOF
+
+finalised_source="$fixture/finalised-source.md"
+printf '# Finalised historical bytes\n' >"$finalised_source"
+finalised_sha="$(shasum -a 256 "$finalised_source" | awk '{print $1}')"
+printf '# Current, unrelated bytes\n' >"$finalised_source"
+cat >"$vault/projects/$project_id/episodes/episode_finalised_source.md" <<EOF
+---
+type: Episode
+brain_project_id: $project_id
+brain_episode_id: episode_finalised_source
+brain_source_path: $finalised_source
+brain_source_hash: $finalised_sha
+brain_source_reconciliation_state: unrecoverable
+brain_source_reconciliation_reason: historical-authority-unavailable
+brain_review_state: captured
+---
+# Finalised source episode
+EOF
+preserved_reconciliation_row="$(printf 'episodes/episode_finalised_source.md\t%s\t%s\tunrecoverable\t\tfinalised-historical-authority' "$finalised_sha" "$finalised_source")"
+mkdir -p "$vault/projects/$project_id/migrations"
+printf 'episode\trecorded_hash\tpointer\tstatus\tresolved_path\tmethod\n%s\n' "$preserved_reconciliation_row" >"$vault/projects/$project_id/migrations/source-reconciliation.tsv"
+
 cat >"$vault/projects/$project_id/okf/procedures/procedure_revalidate_source.md" <<EOF
 ---
 type: Procedure
@@ -475,7 +497,9 @@ assert_contains "$(cat "$vault/projects/$project_id/schema.version")" '3'
 assert_contains "$(cat "$vault/projects/$project_id/review/claim_scaffold.md")" 'brain_review_state: superseded'
 assert_file "$vault/projects/$project_id/okf/retractions/claim_scaffold.md"
 assert_contains "$(cat "$vault/projects/$project_id/migrations/source-reconciliation.tsv")" 'recovered-legacy-md5'
+grep -Fxq "$preserved_reconciliation_row" "$vault/projects/$project_id/migrations/source-reconciliation.tsv" || fail "migration changed a terminal reconciliation row"
 assert_contains "$($cli --root "$vault" migrate check)" 'source_unresolved=1'
+assert_contains "$($cli --root "$vault" migrate check)" 'source_unrecoverable=1'
 $cli --root "$vault" validate-source "$project_id" procedure_revalidate_source "$source" --reason 'fixture current authority' >/dev/null
 if grep -Fq 'source_episode:' "$vault/projects/$project_id/okf/procedures/procedure_revalidate_source.md"; then fail "validate-source retained superseded episode dependency"; fi
 assert_contains "$(cat "$vault/projects/$project_id/okf/procedures/procedure_revalidate_source.md")" 'brain_source_hash_sha256:'
@@ -483,7 +507,7 @@ reconciled="$($cli --root "$vault" migrate reconcile-sources "$project_id" --fin
 assert_contains "$reconciled" 'finalised=1'
 assert_contains "$(cat "$vault/projects/$project_id/episodes/episode_drifted_source.md")" 'brain_source_reconciliation_state: unrecoverable'
 assert_contains "$($cli --root "$vault" migrate check)" 'source_unresolved=0'
-assert_contains "$($cli --root "$vault" migrate check)" 'source_unrecoverable=1'
+assert_contains "$($cli --root "$vault" migrate check)" 'source_unrecoverable=2'
 assert_contains "$($cli --root "$vault" migrate verify)" 'migration_verify=ok'
 
 printf 'tamper\n' >>"$vault/projects/$project_id/audit.v2.tsv"

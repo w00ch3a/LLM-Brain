@@ -2299,13 +2299,15 @@ EOF
 }
 
 migrate_project_in_place() {
-  local dir="$1" id review canonical rid source hash dest old_topic pointer ledger root_map algorithm custody_hash status title
+  local dir="$1" id review canonical rid source source_rel hash dest old_topic pointer ledger root_map algorithm custody_hash status title
+  local old_terminal_rows="" old_terminal_row reconciliation_state reconciliation_reason
   id="$(basename "$1")"
   ensure_project_layout "$id" "$dir"
   printf '%s\n' "$SCHEMA_VERSION" >"$dir/schema.version"
   ensure_dir "$dir/migrations"
   ledger="$dir/migrations/source-reconciliation.tsv"
   root_map="$dir/migrations/source-root-mappings.tsv"
+  [ ! -f "$ledger" ] || old_terminal_rows="$(awk -F '\t' 'NR > 1 && $4 == "unrecoverable"' "$ledger")"
   printf 'episode\trecorded_hash\tpointer\tstatus\tresolved_path\tmethod\n' >"$ledger"
   printf 'pointer\tresolved_path\tmethod\n' >"$root_map"
   while IFS= read -r review; do
@@ -2319,15 +2321,28 @@ migrate_project_in_place() {
     fi
   done < <(find "$dir/review" -maxdepth 1 -type f -name '*.md' 2>/dev/null)
   while IFS= read -r source; do
+    source_rel="${source#"$dir"/}"
+    old_terminal_row="$(printf '%s\n' "$old_terminal_rows" | awk -F '\t' -v episode="$source_rel" '$1 == episode { print; exit }')"
+    if [ -n "$old_terminal_row" ]; then
+      printf '%s\n' "$old_terminal_row" >>"$ledger"
+      continue
+    fi
     hash="$(frontmatter_field "$source" brain_source_hash_sha256 brain_source_hash)"
-    [ -n "$hash" ] || { printf '%s\t\t\tno-recorded-hash\t\t\n' "${source#"$dir"/}" >>"$ledger"; continue; }
+    reconciliation_state="$(frontmatter_field "$source" brain_source_reconciliation_state)"
+    if [ "$reconciliation_state" = unrecoverable ]; then
+      pointer="$(frontmatter_field "$source" brain_source_path brain_source_ref)"
+      reconciliation_reason="$(frontmatter_field "$source" brain_source_reconciliation_reason)"
+      printf '%s\t%s\t%s\tunrecoverable\t\tpreserved-%s\n' "$source_rel" "$hash" "$pointer" "$(slug "${reconciliation_reason:-episode-state}")" >>"$ledger"
+      continue
+    fi
+    [ -n "$hash" ] || { printf '%s\t\t\tno-recorded-hash\t\t\n' "$source_rel" >>"$ledger"; continue; }
     pointer="$(frontmatter_field "$source" brain_source_path brain_source_ref)"
-    [ -n "$pointer" ] || { printf '%s\t%s\t\tmissing-pointer\t\t\n' "${source#"$dir"/}" "$hash" >>"$ledger"; continue; }
+    [ -n "$pointer" ] || { printf '%s\t%s\t\tmissing-pointer\t\t\n' "$source_rel" "$hash" >>"$ledger"; continue; }
     algorithm=""
     printf '%s' "$hash" | grep -Eq '^[a-fA-F0-9]{64}$' && algorithm="sha256"
     printf '%s' "$hash" | grep -Eq '^[a-fA-F0-9]{32}$' && algorithm="md5"
     if [ -z "$algorithm" ]; then
-      printf '%s\t%s\t%s\tunsupported-hash\t\t\n' "${source#"$dir"/}" "$hash" "$pointer" >>"$ledger"
+      printf '%s\t%s\t%s\tunsupported-hash\t\t\n' "$source_rel" "$hash" "$pointer" >>"$ledger"
       continue
     fi
     if resolve_legacy_source "$dir" "$id" "$pointer" "$hash" "$algorithm"; then
@@ -2338,10 +2353,10 @@ migrate_project_in_place() {
       set_frontmatter_field "$source" brain_source_hash_algorithm "$algorithm"
       set_frontmatter_field "$source" brain_source_custody_hash_sha256 "$custody_hash"
       set_frontmatter_field "$source" brain_source_reconciliation_state "$status"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${source#"$dir"/}" "$hash" "$pointer" "$status" "${dest#"$dir"/}" "$MIGRATION_SOURCE_METHOD" >>"$ledger"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$source_rel" "$hash" "$pointer" "$status" "${dest#"$dir"/}" "$MIGRATION_SOURCE_METHOD" >>"$ledger"
       case "$MIGRATION_SOURCE_METHOD" in parent-root-*) printf '%s\t%s\t%s\n' "$pointer" "$MIGRATION_SOURCE_PATH" "$MIGRATION_SOURCE_METHOD" >>"$root_map" ;; esac
     else
-      printf '%s\t%s\t%s\tdrifted-or-missing\t\t\n' "${source#"$dir"/}" "$hash" "$pointer" >>"$ledger"
+      printf '%s\t%s\t%s\tdrifted-or-missing\t\t\n' "$source_rel" "$hash" "$pointer" >>"$ledger"
     fi
   done < <(find "$dir/episodes" -type f -name '*.md' 2>/dev/null)
   while IFS= read -r canonical; do
