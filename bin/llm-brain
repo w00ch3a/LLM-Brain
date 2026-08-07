@@ -83,6 +83,9 @@ Commands:
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
+  run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--obligation TEXT]
+  run outcome PROJECT_ID RUN_ID --status success|failed|partial --summary TEXT [--evidence REF] [--verified-by ACTOR]
+  run status PROJECT_ID
   eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -558,6 +561,7 @@ ensure_project_layout() {
   ensure_dir "$dir/episodes"
   ensure_dir "$dir/review"
   ensure_dir "$dir/sources"
+  ensure_dir "$dir/reflection/scheduler"
   ensure_dir "$dir/indexes/embeddings"
   ensure_dir "$dir/context-packs"
   ensure_dir "$dir/adapters"
@@ -565,6 +569,7 @@ ensure_project_layout() {
   ensure_dir "$dir/requests"
   ensure_dir "$dir/requests/.staging"
   ensure_dir "$dir/evaluations"
+  ensure_dir "$dir/runs/outcomes"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -1144,6 +1149,77 @@ run_provider_with_timeout() {
   return "${status:-0}"
 }
 
+reflection_schedule_record() {
+  local project_id="$1" episode_ref="$2" decision="$3" reason="$4" dir episode schedule policy source_ref source_hash body schedule_hash
+  dir="$(require_project "$project_id")"
+  episode="$dir/$episode_ref"
+  [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
+  validate_scalar "$decision" || die 65 "invalid reflection decision"
+  validate_scalar "$reason" || die 65 "invalid reflection reason"
+  policy="${LLM_BRAIN_REFLECTION_POLICY:-selective}"
+  case "$policy" in selective|legacy) ;; *) die 64 "LLM_BRAIN_REFLECTION_POLICY must be selective or legacy" ;; esac
+  source_ref="$(frontmatter_field "$episode" brain_source_ref)"
+  source_hash="$(frontmatter_field "$episode" brain_source_hash_sha256 brain_source_hash)"
+  schedule="$dir/reflection/scheduler/$(basename "$episode" .md).md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$schedule" ] || [ "$(frontmatter_field "$schedule" brain_reflection_decision)" != "$decision" ] || [ "$(frontmatter_field "$schedule" brain_reflection_reason)" != "$reason" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ReflectionSchedule\ntitle: %s\nbrain_project_id: %s\nbrain_episode_ref: %s\n' "$(yaml_quote "Reflection $(basename "$episode")")" "$project_id" "$(yaml_quote "$episode_ref")"
+      printf 'brain_reflection_decision: %s\nbrain_reflection_reason: %s\nbrain_reflection_policy: %s\n' "$decision" "$(yaml_quote "$reason")" "$policy"
+      printf 'brain_source_ref: %s\nbrain_source_hash_sha256: %s\nbrain_scheduler_version: 1\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$source_ref")" "$source_hash" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Reflection schedule\n\nDecision: `%s`  \nReason: `%s`  \nPolicy: `%s`\n' "$decision" "$reason" "$policy"
+    } >"${schedule}.tmp.$$"
+    mv "${schedule}.tmp.$$" "$schedule"
+    set_frontmatter_field "$episode" brain_reflection_decision "$decision"
+    set_frontmatter_field "$episode" brain_reflection_reason "$reason"
+    set_frontmatter_field "$episode" brain_reflection_policy "$policy"
+    schedule_hash="$(sha256_file "$schedule")"
+    audit_v2 "$dir" "reflection-schedule" "$(frontmatter_field "$episode" brain_episode_id)" "" "$decision" "$schedule_hash" "reason=$reason"
+  fi
+  release_lock
+  printf 'decision=%s reason=%s file=%s\n' "$decision" "$reason" "$schedule"
+}
+
+reflection_schedule() {
+  local project_id="$1" episode_ref="$2" dir episode state request_file source_ref source text source_text lower policy
+  dir="$(require_project "$project_id")"
+  episode="$dir/$episode_ref"
+  [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
+  policy="${LLM_BRAIN_REFLECTION_POLICY:-selective}"
+  case "$policy" in selective|legacy) ;; *) die 64 "LLM_BRAIN_REFLECTION_POLICY must be selective or legacy" ;; esac
+  state="$(frontmatter_field "$episode" brain_reflection_state)"
+  if [ "$state" = "reflected" ]; then
+    reflection_schedule_record "$project_id" "$episode_ref" deferred already-reflected
+    return 0
+  fi
+  while IFS= read -r request_file; do
+    [ "$(frontmatter_field "$request_file" brain_episode_ref)" = "$episode_ref" ] || continue
+    case "$(frontmatter_field "$request_file" brain_request_state)" in pending|running)
+      reflection_schedule_record "$project_id" "$episode_ref" deferred pending-work
+      return 0
+      ;;
+    esac
+  done < <(find "$dir/requests" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
+  if [ "$policy" = "legacy" ]; then
+    reflection_schedule_record "$project_id" "$episode_ref" immediate legacy-policy
+    return 0
+  fi
+  source_ref="$(frontmatter_field "$episode" brain_source_ref)"
+  source="$dir/$source_ref"
+  source_text="$(cat "$source" 2>/dev/null || true)"
+  text="$(cat "$source" "$episode" 2>/dev/null || true)"
+  lower="$(printf '%s' "$text" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  if printf '%s' "$lower" | grep -Eq 'correction|corrected|actually|decision|decided|requirement|must[[:space:]]|procedure|step-by-step|outcome|failed|failure|contradict|conflict|authoritative|source of truth|supersed|deprecated'; then
+    reflection_schedule_record "$project_id" "$episode_ref" immediate explicit-signal
+  elif [ "$(printf '%s' "$source_text" | wc -c | tr -d ' ')" -le 160 ] && printf '%s' "$source_text" | tr '\n' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -Eq '^[[:space:]]*(hi|hello|thanks([[:space:]]+for[[:space:]]+the[[:space:]]+update)?|thank you|ok|okay|ack|noted|lgtm)[.![:space:]]*$'; then
+    reflection_schedule_record "$project_id" "$episode_ref" deferred low-value-transient
+  else
+    reflection_schedule_record "$project_id" "$episode_ref" immediate default-safe
+  fi
+}
+
 work_request_id() {
   local project_id="$1" operation="$2" subject="$3" subject_hash="$4" provider="$5"
   printf 'request_%s\n' "$(sha256_text "$project_id|$operation|$subject|$subject_hash|$provider" | cut -c1-16)"
@@ -1333,6 +1409,121 @@ cmd_work() {
       acquire_lock "project-$project_id"; work_recover_locked "$dir"; release_lock; printf 'work=recovered project_id=%s\n' "$project_id"
       ;;
     *) die 64 "work requires enqueue, run-once, status, or recover" ;;
+  esac
+}
+
+run_start() {
+  local project_id="$1" procedure_ref="$2" task="" request_id="" branch="main" obligations="" dir run_id run_file
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task) task="${2:-}"; shift 2 ;;
+      --request-id) request_id="${2:-}"; shift 2 ;;
+      --branch) branch="${2:-}"; shift 2 ;;
+      --obligation) obligations="${obligations}${obligations:+,}${2:-}"; shift 2 ;;
+      *) die 64 "unknown run start option: $1" ;;
+    esac
+  done
+  validate_scalar "$procedure_ref" || die 65 "procedure reference must be a single line"
+  validate_scalar "$task" || die 65 "run task must be a single line"
+  validate_scalar "$branch" || die 65 "run branch must be a single line"
+  validate_scalar "$obligations" || die 65 "run obligation must be a single line"
+  [ -z "$request_id" ] || validate_id "$request_id" || die 64 "invalid run request id"
+  dir="$(require_project "$project_id")"
+  if [ -n "$request_id" ]; then
+    run_id="run_$(sha256_text "$project_id|$procedure_ref|$request_id" | cut -c1-16)"
+  else
+    run_id="run_$(date -u '+%Y%m%dT%H%M%SZ')_$(sha256_text "$project_id|$procedure_ref|$task|$branch|$obligations|$$" | cut -c1-12)"
+  fi
+  run_file="$dir/runs/$run_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$run_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ProcedureRun\ntitle: %s\nbrain_project_id: %s\nbrain_run_id: %s\n' "$(yaml_quote "Run $procedure_ref")" "$project_id" "$run_id"
+      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")"
+      printf 'brain_run_state: active\nbrain_verification_state: unverified\nbrain_artifact_state: noncanonical\nbrain_started_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Procedure run\n\nProcedure: `%s`  \nBranch: `%s`  \nTask: %s\n\nThis is append-only working state, not canonical OKF memory.\n' "$procedure_ref" "$branch" "${task:-none}"
+    } >"${run_file}.tmp.$$"
+    mv "${run_file}.tmp.$$" "$run_file"
+    audit_v2 "$dir" "run-start" "$run_id" "" "active" "$(sha256_file "$run_file")" "procedure=$(slug "$procedure_ref")"
+  fi
+  release_lock
+  printf 'run=ok project_id=%s run_id=%s state=%s file=%s\n' "$project_id" "$run_id" "$(frontmatter_field "$run_file" brain_run_state)" "$run_file"
+}
+
+run_outcome() {
+  local project_id="$1" run_id="$2" status="" summary="" evidence_refs="" verified_by="" dir run_file outcome_id outcome_file evidence_ref evidence_file evidence_hash evidence_lines="" verification="unverified"
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status) status="${2:-}"; shift 2 ;;
+      --summary) summary="${2:-}"; shift 2 ;;
+      --evidence) evidence_refs="${evidence_refs}${evidence_refs:+,}${2:-}"; shift 2 ;;
+      --verified-by) verified_by="${2:-}"; shift 2 ;;
+      *) die 64 "unknown run outcome option: $1" ;;
+    esac
+  done
+  case "$status" in success|failed|partial) ;; *) die 64 "run outcome requires --status success, failed, or partial" ;; esac
+  [ -n "$summary" ] || die 64 "run outcome requires --summary TEXT"
+  validate_scalar "$summary" || die 65 "run summary must be a single line"
+  validate_scalar "$evidence_refs" || die 65 "run evidence must be a single line"
+  validate_scalar "$verified_by" || die 65 "run verifier must be a single line"
+  validate_id "$run_id" || die 64 "invalid run id"
+  dir="$(require_project "$project_id")"; run_file="$dir/runs/$run_id.md"; [ -f "$run_file" ] || die 66 "run missing: $run_id"
+  if [ -n "$verified_by" ]; then
+    case "$verified_by" in human:*|process:*) verification="verified" ;; *) verification="unverified" ;; esac
+  fi
+  while IFS= read -r evidence_ref; do
+    [ -n "$evidence_ref" ] || continue
+    case "$evidence_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "run evidence must stay inside the project" ;; esac
+    evidence_file="$dir/$evidence_ref"
+    [ -f "$evidence_file" ] || die 66 "run evidence missing: $evidence_ref"
+    evidence_hash="$(sha256_file "$evidence_file")"
+    evidence_lines="${evidence_lines}- ref: $(yaml_quote "$evidence_ref") hash: $evidence_hash\n"
+  done < <(printf '%s\n' "$evidence_refs" | tr ',' '\n')
+  outcome_id="outcome_$(sha256_text "$run_id|$status|$summary|$evidence_refs" | cut -c1-16)"
+  outcome_file="$dir/runs/outcomes/$outcome_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$outcome_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ProcedureOutcome\ntitle: %s\nbrain_project_id: %s\nbrain_run_id: %s\nbrain_outcome_id: %s\n' "$(yaml_quote "Outcome $run_id")" "$project_id" "$run_id" "$outcome_id"
+      printf 'brain_outcome_status: %s\nbrain_verification_state: %s\nbrain_verified_by: %s\nbrain_evidence_refs: %s\nbrain_artifact_state: noncanonical\nbrain_observed_at: %s\nbrain_schema_version: %s\n' "$status" "$verification" "$(yaml_quote "${verified_by:-none}")" "$(yaml_quote "${evidence_refs:-none}")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Procedure outcome\n\nStatus: `%s`  \nSummary: %s\n\n## Evidence\n' "$status" "$summary"
+      if [ -n "$evidence_lines" ]; then printf '%b' "$evidence_lines"; else printf '%s\n' '- none recorded'; fi
+    } >"${outcome_file}.tmp.$$"
+    mv "${outcome_file}.tmp.$$" "$outcome_file"
+    audit_v2 "$dir" "run-outcome" "$outcome_id" "" "$status" "$(sha256_file "$outcome_file")" "run=$run_id"
+  fi
+  set_frontmatter_field "$run_file" brain_run_state "$status"
+  set_frontmatter_field "$run_file" brain_last_outcome_ref "runs/outcomes/$outcome_id.md"
+  set_frontmatter_field "$run_file" brain_verification_state "$verification"
+  set_frontmatter_field "$run_file" brain_completed_at "$(now_utc)"
+  audit_v2 "$dir" "run-state" "$run_id" "active" "$status" "$(sha256_file "$run_file")" "outcome=$outcome_id"
+  release_lock
+  printf 'run-outcome=ok project_id=%s run_id=%s outcome_id=%s status=%s verification=%s file=%s\n' "$project_id" "$run_id" "$outcome_id" "$status" "$verification" "$outcome_file"
+}
+
+cmd_run() {
+  local action="${1:-}" project_id="${2:-}"
+  [ -n "$project_id" ] || die 64 "run requires PROJECT_ID"
+  case "$action" in
+    start) [ -n "${3:-}" ] || die 64 "run start requires PROCEDURE_REF"; run_start "$project_id" "$3" "${@:4}" ;;
+    outcome) [ -n "${3:-}" ] || die 64 "run outcome requires RUN_ID"; run_outcome "$project_id" "$3" "${@:4}" ;;
+    show)
+      local run_file; validate_id "${3:-}" || die 64 "invalid run id"; run_file="$(require_project "$project_id")/runs/${3:-}.md"; [ -f "$run_file" ] || die 66 "run missing: ${3:-}"; cat "$run_file" ;;
+    status)
+      local dir run_file
+      dir="$(require_project "$project_id")"
+      printf 'run_id\tstate\tprocedure\tverification\tpath\n'
+      find "$dir/runs" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r run_file; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$run_file" brain_run_id)" "$(frontmatter_field "$run_file" brain_run_state)" "$(frontmatter_field "$run_file" brain_procedure_ref)" "$(frontmatter_field "$run_file" brain_verification_state)" "${run_file#"$dir"/}"
+      done
+      ;;
+    *) die 64 "run requires start, outcome, show, or status" ;;
   esac
 }
 
@@ -3888,7 +4079,7 @@ main() {
     project) [ "${1:-}" = "ensure" ] || die 64 "project requires ensure"; shift; cmd_project_ensure "$@" ;;
     topic) [ "${1:-}" = "add" ] || die 64 "topic requires add"; shift; cmd_topic_add "$@" ;;
     ingest-source)
-      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p')" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
+      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result legacy_episode_ref; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; legacy_episode_ref="$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"; reflection_schedule_record "$project_id" "${legacy_episode_ref#"$(project_dir "$project_id")/"}" deferred capture-only >/dev/null; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$legacy_episode_ref" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
       ;;
     ingest)
       local source="${1:-}" topic="" capture_only=0 manual_only=0 provider="$REFLECTOR"; shift || true
@@ -3901,23 +4092,36 @@ main() {
       local id="${PROJECT_OVERRIDE:-$(project_from_identity)}"
       release_lock
       [ -d "$(project_dir "$id")" ] || cmd_project_ensure "$CWD" --id "$id" >/dev/null
-      local result episode_file episode_ref; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
+      local result episode_file episode_ref schedule decision reason; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
+      episode_file="$(printf '%s\n' "$result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"
+      episode_ref="${episode_file#"$(project_dir "$id")"/}"
       if [ "$manual_only" = 1 ]; then
+        reflection_schedule_record "$id" "$episode_ref" deferred manual-only >/dev/null
         printf 'reflection=deferred reason=manual-only\n'
       elif [ "$capture_only" = 0 ] && [ -n "$provider" ]; then
-        episode_file="$(printf '%s\n' "$result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"
-        episode_ref="${episode_file#"$(project_dir "$id")"/}"
-        cmd_work enqueue "$id" reflect "$episode_ref" --provider "$provider"
-        if [ "${LLM_BRAIN_WORK_AUTORUN:-1}" != "0" ]; then
-          ( "$SCRIPT_SOURCE" --root "$ROOT" work run-once "$id" >/dev/null 2>&1 || true ) &
+        schedule="$(reflection_schedule "$id" "$episode_ref")"
+        decision="$(printf '%s\n' "$schedule" | sed -n 's/^decision=\([^ ]*\).*/\1/p')"
+        reason="$(printf '%s\n' "$schedule" | sed -n 's/^decision=[^ ]* reason=\([^ ]*\).*/\1/p')"
+        if [ "$decision" = immediate ]; then
+          cmd_work enqueue "$id" reflect "$episode_ref" --provider "$provider"
+          if [ "${LLM_BRAIN_WORK_AUTORUN:-1}" != "0" ]; then
+            ( "$SCRIPT_SOURCE" --root "$ROOT" work run-once "$id" >/dev/null 2>&1 || true ) &
+          fi
+          printf 'reflection=queued reason=async-work schedule_reason=%s\n' "$reason"
+        else
+          printf 'reflection=deferred reason=%s\n' "$reason"
         fi
-        printf 'reflection=queued reason=async-work\n'
       elif [ "$capture_only" = 0 ]; then
+        reflection_schedule_record "$id" "$episode_ref" deferred provider-unconfigured >/dev/null
         printf 'reflection=deferred reason=provider-unconfigured\n'
+      else
+        reflection_schedule_record "$id" "$episode_ref" deferred capture-only >/dev/null
+        printf 'reflection=deferred reason=capture-only\n'
       fi
       ;;
     reflect) cmd_reflect "$@" ;;
     work) cmd_work "$@" ;;
+    run) cmd_run "$@" ;;
     eval) cmd_eval "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
