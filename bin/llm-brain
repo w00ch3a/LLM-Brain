@@ -80,6 +80,9 @@ Commands:
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--explain] [--include-proposed] [--include-cold]
   pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical]
   adapters build PROJECT_ID [--agent NAME|all]
+  work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
+  work run-once PROJECT_ID [--provider EXECUTABLE]
+  work status|recover PROJECT_ID
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
   map PROJECT_ID [ROOT]
@@ -558,6 +561,8 @@ ensure_project_layout() {
   ensure_dir "$dir/context-packs"
   ensure_dir "$dir/adapters"
   ensure_dir "$dir/exports"
+  ensure_dir "$dir/requests"
+  ensure_dir "$dir/requests/.staging"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -1124,6 +1129,198 @@ run_provider_with_timeout() {
   done
   wait "$pid" || status=$?
   return "${status:-0}"
+}
+
+work_request_id() {
+  local project_id="$1" operation="$2" subject="$3" subject_hash="$4" provider="$5"
+  printf 'request_%s\n' "$(sha256_text "$project_id|$operation|$subject|$subject_hash|$provider" | cut -c1-16)"
+}
+
+work_request_file() {
+  local dir="$1" request_id="$2"
+  printf '%s/requests/%s.md\n' "$dir" "$request_id"
+}
+
+work_request_reflect_enqueue() {
+  local project_id="$1" episode_ref="$2" provider="$3" dir episode request_id request_file episode_hash
+  dir="$(require_project "$project_id")"
+  [ -n "$episode_ref" ] || die 64 "work enqueue reflect requires EPISODE_FILE"
+  [ -n "$provider" ] || die 69 "work enqueue reflect requires --provider EXECUTABLE"
+  [ -x "$provider" ] || die 69 "reflection provider is not executable: $provider"
+  case "$episode_ref" in
+    /*|*..*|*$'\n'*|*$'\r'*) die 65 "episode reference must stay inside the project" ;;
+  esac
+  episode="$dir/$episode_ref"
+  [ -f "$episode" ] || episode="$episode_ref"
+  [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
+  case "$episode" in "$dir"/*) ;; *) die 65 "episode reference must stay inside the project" ;; esac
+  episode_ref="${episode#"$dir"/}"
+  episode_hash="$(sha256_file "$episode")"
+  request_id="$(work_request_id "$project_id" reflect "$episode_ref" "$episode_hash" "$provider")"
+  request_file="$(work_request_file "$dir" "$request_id")"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$request_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: WorkItem\ntitle: %s\n' "$(yaml_quote "Reflect $(basename "$episode")")"
+      printf 'brain_project_id: %s\nbrain_request_id: %s\n' "$project_id" "$request_id"
+      printf 'brain_operation: reflect\nbrain_request_state: pending\n'
+      printf 'brain_episode_ref: %s\nbrain_episode_hash_sha256: %s\n' "$(yaml_quote "$episode_ref")" "$episode_hash"
+      printf 'brain_provider: %s\nbrain_attempts: 0\n' "$(yaml_quote "$provider")"
+      printf 'brain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Reflect %s\n\nThe provider runs outside the project commit lock. Results remain untrusted until candidate validation and policy checks complete.\n' "$(basename "$episode")"
+    } >"${request_file}.tmp.$$"
+    mv "${request_file}.tmp.$$" "$request_file"
+    audit_v2 "$dir" "work-enqueue" "$request_id" "" "pending" "$(sha256_file "$request_file")" "operation=reflect"
+  fi
+  release_lock
+  printf 'work=queued project_id=%s request_id=%s state=%s file=%s\n' "$project_id" "$request_id" "$(frontmatter_field "$request_file" brain_request_state)" "$request_file"
+}
+
+work_mark_failed() {
+  local project_id="$1" request_file="$2" error="$3" dir
+  dir="$(require_project "$project_id")"
+  acquire_lock "project-$project_id"
+  set_frontmatter_field "$request_file" brain_request_state failed
+  set_frontmatter_field "$request_file" brain_error "$error"
+  set_frontmatter_field "$request_file" brain_finished_at "$(now_utc)"
+  audit_v2 "$dir" "work-failed" "$(frontmatter_field "$request_file" brain_request_id)" "running" "failed" "$(sha256_file "$request_file")" "operation=$(frontmatter_field "$request_file" brain_operation)"
+  release_lock
+}
+
+work_recover_locked() {
+  local dir="$1" request_file state pid current owner_start recover
+  find "$dir/requests" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r request_file; do
+    state="$(frontmatter_field "$request_file" brain_request_state)"
+    [ "$state" = "running" ] || continue
+    pid="$(frontmatter_field "$request_file" brain_owner_pid)"
+    current=""; recover=0
+    case "$pid" in
+      ''|*[!0-9]*) recover=1 ;;
+      *)
+        if kill -0 "$pid" 2>/dev/null; then
+          owner_start="$(frontmatter_field "$request_file" brain_owner_process_start)"
+          current="$(lock_process_start "$pid")"
+          [ -n "$owner_start" ] && [ -n "$current" ] && [ "$owner_start" != "$current" ] && recover=1
+        else
+          current="$(lock_process_start "$pid")"
+          [ -z "$current" ] && recover=1
+        fi
+        ;;
+    esac
+    if [ "$recover" = 1 ]; then
+      set_frontmatter_field "$request_file" brain_request_state pending
+      set_frontmatter_field "$request_file" brain_error worker-lost
+      set_frontmatter_field "$request_file" brain_recovered_at "$(now_utc)"
+      audit_v2 "$dir" "work-recover" "$(frontmatter_field "$request_file" brain_request_id)" "running" "pending" "$(sha256_file "$request_file")" "reason=worker-lost"
+    fi
+  done
+}
+
+work_run_once() {
+  local project_id="$1" provider_override="" dir request_file request_id episode_ref provider episode out candidate request candidate_count=0 attempts=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --provider) provider_override="${2:-}"; shift 2 ;;
+      *) die 64 "unknown work run-once option: $1" ;;
+    esac
+  done
+  dir="$(require_project "$project_id")"
+  ensure_project_layout "$project_id" "$dir"
+  acquire_lock "project-$project_id"
+  work_recover_locked "$dir"
+  request_file=""
+  while IFS= read -r candidate; do
+    [ "$(frontmatter_field "$candidate" brain_request_state)" = "pending" ] || continue
+    request_file="$candidate"
+    request_id="$(frontmatter_field "$candidate" brain_request_id)"
+    attempts="$(frontmatter_field "$candidate" brain_attempts)"; case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+    set_frontmatter_field "$candidate" brain_request_state running
+    set_frontmatter_field "$candidate" brain_owner_pid "$$"
+    set_frontmatter_field "$candidate" brain_owner_process_start "$(lock_process_start "$$")"
+    set_frontmatter_field "$candidate" brain_started_at "$(now_utc)"
+    set_frontmatter_field "$candidate" brain_attempts "$((attempts + 1))"
+    audit_v2 "$dir" "work-start" "$request_id" "pending" "running" "$(sha256_file "$candidate")" "operation=$(frontmatter_field "$candidate" brain_operation)"
+    break
+  done < <(find "$dir/requests" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
+  release_lock
+  [ -n "$request_file" ] || { printf 'work=idle project_id=%s\n' "$project_id"; return 0; }
+  case "$(frontmatter_field "$request_file" brain_operation)" in
+    reflect) ;;
+    *) work_mark_failed "$project_id" "$request_file" unsupported-operation; printf 'work=failed project_id=%s request_id=%s\n' "$project_id" "$request_id"; return 0 ;;
+  esac
+  episode_ref="$(frontmatter_field "$request_file" brain_episode_ref)"
+  episode="$dir/$episode_ref"
+  provider="$(frontmatter_field "$request_file" brain_provider)"
+  [ -n "$provider_override" ] && provider="$provider_override"
+  if [ ! -x "$provider" ]; then
+    work_mark_failed "$project_id" "$request_file" provider-unavailable
+    printf 'work=failed project_id=%s request_id=%s\n' "$project_id" "$request_id"
+    return 0
+  fi
+  if [ ! -f "$episode" ]; then
+    work_mark_failed "$project_id" "$request_file" episode-missing
+    printf 'work=failed project_id=%s request_id=%s\n' "$project_id" "$request_id"
+    return 0
+  fi
+  out="$(mktemp -d "$dir/requests/.staging/${request_id}.XXXXXX")"
+  if request="$(provider_request "$project_id" "$episode")" && run_provider_with_timeout "$provider" "$request" "$out"; then
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      if candidate_valid "$candidate"; then
+        submit_candidate "$project_id" "$candidate" 1 || true
+      else
+        [ "$?" = "2" ] && record_candidate_quarantine "$project_id" "$candidate" >/dev/null || true
+      fi
+      candidate_count=$((candidate_count + 1))
+    done < <(find "$out" -type f -name '*.md' | sort)
+    rm -rf "$out"
+    acquire_lock "project-$project_id"
+    set_frontmatter_field "$episode" brain_reflection_state reflected
+    set_frontmatter_field "$episode" brain_reflected_at "$(now_utc)"
+    set_frontmatter_field "$request_file" brain_request_state committed
+    set_frontmatter_field "$request_file" brain_result_count "$candidate_count"
+    set_frontmatter_field "$request_file" brain_finished_at "$(now_utc)"
+    set_frontmatter_field "$request_file" brain_owner_pid ""
+    audit_v2 "$dir" "reflection-complete" "$(frontmatter_field "$episode" brain_episode_id)" "captured" "reflected" "$(sha256_file "$episode")" "provider=$(slug "$(basename "$provider")")"
+    audit_v2 "$dir" "work-commit" "$request_id" "running" "committed" "$(sha256_file "$request_file")" "candidates=$candidate_count"
+    release_lock
+    printf 'work=committed project_id=%s request_id=%s candidates=%s\n' "$project_id" "$request_id" "$candidate_count"
+  else
+    local provider_status=$?
+    rm -rf "$out"
+    [ "$provider_status" = "124" ] && work_mark_failed "$project_id" "$request_file" provider-timeout || work_mark_failed "$project_id" "$request_file" provider-failed
+    printf 'work=failed project_id=%s request_id=%s\n' "$project_id" "$request_id"
+  fi
+}
+
+cmd_work() {
+  local action="${1:-}" project_id="${2:-}" dir request_file state operation id attempts title
+  shift 2 || true
+  [ -n "$project_id" ] || die 64 "work requires PROJECT_ID"
+  dir="$(require_project "$project_id")"
+  case "$action" in
+    enqueue)
+      local operation_name="${1:-}" episode_ref="${2:-}" provider=""; shift 2 || true
+      while [ $# -gt 0 ]; do case "$1" in --provider) provider="${2:-}"; shift 2 ;; *) die 64 "unknown work enqueue option: $1" ;; esac; done
+      [ "$operation_name" = "reflect" ] || die 64 "work enqueue supports reflect"
+      work_request_reflect_enqueue "$project_id" "$episode_ref" "$provider"
+      ;;
+    run-once) work_run_once "$project_id" "$@" ;;
+    status)
+      printf 'request_id\tstate\toperation\tattempts\ttitle\tpath\n'
+      find "$dir/requests" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r request_file; do
+        id="$(frontmatter_field "$request_file" brain_request_id)"; state="$(frontmatter_field "$request_file" brain_request_state)"; operation="$(frontmatter_field "$request_file" brain_operation)"; attempts="$(frontmatter_field "$request_file" brain_attempts)"; title="$(frontmatter_field "$request_file" title)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$state" "$operation" "$attempts" "$title" "${request_file#"$dir"/}"
+      done
+      ;;
+    recover)
+      acquire_lock "project-$project_id"; work_recover_locked "$dir"; release_lock; printf 'work=recovered project_id=%s\n' "$project_id"
+      ;;
+    *) die 64 "work requires enqueue, run-once, status, or recover" ;;
+  esac
 }
 
 cmd_reflect() {
@@ -3391,10 +3588,23 @@ main() {
       local id="${PROJECT_OVERRIDE:-$(project_from_identity)}"
       release_lock
       [ -d "$(project_dir "$id")" ] || cmd_project_ensure "$CWD" --id "$id" >/dev/null
-      local result; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
-      if [ "$manual_only" = 1 ]; then printf 'reflection=deferred reason=manual-only\n'; elif [ "$capture_only" = 0 ] && [ -n "$provider" ]; then cmd_reflect run "$id" --provider "$provider"; elif [ "$capture_only" = 0 ]; then printf 'reflection=deferred reason=provider-unconfigured\n'; fi
+      local result episode_file episode_ref; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
+      if [ "$manual_only" = 1 ]; then
+        printf 'reflection=deferred reason=manual-only\n'
+      elif [ "$capture_only" = 0 ] && [ -n "$provider" ]; then
+        episode_file="$(printf '%s\n' "$result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"
+        episode_ref="${episode_file#"$(project_dir "$id")"/}"
+        cmd_work enqueue "$id" reflect "$episode_ref" --provider "$provider"
+        if [ "${LLM_BRAIN_WORK_AUTORUN:-1}" != "0" ]; then
+          ( "$SCRIPT_SOURCE" --root "$ROOT" work run-once "$id" >/dev/null 2>&1 || true ) &
+        fi
+        printf 'reflection=queued reason=async-work\n'
+      elif [ "$capture_only" = 0 ]; then
+        printf 'reflection=deferred reason=provider-unconfigured\n'
+      fi
       ;;
     reflect) cmd_reflect "$@" ;;
+    work) cmd_work "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;

@@ -35,6 +35,8 @@ Project writes use a durable directory lease under `.locks/`. Contenders wait fo
 
 Index and embedding work is staged outside the project lease. Only the short derived-index commit and its audit event take the lease, so a slow embedder cannot block capture, review or canonical updates.
 
+Provider-backed capture writes a Markdown `WorkItem` under each project's `requests/` directory before reflection. One-shot workers claim that item under the lease, call the provider outside it, and commit candidates and lifecycle state atomically. A dead worker is returned to `pending`; failed work remains durable and inspectable. Requests are derived and never canonical OKF truth.
+
 ## Provider and promotion policy
 
 The core invokes only explicit trusted reflector, document embedder and query-embedder executables. Provider output is untrusted data and must pass bounded-file, YAML, secret, policy and custody checks.
