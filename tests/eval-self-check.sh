@@ -62,9 +62,10 @@ for number in $(seq -w 0 20); do
   sed -e "s/source-claim/cutoff-$number/g" -e 's/Source retrieval identifier/Top cutoff fixture/g' -e 's/source retrieval identifier\./top cutoff fixture./g' "$project_dir/okf/claims/source-claim.md" >"$project_dir/okf/claims/cutoff-$number.md"
 done
 printf 'case_id\tquery\texpected_paths\ttask\ncutoff\ttop cutoff fixture\tokf/claims/cutoff-20.md\ttop twenty only\n' >"$fixture/cutoff-cases.tsv"
-cutoff="$($cli --root "$vault" eval run "$project_id" --cases "$fixture/cutoff-cases.tsv" --strategies lexical)"
+"$cli" --root "$vault" index build "$project_id" --embedder "$fixture/embedder.sh" >/dev/null
+cutoff="$($cli --root "$vault" eval run "$project_id" --cases "$fixture/cutoff-cases.tsv" --strategies lexical,vector --query-embedder "$fixture/embedder.sh")"
 cutoff_output="$(printf '%s\n' "$cutoff" | sed -n 's/.*output=\([^ ]*\).*/\1/p')"
-awk -F '\t' 'NR == 2 && $9 == "false" && split($6, paths, ",") == 20 { found = 1 } END { exit !found }' "$cutoff_output/trace.tsv"
+awk -F '\t' 'NR > 1 && $9 == "false" && split($6, paths, ",") == 20 { found[$2] = 1 } END { exit !(found["lexical"] && found["vector"]) }' "$cutoff_output/trace.tsv"
 
 cat >"$fixture/answer-runner.sh" <<'RUNNER'
 #!/usr/bin/env bash

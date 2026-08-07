@@ -2615,7 +2615,7 @@ cmd_search() {
       printf '%s\n' "$query" >"$query_input"
       if "$query_embedder" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
         query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
-        vector_model="$(tail -n +2 "$dir/indexes/vectors.tsv" | head -n 1 | cut -f3)"; vector_dimensions="$(tail -n +2 "$dir/indexes/vectors.tsv" | head -n 1 | cut -f4)"
+        vector_model="$(awk -F '\t' 'NR == 2 { print $3; exit }' "$dir/indexes/vectors.tsv")"; vector_dimensions="$(awk -F '\t' 'NR == 2 { print $4; exit }' "$dir/indexes/vectors.tsv")"
         if [ "$query_model" = "$vector_model" ] && [ "$query_dimensions" = "$vector_dimensions" ]; then
           awk -F '\t' -v q="$(embedding_field "$query_vector" vector)" -v model="$query_model" -v dimensions="$query_dimensions" '
             BEGIN { split(q, qv, /[[:space:]]+/) }
