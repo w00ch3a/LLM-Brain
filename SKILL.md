@@ -71,6 +71,7 @@ bin/llm-brain ingest /path/to/source.md --provider /path/to/reflector
 bin/llm-brain search <project-id> "task words"
 bin/llm-brain pack build <project-id> --agent generic --task "current task"
 bin/llm-brain index build <project-id>
+bin/llm-brain eval run <project-id> --cases ./cases.tsv --strategies none,source,episode,lexical,hybrid,graph
 ```
 
 `ingest-source PROJECT FILE [ROOT]` remains the v0.1 capture-only compatibility command. `ingest` reflects and applies automatic policy when a provider is configured. A provider receives a request path and an empty output directory, then writes candidate Markdown files with `ReviewItem` frontmatter.
@@ -82,6 +83,10 @@ Project writes wait behind another writer instead of failing on ordinary lock co
 Slow reflection, embedding and index preparation must run outside the project write lease; acquire the lease only for the atomic Markdown/index commit and its audit event.
 
 Provider-backed `ingest` captures first and queues reflection as a Markdown `WorkItem` under `requests/`; a bounded one-shot worker may run automatically in the background. Agents should also make a best-effort `work run-once PROJECT_ID` call during normal closeout. `work recover PROJECT_ID` returns dead workers to `pending`; failed work stays inspectable and retryable. The human does not manage this queue.
+
+`eval run` is a read-only comparison harness. Its case file is tab-separated (`case_id`, `query`, optional comma-separated expected paths, optional task), and its Markdown report plus TSV trace are derived artefacts under `evaluations/`; they never become canonical memory. Unsupported strategies are recorded as unsupported rather than silently replaced. Token values are conservative estimates unless a separately configured answer runner provides exact accounting.
+
+Temporal extensions are additive and optional: `brain_observed_at`, `brain_valid_from`, `brain_valid_to`, `brain_last_verified_at`, `brain_version_of`, `brain_derived_from` and `brain_authority_origin`. Missing validity is unknown, not invented. `search --as-of ISO-UTC` applies a half-open interval (`valid_from <= as_of < valid_to`); `--historical` without `--as-of` preserves the existing all-history view. A derived/provider observation cannot be auto-promoted as repository or human authority.
 
 For migration, first run `migrate check`. `migrate apply --all` is a vault-wide, staging-and-rollback operation and requires explicit authorisation. It never runs as a side effect of normal work.
 

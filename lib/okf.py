@@ -219,6 +219,46 @@ def concept_issues(metadata: dict[str, Any], body: str) -> list[str]:
     if "stale_after" in metadata and not valid_date(metadata["stale_after"]):
         issues.append("stale_after must be YYYY-MM-DD")
 
+    for field in (
+        "brain_observed_at",
+        "brain_valid_from",
+        "brain_valid_to",
+        "brain_last_verified_at",
+    ):
+        if field in metadata and not valid_datetime(metadata[field]):
+            issues.append(f"{field} must be an ISO 8601 datetime with timezone")
+    valid_from = metadata.get("brain_valid_from")
+    valid_to = metadata.get("brain_valid_to")
+    if valid_from is not None and valid_to is not None:
+        try:
+            start = dt.datetime.fromisoformat(scalar_text(valid_from).replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(scalar_text(valid_to).replace("Z", "+00:00"))
+            if start >= end:
+                issues.append("brain_valid_from must be earlier than brain_valid_to")
+        except ValueError:
+            pass
+    if "brain_version_of" in metadata and (
+        not isinstance(metadata["brain_version_of"], str)
+        or not metadata["brain_version_of"].strip()
+    ):
+        issues.append("brain_version_of must be a non-empty reference")
+    derived_from = metadata.get("brain_derived_from")
+    if derived_from is not None:
+        values = derived_from if isinstance(derived_from, list) else [derived_from]
+        if not values or not all(isinstance(value, str) and value.strip() for value in values):
+            issues.append("brain_derived_from must contain non-empty references")
+    if "brain_authority_origin" in metadata and metadata["brain_authority_origin"] not in {
+        "human-directive",
+        "repository",
+        "runtime-proof",
+        "approved-canonical",
+        "source",
+        "provider",
+        "external-observation",
+        "unknown",
+    }:
+        issues.append("brain_authority_origin is not a recognised authority origin")
+
     if concept_type == "Attested Computation":
         if not isinstance(metadata.get("runtime"), str) or not metadata["runtime"].strip():
             issues.append("Attested Computation requires a non-empty runtime")

@@ -77,12 +77,13 @@ Commands:
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT
   index build|status PROJECT_ID [--embedder EXECUTABLE]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--explain] [--include-proposed] [--include-cold]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--explain] [--include-proposed] [--include-cold]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC]
   adapters build PROJECT_ID [--agent NAME|all]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
+  eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
   map PROJECT_ID [ROOT]
@@ -563,6 +564,7 @@ ensure_project_layout() {
   ensure_dir "$dir/exports"
   ensure_dir "$dir/requests"
   ensure_dir "$dir/requests/.staging"
+  ensure_dir "$dir/evaluations"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -889,7 +891,7 @@ EOF
 }
 
 candidate_valid() {
-  local file="$1" kind confidence risk sensitivity provenance provider provider_version
+  local file="$1" kind confidence risk sensitivity provenance provider provider_version field value origin
   is_regular_text_file "$file" || return 65
   secret_scan_file "$file" || return $?
   kind="$(frontmatter_field "$file" brain_review_kind)"
@@ -904,6 +906,12 @@ candidate_valid() {
   case "$sensitivity" in public|internal|restricted) ;; *) return 65 ;; esac
   awk -v value="$confidence" 'BEGIN { exit !(value ~ /^[01](\.[0-9]+)?$/ && value + 0 >= 0 && value + 0 <= 1) }' || return 65
   [ -n "$provenance" ] && [ -n "$provider" ] && [ -n "$provider_version" ] || return 65
+  for field in brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at; do
+    value="$(frontmatter_field "$file" "$field")"
+    [ -z "$value" ] || brain_datetime_valid "$value" || return 65
+  done
+  origin="$(frontmatter_field "$file" brain_authority_origin)"
+  case "$origin" in ''|human-directive|repository|runtime-proof|approved-canonical|source|provider|external-observation|unknown) ;; *) return 65 ;; esac
   return 0
 }
 
@@ -943,18 +951,20 @@ is_protected_candidate() {
 }
 
 auto_promote_eligible() {
-  local file="$1" confidence risk sensitivity authority kind provenance project_id
+  local file="$1" confidence risk sensitivity authority kind provenance project_id origin
   kind="$(frontmatter_field "$file" brain_review_kind)"
   confidence="$(frontmatter_field "$file" brain_confidence confidence)"
   risk="$(frontmatter_field "$file" brain_risk)"
   sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
   authority="$(frontmatter_field "$file" brain_source_authority)"
+  origin="$(frontmatter_field "$file" brain_authority_origin)"
   provenance="$(frontmatter_field "$file" brain_provenance)"
   case "$kind" in claim|procedure|reference) ;; *) return 1 ;; esac
   [ "$risk" = "low" ] || return 1
   [ "$sensitivity" != "restricted" ] || return 1
   awk -v value="$confidence" 'BEGIN { exit !(value + 0 >= 0.90) }' || return 1
   case "$authority" in human-directive|repository|runtime-proof|approved-canonical) ;; *) return 1 ;; esac
+  case "$origin" in provider|external-observation) case "$authority" in provider|external-observation|source|unknown) ;; *) return 1 ;; esac ;; esac
   case "$provenance" in episode://*|okf://*|human://*|runtime://*) ;; *) return 1 ;; esac
   project_id="$(frontmatter_field "$file" brain_project_id)"
   [ -n "$project_id" ] && provenance_resolves "$project_id" "$file" || return 1
@@ -989,7 +999,7 @@ create_conflict_review() {
 }
 
 promote_review_locked() {
-  local project_id="$1" review_id="$2" actor="${3:-$ACTOR}" reason="${4:-automatic-policy}" dir review kind state title confidence sensitivity body dest hash old
+  local project_id="$1" review_id="$2" actor="${3:-$ACTOR}" reason="${4:-automatic-policy}" dir review kind state title confidence sensitivity body dest hash old authority_origin authority_origin_line=""
   dir="$(require_project "$project_id")"
   review="$dir/review/$review_id.md"
   [ -f "$review" ] || { say_error "missing review item: $review_id"; return 66; }
@@ -1017,6 +1027,8 @@ promote_review_locked() {
   done < <(canonical_files "$dir")
   confidence="$(frontmatter_field "$review" brain_confidence confidence)"
   sensitivity="$(frontmatter_field "$review" brain_sensitivity sensitivity)"
+  authority_origin="$(frontmatter_field "$review" brain_authority_origin)"
+  [ -z "$authority_origin" ] || authority_origin_line="brain_authority_origin: $(yaml_quote "$authority_origin")"
   body="$(review_body_for_canonical "$review")"
   local generated_by generated_at verified_line=""
   generated_by="$(frontmatter_field "$review" brain_provider_id)"
@@ -1040,6 +1052,7 @@ brain_risk: $(frontmatter_field "$review" brain_risk)
 brain_sensitivity: $sensitivity
 brain_loading_temperature: $(frontmatter_field "$review" brain_loading_temperature)
 brain_source_authority: $(frontmatter_field "$review" brain_source_authority)
+$authority_origin_line
 brain_provenance: $(yaml_quote "review://$review_id")
 brain_provider_id: $(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")
 brain_provider_version: $(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")
@@ -1686,8 +1699,28 @@ build_supersession_map() {
   done < <(canonical_files "$dir")
 }
 
+brain_datetime_valid() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+brain_temporal_eligible() {
+  local file="$1" as_of="$2" historical="$3" valid_from valid_to
+  [ "$historical" = "1" ] && [ -z "$as_of" ] && return 0
+  [ -n "$as_of" ] || as_of="$(now_utc)"
+  valid_from="$(frontmatter_field "$file" brain_valid_from)"
+  valid_to="$(frontmatter_field "$file" brain_valid_to)"
+  [ -z "$valid_from" ] || brain_datetime_valid "$valid_from" || return 1
+  [ -z "$valid_to" ] || brain_datetime_valid "$valid_to" || return 1
+  [ -z "$valid_from" ] || [ "$valid_from" \< "$as_of" ] || [ "$valid_from" = "$as_of" ] || return 1
+  [ -z "$valid_to" ] || [ "$as_of" \< "$valid_to" ] || return 1
+  return 0
+}
+
 search_file_eligible() {
-  local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" state status sensitivity temperature
+  local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" as_of="${7:-}" state status sensitivity temperature
   [ ! -f "$dir/okf/retractions/$(basename "$file" .md).md" ] || return 1
   state="$(frontmatter_field "$file" brain_review_state review_state)"
   status="$(frontmatter_field "$file" status)"; [ -n "$status" ] || status="stable"
@@ -1706,6 +1739,7 @@ search_file_eligible() {
   temperature="$(frontmatter_field "$file" brain_loading_temperature)"
   [ "$include_cold" = "1" ] || [ "$temperature" != "cold" ] || return 1
   [ -z "$topic" ] || [ "$(frontmatter_field "$file" brain_topic_id topic_id)" = "$topic" ] || return 1
+  brain_temporal_eligible "$file" "$as_of" "$historical" || return 1
   return 0
 }
 
@@ -1816,7 +1850,7 @@ resolve_graph_target() {
 
 cmd_search() {
   local project_id="$1" query="$2"; shift 2 || true
-  local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file=""
+  local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" as_of=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -1828,6 +1862,7 @@ cmd_search() {
       --query-embedder) query_embedder="${2:-}"; shift 2 ;;
       --expand-graph) expand_graph=1; shift ;;
       --historical) historical=1; shift ;;
+      --as-of) as_of="${2:-}"; shift 2 ;;
       --explain) explain=1; shift ;;
       --include-proposed) include_proposed=1; shift ;;
       --include-cold) include_cold=1; shift ;;
@@ -1836,6 +1871,7 @@ cmd_search() {
     esac
   done
   validate_scalar "$query" || die 65 "query must be a single line"
+  [ -z "$as_of" ] || brain_datetime_valid "$as_of" || die 65 "--as-of must be an ISO-8601 UTC datetime"
   case "$strategy" in lexical|hybrid) ;; *) die 64 "search strategy must be lexical or hybrid" ;; esac
   require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   dir="$(require_project "$project_id")"
@@ -1854,7 +1890,7 @@ cmd_search() {
   build_supersession_map "$dir" "$SEARCH_SUPERSESSION_MAP"
   : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"
   while IFS= read -r file; do
-    search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" || continue
+    search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" || continue
     rel="${file#"$dir"/}"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; title="$(frontmatter_field "$file" title)"
     score=0
     if grep -Fqi -- "$query" "$file"; then score=$((score + 20)); fi
@@ -1887,7 +1923,7 @@ cmd_search() {
           ' "$dir/indexes/vectors.tsv" >"$semantic_raw"
           while IFS=$'\t' read -r rel score; do
             [ -n "$rel" ] || continue
-            search_file_eligible "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" && printf '%s\t%s\n' "$rel" "$score"
+            search_file_eligible "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" && printf '%s\t%s\n' "$rel" "$score"
           done <"$semantic_raw" >"$semantic_raw.filtered"
           mv "$semantic_raw.filtered" "$semantic_raw"
           sort -t $'\t' -k2,2nr -k1,1 "$semantic_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$semantic_rank"
@@ -1929,7 +1965,7 @@ cmd_search() {
           target_rel="$(resolve_graph_target "$dir" "$target" 2>/dev/null || true)"
           [ -n "$target_rel" ] || continue
           [ "$target_rel" != "$rel" ] || continue
-          search_file_eligible "$dir" "$dir/$target_rel" "$include_proposed" "$include_cold" "$topic" "$historical" || continue
+          search_file_eligible "$dir" "$dir/$target_rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" || continue
           graph_score="$(awk -v value="$score" 'BEGIN { printf "%.12f", value * 0.5 }')"
           printf 'G\t%s\t%s\t%s\t%s\n' "$target_rel" "$graph_score" "$rel" "$relation" >>"$graph_records"
           graph_candidate_count=$((graph_candidate_count + 1))
@@ -1976,7 +2012,7 @@ cmd_search() {
     fi
   done < <(head -n "$limit" "$final_ranked")
   if [ -n "$metadata_file" ]; then
-    printf 'retrieval_mode=%s\ndegraded=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" >"$metadata_file"
+    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" >"$metadata_file"
   fi
   rm -rf "$tmp_dir"
   SEARCH_SUPERSESSION_MAP=""
@@ -1984,10 +2020,187 @@ cmd_search() {
   INDEX_EXPECTED_SIGNATURE_READY=0
 }
 
+eval_raw_search() {
+  local dir="$1" corpus="$2" query="$3" output="$4" file rel title score term
+  : >"$output"
+  while IFS= read -r file; do
+    rel="${file#"$dir"/}"
+    title="$(frontmatter_field "$file" title)"
+    score=0
+    if grep -Fqi -- "$query" "$file"; then score=$((score + 20)); fi
+    for term in $(printf '%s' "$query" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' '); do
+      [ "${#term}" -gt 2 ] || continue
+      grep -Fqi -- "$term" "$file" && score=$((score + 1))
+      printf '%s' "$title" | grep -Fqi -- "$term" && score=$((score + 4))
+    done
+    [ "$score" -gt 0 ] && printf '%s\t%s\n' "$rel" "$score" >>"$output"
+  done < <(find "$dir/$corpus" -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+  sort -t $'\t' -k2,2nr -k1,1 "$output" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"${output}.ranked"
+  mv "${output}.ranked" "$output"
+}
+
+eval_case_hit() {
+  local expected="$1" ranked="$2" path
+  [ -n "$expected" ] || return 1
+  while IFS=$'\t' read -r path _; do
+    [ -n "$path" ] || continue
+    while IFS= read -r wanted; do
+      [ -n "$wanted" ] && [ "$path" = "$wanted" ] && return 0
+    done < <(printf '%s\n' "$expected" | tr ',' '\n')
+  done <"$ranked"
+  return 1
+}
+
+eval_context_bytes() {
+  local dir="$1" ranked="$2" path total=0 bytes
+  while IFS=$'\t' read -r path _; do
+    [ -n "$path" ] || continue
+    [ -f "$dir/$path" ] || continue
+    bytes="$(wc -c <"$dir/$path" | tr -d ' ')"
+    total=$((total + bytes))
+  done < <(head -n 20 "$ranked")
+  printf '%s\n' "$total"
+}
+
+cmd_eval() {
+  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" output="" dir cases_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
+  shift 2 || true
+  [ "$action" = "run" ] || die 64 "eval requires run"
+  [ -n "$project_id" ] || die 64 "eval run requires PROJECT_ID"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cases) cases="${2:-}"; shift 2 ;;
+      --strategies) strategies="${2:-}"; shift 2 ;;
+      --answer-runner) answer_runner="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      *) die 64 "unknown eval option: $1" ;;
+    esac
+  done
+  [ -f "$cases" ] || die 66 "evaluation cases file missing: $cases"
+  is_regular_text_file "$cases" || die 65 "evaluation cases must be a regular text file"
+  [ -z "$answer_runner" ] || [ -x "$answer_runner" ] || die 69 "answer runner is not executable: $answer_runner"
+  [ -n "$strategies" ] || die 64 "eval run requires --strategies"
+  dir="$(require_project "$project_id")"
+  cases_hash="$(sha256_file "$cases")"
+  for strategy in $(printf '%s' "$strategies" | tr ',' ' '); do
+    case "$strategy" in none|source|episode|lexical|vector|hybrid|graph) ;; *) die 64 "unsupported evaluation strategy: $strategy" ;; esac
+  done
+  eval_id="eval_$(sha256_text "$project_id|$cases_hash|$strategies|$answer_runner" | cut -c1-16)"
+  [ -n "$output" ] || output="$dir/evaluations/$eval_id"
+  case "$output" in /*) ;; *) die 65 "evaluation output must be an absolute directory" ;; esac
+  if [ -f "$output/report.md" ]; then
+    printf 'eval=idempotent project_id=%s evaluation_id=%s output=%s\n' "$project_id" "$eval_id" "$output"
+    return 0
+  fi
+  [ ! -e "$output" ] || die 73 "evaluation output already exists: $output"
+  ensure_dir "$(dirname "$output")"
+  stage="${output}.tmp.$$"
+  mkdir "$stage"
+  ensure_dir "$stage/answers"
+  trace="$stage/trace.tsv"
+  printf 'case_id\trequested_strategy\tactual_strategy\tdegraded\tquery\tcandidate_paths\tcandidate_ranks\tevidence_refs\thit\tcontext_bytes\ttoken_estimate\tprovider_calls\tmemory_write_cost\telapsed_seconds\toutcome\n' >"$trace"
+  while IFS=$'\t' read -r case_id query expected task; do
+    [ -n "$case_id" ] || continue
+    [ "$case_id" = "case_id" ] && continue
+    validate_scalar "$case_id" || die 65 "evaluation case id must be one line"
+    validate_scalar "$query" || die 65 "evaluation query must be one line"
+    validate_scalar "$expected" || die 65 "evaluation expected paths must be one line"
+    case_count=$((case_count + 1))
+    for strategy in $(printf '%s' "$strategies" | tr ',' ' '); do
+      ranked="$stage/${case_id}.${strategy}.ranked"; metadata="$stage/${case_id}.${strategy}.metadata"; actual="$strategy"; degraded=false; provider_calls=0; memory_write_cost=0; outcome=unknown
+      started="$(date +%s)"
+      case "$strategy" in
+        none)
+          : >"$ranked"
+          ;;
+        source)
+          eval_raw_search "$dir" sources "$query" "$stage/${case_id}.${strategy}.raw"; mv "$stage/${case_id}.${strategy}.raw" "$ranked"
+          ;;
+        episode)
+          eval_raw_search "$dir" episodes "$query" "$stage/${case_id}.${strategy}.raw"; mv "$stage/${case_id}.${strategy}.raw" "$ranked"
+          ;;
+        lexical)
+          cmd_search "$project_id" "$query" --limit 20 --strategy lexical --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
+          cut -f1,10 "$stage/${case_id}.${strategy}.search" | tail -n +2 | awk -F '\t' '{ print $1 "\t" (NR) }' >"$ranked"
+          actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
+          ;;
+        hybrid)
+          cmd_search "$project_id" "$query" --limit 20 --strategy hybrid --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
+          cut -f1,10 "$stage/${case_id}.${strategy}.search" | tail -n +2 | awk -F '\t' '{ print $1 "\t" (NR) }' >"$ranked"
+          actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
+          ;;
+        graph)
+          cmd_search "$project_id" "$query" --limit 20 --strategy lexical --expand-graph --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
+          cut -f1,10 "$stage/${case_id}.${strategy}.search" | tail -n +2 | awk -F '\t' '{ print $1 "\t" (NR) }' >"$ranked"
+          actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
+          ;;
+        vector)
+          : >"$ranked"; actual=unsupported; degraded=true
+          ;;
+      esac
+      candidate_paths="$(cut -f1 "$ranked" | head -n 20 | paste -sd, -)"
+      candidate_ranks="$(cut -f2 "$ranked" | head -n 20 | paste -sd, -)"
+      evidence_refs="$candidate_paths"
+      if eval_case_hit "$expected" "$ranked"; then hit=true; else hit=false; fi
+      context_bytes="$(eval_context_bytes "$dir" "$ranked")"
+      token_estimate=$(( (context_bytes + 3) / 4 ))
+      if [ -n "$answer_runner" ]; then
+        answer_request="$stage/answers/${case_id}.${strategy}.request.md"; answer_output="$stage/answers/${case_id}.${strategy}.out"
+        {
+          printf '%s\n' '---'
+          printf 'type: EvaluationAnswerRequest\nproject_id: %s\ncase_id: %s\nstrategy: %s\n' "$project_id" "$case_id" "$strategy"
+          printf 'query: %s\nexpected_paths: %s\n' "$(yaml_quote "$query")" "$(yaml_quote "$expected")"
+          printf '%s\n' '---'
+          printf '# Evaluation request\n\n%s\n\nCandidates: %s\n\n%s\n' "$query" "${candidate_paths:-none}" "$task"
+        } >"$answer_request"
+        if "$answer_runner" "$answer_request" "$answer_output"; then
+          provider_calls=1
+          answer_outcome="$(awk -F: 'tolower($1) == "outcome" { gsub(/^[[:space:]]+/, "", $2); print $2; exit }' "$answer_output" 2>/dev/null || true)"
+          [ -n "$answer_outcome" ] && outcome="$answer_outcome" || outcome=unknown
+        else
+          provider_calls=1; outcome=error
+        fi
+      fi
+      elapsed=$(( $(date +%s) - started ))
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$case_id" "$strategy" "${actual:-unknown}" "$degraded" "$query" "$candidate_paths" "$candidate_ranks" "$evidence_refs" "$hit" "$context_bytes" "$token_estimate" "$provider_calls" "$memory_write_cost" "$elapsed" "$outcome" >>"$trace"
+    done
+  done <"$cases"
+  deterministic_hash="$(cut -f1-13,15 "$trace" | sha256_file /dev/stdin)"
+  summary="$stage/summary.tsv"
+  awk -F '\t' 'NR > 1 { total[$2]++; if ($9 == "true") hit[$2]++; bytes[$2] += $10; calls[$2] += $12; writes[$2] += $13 } END { for (s in total) printf "%s\t%d\t%d\t%d\t%d\t%d\n", s, total[s], hit[s] + 0, bytes[s] + 0, calls[s] + 0, writes[s] + 0 }' "$trace" >"$summary"
+  report="$stage/report.md"
+  {
+    printf '%s\n' '---'
+    printf 'type: EvaluationReport\nbrain_project_id: %s\nbrain_evaluation_id: %s\n' "$project_id" "$eval_id"
+    printf 'brain_cases_hash_sha256: %s\nbrain_result_hash_sha256: %s\nbrain_requested_strategies: %s\n' "$cases_hash" "$deterministic_hash" "$(yaml_quote "$strategies")"
+    printf 'brain_answer_runner: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\n' "$(yaml_quote "${answer_runner:-none}")" "$(yaml_quote "$(now_utc)")"
+    printf '%s\n' '---'
+    printf '# Memory evaluation %s\n\nCases: %s\n\n' "$eval_id" "$case_count"
+    printf 'The trace is derived data. Retrieval is read-only; memory write cost is recorded as zero. Token values are conservative four-byte estimates unless an answer runner reports its own outcome.\n\n'
+    printf '## Results\n\n'
+    printf 'strategy\tcases\thits\tcontext_bytes\tprovider_calls\tmemory_writes\n'
+    sort "$summary"
+    printf '\n## Artefacts\n\n* Trace: `trace.tsv`\n* Cases hash: `%s`\n* Requested strategies: `%s`\n' "$cases_hash" "$strategies"
+  } >"$report"
+  rm -f "$summary"
+  for artifact in "$stage"/*; do
+    [ -e "$artifact" ] || continue
+    case "$(basename "$artifact")" in report.md|trace.tsv|answers) ;; *) rm -rf "$artifact" ;; esac
+  done
+  acquire_lock "project-$project_id"
+  if [ -e "$output" ]; then
+    release_lock; rm -rf "$stage"; die 73 "evaluation output appeared during run: $output"
+  fi
+  mv "$stage" "$output"
+  audit_v2 "$dir" "evaluation-run" "$eval_id" "" "derived" "$(sha256_file "$output/report.md")" "cases=$case_count"
+  release_lock
+  printf 'eval=ok project_id=%s evaluation_id=%s output=%s cases=%s\n' "$project_id" "$eval_id" "$output" "$case_count"
+}
+
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 dir results metadata selected hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none"
+  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" dir results metadata selected hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none"
   while [ $# -gt 0 ]; do
     case "$1" in
       --task) task="${2:-}"; shift 2 ;;
@@ -1998,6 +2211,7 @@ cmd_pack() {
       --query-embedder) query_embedder="${2:-}"; shift 2 ;;
       --expand-graph) expand_graph=1; shift ;;
       --historical) historical=1; shift ;;
+      --as-of) as_of="${2:-}"; shift 2 ;;
       --include-proposed) include_proposed=1; shift ;;
       --include-cold) include_cold=1; shift ;;
       *) die 64 "unknown pack option: $1" ;;
@@ -2005,6 +2219,7 @@ cmd_pack() {
   done
   [ -n "$task" ] || die 64 "pack build requires --task"
   case "$strategy" in lexical|hybrid) ;; *) die 64 "pack strategy must be lexical or hybrid" ;; esac
+  [ -z "$as_of" ] || brain_datetime_valid "$as_of" || die 65 "--as-of must be an ISO-8601 UTC datetime"
   case "$budget" in ''|*[!0-9]*) die 64 "--budget-tokens must be a non-negative integer" ;; esac
   [ "$budget" -gt 0 ] || die 64 "--budget-tokens must be positive"
   dir="$(require_project "$project_id")"
@@ -2016,6 +2231,7 @@ cmd_pack() {
   [ -z "$query_embedder" ] || search_args+=("--query-embedder" "$query_embedder")
   [ "$expand_graph" = "0" ] || search_args+=("--expand-graph")
   [ "$historical" = "0" ] || search_args+=("--historical")
+  [ -z "$as_of" ] || search_args+=("--as-of" "$as_of")
   [ "$include_proposed" = "0" ] || search_args+=("--include-proposed")
   [ "$include_cold" = "0" ] || search_args+=("--include-cold")
   cmd_search "${search_args[@]}" >"$results"
@@ -2029,7 +2245,7 @@ cmd_pack() {
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
-    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$SCHEMA_VERSION"
+    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$SCHEMA_VERSION"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
     printf '## Selected Memory\n\n'
@@ -3605,6 +3821,7 @@ main() {
       ;;
     reflect) cmd_reflect "$@" ;;
     work) cmd_work "$@" ;;
+    eval) cmd_eval "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;
