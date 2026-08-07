@@ -42,6 +42,55 @@ for transition in upgrade migration; do
   rmdir "$transition_lock"
 done
 
+stale_transition="$vault_parent/.${vault_base}.migration.lock"
+mkdir "$stale_transition"
+cat >"$stale_transition/owner" <<'OWNER'
+pid=999999
+process_start=not-a-live-process
+timestamp=1970-01-01T00:00:00Z
+actor=test/stale-transition
+token=stale
+OWNER
+stale_transition_topic="$($cli --root "$vault" topic add "$project_id" "Recovered Stale Transition")"
+assert_contains "$stale_transition_topic" 'topic=ok'
+[ ! -d "$stale_transition" ] || fail "stale transition lock was not recovered"
+
+stale_lock="$vault/.locks/project-$project_id.lock"
+mkdir -p "$vault/.locks"
+mkdir "$stale_lock"
+cat >"$stale_lock/owner" <<'OWNER'
+pid=999999
+process_start=not-a-live-process
+timestamp=1970-01-01T00:00:00Z
+actor=test/stale-lock
+token=stale
+OWNER
+stale_topic="$($cli --root "$vault" topic add "$project_id" "Recovered Stale Lock")"
+assert_contains "$stale_topic" 'topic=ok'
+[ ! -d "$stale_lock" ] || fail "stale project lock was not recovered"
+find "$vault/.locks" -maxdepth 1 -type f -name 'project-*.recovered.*.md' -print -quit | grep -q . || fail "stale lock recovery was not recorded"
+
+live_lock="$vault/.locks/project-$project_id.lock"
+mkdir "$live_lock"
+sleep 1 &
+holder_pid=$!
+cat >"$live_lock/owner" <<OWNER
+pid=$holder_pid
+timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+actor=test/live-lock
+token=live
+OWNER
+(
+  sleep 1
+  rm -f "$live_lock/owner"
+  rmdir "$live_lock"
+) &
+release_pid=$!
+wait_output="$($cli --root "$vault" topic add "$project_id" "Waited For Live Lock")"
+wait "$release_pid"
+assert_contains "$wait_output" 'topic=ok'
+[ ! -d "$live_lock" ] || fail "live project lock was not released"
+
 topic_output="$($cli --root "$vault" topic add "$project_id" "Automatic Memory")"
 topic_id="$(printf '%s\n' "$topic_output" | sed -n 's/.*topic_id=\([^ ]*\).*/\1/p')"
 [ -n "$topic_id" ] || fail "topic id missing"
@@ -256,6 +305,30 @@ cat >"$query_embedder" <<'QUERY_EMBEDDER'
 printf 'model: fixture-semantic\ndimensions: 3\nvector: 1 0 0\n'
 QUERY_EMBEDDER
 chmod 755 "$query_embedder"
+slow_marker="$fixture/slow-embedder.started"
+slow_done="$fixture/slow-embedder.done"
+slow_semantic_embedder="$fixture/slow-semantic-embedder.sh"
+cat >"$slow_semantic_embedder" <<SLOW_EMBEDDER
+#!/usr/bin/env bash
+if [ ! -f "$slow_done" ]; then
+  touch "$slow_marker"
+  sleep 2
+  touch "$slow_done"
+fi
+printf 'model: fixture-semantic\ndimensions: 3\nvector: 1 0 0\n'
+SLOW_EMBEDDER
+chmod 755 "$slow_semantic_embedder"
+LLM_BRAIN_EMBEDDER_VERSION=slow "$cli" --root "$vault" index build "$project_id" --embedder "$slow_semantic_embedder" >/dev/null &
+index_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -f "$slow_marker" ] && break
+  sleep 0.1
+done
+[ -f "$slow_marker" ] || fail "slow embedder did not start"
+[ ! -d "$vault/.locks/project-$project_id.lock" ] || fail "index build held project lock during embedding"
+concurrent_topic="$($cli --root "$vault" topic add "$project_id" "During Index Build")"
+assert_contains "$concurrent_topic" 'topic=ok'
+wait "$index_pid"
 LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index build "$project_id" --embedder "$semantic_embedder" >/dev/null
 assert_file "$vault/projects/$project_id/indexes/vectors.tsv"
 index_status="$(LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index status "$project_id")"

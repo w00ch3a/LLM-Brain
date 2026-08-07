@@ -31,6 +31,10 @@ Consumers derive:
 
 Indexes, search results and context packs surface lifecycle, trust and freshness. Effective memory still honours LLM-Brain sensitivity, retraction, conflict and supersession controls. `Attested Computation` documents are validated, indexed, preserved and exported; LLM-Brain does not execute their computation, executor or attester.
 
+Project writes use a durable directory lease under `.locks/`. Contenders wait for the owning process to finish; an owner proven dead is recovered only after its metadata is retained as a Markdown `LockRecovery` record. Writes keep temp-file-then-rename semantics and audit updates remain inside the lease. There is no lock-bypass mode. Vault migration and upgrade transition locks remain hard stops while owned by a live process because those operations replace or transform the vault as a whole; current releases record an owner so a dead transaction can be recovered, while legacy unowned transition locks remain a deliberate manual stop.
+
+Index and embedding work is staged outside the project lease. Only the short derived-index commit and its audit event take the lease, so a slow embedder cannot block capture, review or canonical updates.
+
 ## Provider and promotion policy
 
 The core invokes only explicit trusted reflector, document embedder and query-embedder executables. Provider output is untrusted data and must pass bounded-file, YAML, secret, policy and custody checks.

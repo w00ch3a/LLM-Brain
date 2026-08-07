@@ -77,6 +77,10 @@ bin/llm-brain index build <project-id>
 
 Use `review list`, `review show` and `review decide` only for real exceptions. Safe candidates should not create human queue work.
 
+Project writes wait behind another writer instead of failing on ordinary lock contention. Stale project ownership is recovered only when the owner is proven dead, with a Markdown recovery record retained under `.locks/`. Do not bypass locks. Migration and upgrade transition locks are whole-vault safety stops while live; current transactions record ownership so dead ones can be recovered, while legacy unowned transition locks require explicit inspection.
+
+Slow reflection, embedding and index preparation must run outside the project write lease; acquire the lease only for the atomic Markdown/index commit and its audit event.
+
 For migration, first run `migrate check`. `migrate apply --all` is a vault-wide, staging-and-rollback operation and requires explicit authorisation. It never runs as a side effect of normal work.
 
 Use `migrate reconcile-sources PROJECT_ID` to retry exact source custody recovery after migration. Legacy 32-character MD5 records are accepted only when the pointed-to bytes match exactly; custody is then stored under a computed SHA-256 while the original MD5 remains in provenance. After an exhaustive recovery search and explicit authorisation, `--finalise-missing --reason TEXT` may mark a gap unrecoverable only when no effective canonical item depends on it. This records the outcome in the episode, reconciliation ledger and hash-chained audit; it does not pretend the bytes were recovered.

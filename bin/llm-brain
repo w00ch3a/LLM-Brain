@@ -43,6 +43,11 @@ INDEX_EXPECTED_SIGNATURE_READY=0
 GENERATED_MARKER="<!-- llm-brain:generated-map -->"
 MAX_SOURCE_BYTES=$((10 * 1024 * 1024))
 CURRENT_LOCK=""
+CURRENT_LOCK_TOKEN=""
+LOCK_OWNER_TOKEN=""
+LOCK_WAIT_SECONDS="${LLM_BRAIN_LOCK_WAIT_SECONDS:-0}"
+LOCK_POLL_SECONDS="${LLM_BRAIN_LOCK_POLL_SECONDS:-1}"
+LOCK_STALE_SECONDS="${LLM_BRAIN_LOCK_STALE_SECONDS:-300}"
 MIGRATION_LOCK=""
 UPGRADE_ACTIVE=0
 UPGRADE_RECEIPT=""
@@ -261,37 +266,153 @@ remove_frontmatter_field() {
 
 ensure_dir() { [ -d "$1" ] || mkdir -p "$1"; }
 
+lock_owner_field() {
+  local file="$1" key="$2"
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$file" 2>/dev/null || true
+}
+
+lock_process_start() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+lock_mtime() {
+  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || printf '0\n'
+}
+
+lock_is_stale() {
+  local lock_dir="$1" owner pid started current age now mtime
+  [ -d "$lock_dir" ] || return 1
+  [ ! -L "$lock_dir" ] || return 1
+  owner="$lock_dir/owner"
+  [ ! -L "$owner" ] || return 1
+  if [ -f "$owner" ]; then
+    pid="$(lock_owner_field "$owner" pid)"
+    case "$pid" in ''|*[!0-9]*) ;; *)
+      if ! kill -0 "$pid" 2>/dev/null; then
+        [ -z "$(lock_process_start "$pid")" ] && return 0
+        return 1
+      fi
+      started="$(lock_owner_field "$owner" process_start)"
+      if [ -n "$started" ]; then
+        current="$(lock_process_start "$pid")"
+        [ -n "$current" ] && [ "$current" != "$started" ] && return 0
+      fi
+      return 1
+      ;;
+    esac
+  fi
+  now="$(date +%s)"
+  mtime="$(lock_mtime "$lock_dir")"
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  age=$((now - mtime))
+  [ "$age" -ge "$LOCK_STALE_SECONDS" ]
+}
+
+record_lock_recovery() {
+  local lock_dir="$1" owner recovery tmp scope
+  ensure_dir "$ROOT/.locks"
+  owner="$lock_dir/owner"
+  scope="$(basename "$lock_dir" .lock)"
+  validate_scalar "$scope" || return 1
+  recovery="$ROOT/.locks/${scope}.recovered.$(date -u '+%Y%m%dT%H%M%SZ').$$.md"
+  tmp="${recovery}.tmp"
+  {
+    printf '%s\n' '---'
+    printf 'type: LockRecovery\nscope: %s\nrecovered_at: %s\nreason: stale-owner\n' "$scope" "$(now_utc)"
+    printf '%s\n' '---'
+    printf '# Recovered stale lock\n\nThe lock owner was no longer live. Its metadata was retained before recovery.\n\n'
+    printf '## Owner metadata\n\n```text\n'
+    [ -f "$owner" ] && cat "$owner" || printf 'owner metadata unavailable\n'
+    printf '%s\n' '```'
+  } >"$tmp"
+  mv "$tmp" "$recovery"
+}
+
+recover_stale_lock() {
+  local lock_dir="$1"
+  lock_is_stale "$lock_dir" || return 1
+  record_lock_recovery "$lock_dir" || return 1
+  rm -f "$lock_dir/owner"
+  rmdir "$lock_dir" 2>/dev/null
+}
+
+recover_stale_project_locks() {
+  local lock
+  [ -d "$ROOT/.locks" ] || return 0
+  for lock in "$ROOT"/.locks/*.lock; do
+    [ -d "$lock" ] || continue
+    recover_stale_lock "$lock" || return 73
+  done
+  return 0
+}
+
+write_lock_owner() {
+  local lock_dir="$1" scope="$2" token
+  validate_scalar "$ACTOR" || die 65 "invalid lock actor"
+  token="$(sha256_text "$$|$scope|$(now_utc)|${RANDOM:-0}")"
+  LOCK_OWNER_TOKEN="$token"
+  printf 'pid=%s\nprocess_start=%s\ntimestamp=%s\nactor=%s\ntoken=%s\n' \
+    "$$" "$(lock_process_start "$$")" "$(now_utc)" "$ACTOR" "$token" >"$lock_dir/owner"
+}
+
 require_no_root_transition() {
   local parent base transition_lock
   parent="$(dirname "$ROOT")"
   base="$(basename "$ROOT")"
   for transition_lock in "$parent/.${base}.upgrade.lock" "$parent/.${base}.migration.lock"; do
-    [ ! -d "$transition_lock" ] || die 73 "vault transition lock held: $transition_lock"
+    [ ! -d "$transition_lock" ] && continue
+    if [ -f "$transition_lock/owner" ] && recover_stale_lock "$transition_lock"; then continue; fi
+    say_error "vault transition lock held: $transition_lock"
+    return 73
   done
+  return 0
 }
 
 acquire_lock() {
-  local scope="$1" lock_dir
-  require_no_root_transition
+  local scope="$1" lock_dir started_at now elapsed
+  case "$LOCK_WAIT_SECONDS:$LOCK_POLL_SECONDS:$LOCK_STALE_SECONDS" in
+    ''|*[!0-9:]*|*::*|*:*:*:*) die 64 "lock timing settings must be non-negative integers" ;;
+  esac
+  [ "$LOCK_POLL_SECONDS" -gt 0 ] || die 64 "LLM_BRAIN_LOCK_POLL_SECONDS must be positive"
+  require_no_root_transition || return $?
   lock_dir="$ROOT/.locks/${scope}.lock"
   ensure_dir "$ROOT/.locks"
-  if ! mkdir "$lock_dir" 2>/dev/null; then
-    die 73 "lock held: $lock_dir"
-  fi
+  started_at="$(date +%s)"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if recover_stale_lock "$lock_dir"; then continue; fi
+    if [ "$LOCK_WAIT_SECONDS" -gt 0 ]; then
+      now="$(date +%s)"; elapsed=$((now - started_at))
+      [ "$elapsed" -lt "$LOCK_WAIT_SECONDS" ] || die 73 "lock held after ${LOCK_WAIT_SECONDS}s: $lock_dir"
+    fi
+    sleep "$LOCK_POLL_SECONDS"
+  done
+  write_lock_owner "$lock_dir" "$scope"
+  CURRENT_LOCK_TOKEN="$LOCK_OWNER_TOKEN"
   CURRENT_LOCK="$lock_dir"
-  printf 'pid=%s\ntimestamp=%s\nactor=%s\n' "$$" "$(now_utc)" "$ACTOR" >"$lock_dir/owner"
+  if ! require_no_root_transition; then
+    release_lock
+    sleep "$LOCK_POLL_SECONDS"
+    acquire_lock "$scope"
+  fi
 }
 
 release_lock() {
-  local lock_dir="${CURRENT_LOCK:-}"
+  local lock_dir="${CURRENT_LOCK:-}" token
   CURRENT_LOCK=""
+  token="${CURRENT_LOCK_TOKEN:-}"
+  CURRENT_LOCK_TOKEN=""
   [ -n "$lock_dir" ] || return 0
-  rm -rf "$lock_dir" 2>/dev/null || true
+  [ -d "$lock_dir" ] || return 0
+  [ ! -L "$lock_dir" ] && [ ! -L "$lock_dir/owner" ] || return 0
+  [ -n "$token" ] && [ "$(lock_owner_field "$lock_dir/owner" token)" = "$token" ] || return 0
+  rm -f "$lock_dir/owner"
+  rmdir "$lock_dir" 2>/dev/null || true
 }
 
 cleanup() {
   release_lock
   if [ -n "${MIGRATION_LOCK:-}" ]; then
+    rm -f "$MIGRATION_LOCK/owner"
     rmdir "$MIGRATION_LOCK" 2>/dev/null || true
     MIGRATION_LOCK=""
   fi
@@ -670,9 +791,9 @@ EOF
 capture_source() {
   local project_id="$1" source="$2" topic_id="${3:-}" dir source_dir staging hash short name dest episode_id episode_file review_id review_file day
   dir="$(require_project "$project_id")"
-  ensure_project_layout "$project_id" "$dir"
   is_regular_text_file "$source" || die 65 "source must be a regular non-binary file under 10 MiB"
   acquire_lock "project-$project_id"
+  ensure_project_layout "$project_id" "$dir"
   source_dir="$dir/sources"
   staging="$source_dir/.incoming.$$"
   cp "$source" "$staging"
@@ -681,7 +802,6 @@ capture_source() {
   else
     local status=$?
     rm -f "$staging"
-    release_lock
     if [ "$status" = "2" ]; then
       local blocked_id
       blocked_id="redaction_$(sha256_text "$(canonical_path "$(dirname "$source")")/$(basename "$source")" | cut -c1-12)"
@@ -689,10 +809,12 @@ capture_source() {
       printf 'source_hash=unrecorded\nsource_ref=%s\nstatus=blocked\n' "$(basename "$source")" >"$dir/quarantine/$blocked_id.txt"
       write_review_item "$dir" "$blocked_id" "redaction" "Redaction review for $(basename "$source")" "needs-validation" "0.0" "high" "restricted" "source" "" "source://$(basename "$source")" "Source matched the secret scanner and was not copied." >/dev/null
       audit_v2 "$dir" "ingest-blocked" "$blocked_id" "" "needs-validation" "" "secret-scan"
+      release_lock
       printf 'ingest-source=secret-scan-blocked source=%s\n' "$source" >&2
       printf 'ingest=blocked project_id=%s review=%s\n' "$project_id" "$blocked_id"
       return 2
     fi
+    release_lock
     return "$status"
   fi
   hash="$(sha256_file "$staging")"
@@ -1403,12 +1525,14 @@ file_conflict_state() {
 }
 
 build_indexes() {
-  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors stage tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts vector vector_tmp
   dir="$(require_project "$project_id")"
   [ -z "$embedder" ] || [ -x "$embedder" ] || die 69 "embedder is not executable: $embedder"
-  acquire_lock "project-$project_id"
   docs="$dir/indexes/documents.tsv"; terms="$dir/indexes/terms.tsv"; graph="$dir/indexes/graph.tsv"; manifest="$dir/indexes/manifest.tsv"; vectors="$dir/indexes/vectors.tsv"
-  tmp_docs="${docs}.tmp.$$"; tmp_terms="${terms}.tmp.$$"; tmp_graph="${graph}.tmp.$$"; tmp_manifest="${manifest}.tmp.$$"; tmp_vectors="${vectors}.tmp.$$"
+  ensure_dir "$dir/indexes"
+  ensure_dir "$dir/indexes/embeddings"
+  stage="$(mktemp -d "$dir/indexes/.build.XXXXXX")"
+  tmp_docs="$stage/documents.tsv"; tmp_terms="$stage/terms.tsv"; tmp_graph="$stage/graph.tsv"; tmp_manifest="$stage/manifest.tsv"; tmp_vectors="$stage/vectors.tsv"
   printf 'path\thash\ttype\ttitle\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttemperature\ttopic_id\tgenerated_at\tstale_after\tsources\truntime\n' >"$tmp_docs"
   printf 'term\tpath\tcount\n' >"$tmp_terms"
   printf 'source\trelation\ttarget\n' >"$tmp_graph"
@@ -1431,15 +1555,15 @@ build_indexes() {
     { grep -Eo '\[\[[^]]+\]\]|\[[^]]+\]\([^)]+\)' "$file" 2>/dev/null || true; } | sed 's/^\[\[//; s/\]\]$//; s/^[^]]*\](//; s/)$//' | while IFS= read -r target; do [ -n "$target" ] && printf '%s\tlinks_to\t%s\n' "$rel" "$target" >>"$tmp_graph"; done
     printf '%s\t%s\t%s\t%s\n' "$rel" "$hash" "$SCHEMA_VERSION" "${embedder:+$(slug "$(basename "$embedder")"):$embedder_version}" >>"$tmp_manifest"
     if [ -n "$embedder" ]; then
-      local vector
       vector="$dir/indexes/embeddings/${hash}-$(slug "$embedder_version").txt"
       if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then
-        rm -f "${vector}.tmp.$$"
-        if "$embedder" "$file" >"${vector}.tmp.$$" && valid_embedding_file "${vector}.tmp.$$"; then
-          mv "${vector}.tmp.$$" "$vector"
+        vector_tmp="${vector}.tmp.$$"
+        rm -f "$vector_tmp"
+        if "$embedder" "$file" >"$vector_tmp" && valid_embedding_file "$vector_tmp"; then
+          if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then mv "$vector_tmp" "$vector"; else rm -f "$vector_tmp"; fi
         else
-          rm -f "${vector}.tmp.$$"
-          release_lock
+          rm -f "$vector_tmp"
+          rm -rf "$stage"
           die 69 "embedder returned an invalid vector for: $rel"
         fi
       fi
@@ -1449,10 +1573,12 @@ build_indexes() {
   { head -1 "$tmp_docs"; tail -n +2 "$tmp_docs" | sort -u; } >"${tmp_docs}.sorted"; mv "${tmp_docs}.sorted" "$tmp_docs"
   { head -1 "$tmp_terms"; tail -n +2 "$tmp_terms" | sort -u; } >"${tmp_terms}.sorted"; mv "${tmp_terms}.sorted" "$tmp_terms"
   { head -1 "$tmp_graph"; tail -n +2 "$tmp_graph" | sort -u; } >"${tmp_graph}.sorted"; mv "${tmp_graph}.sorted" "$tmp_graph"
+  acquire_lock "project-$project_id"
   mv "$tmp_docs" "$docs"; mv "$tmp_terms" "$terms"; mv "$tmp_graph" "$graph"; mv "$tmp_manifest" "$manifest"
   if [ -n "$embedder" ]; then mv "$tmp_vectors" "$vectors"; else rm -f "$tmp_vectors" "$vectors"; fi
   audit_v2 "$dir" "index-build" "indexes" "" "rebuilt" "$(sha256_file "$docs")" "embedder=${embedder:+configured}"
   release_lock
+  rmdir "$stage" 2>/dev/null || true
   printf 'index=rebuilt project_id=%s documents=%s terms=%s graph=%s\n' "$project_id" "$docs" "$terms" "$graph"
 }
 
@@ -1774,15 +1900,18 @@ cmd_export() {
       printf 'source_path\tdocument_path\n' >"$stage/manifest.tsv"
       while IFS= read -r file; do printf '%s\t%s\n' "${file#"$stage"/documents/}" "${file#"$stage"/}" >>"$stage/manifest.tsv"; done < <(find "$stage/documents" -type f -name '*.md' | sort)
       local previous=""
+      acquire_lock "project-$project_id"
       if [ -e "$out" ]; then previous="${out}.previous.$$"; mv "$out" "$previous"; fi
       if mv "$stage" "$out"; then
         [ -z "$previous" ] || rm -rf "$previous"
       else
         [ -z "$previous" ] || mv "$previous" "$out"
+        release_lock
         rm -rf "$stage"
         die 73 "knowledge catalog export replacement failed"
       fi
       audit_v2 "$dir" "export-knowledge-catalog" "knowledge-catalog" "" "built" "$(sha256_file "$out/manifest.tsv")" ""
+      release_lock
       printf 'export=knowledge-catalog path=%s\n' "$out"
       ;;
     bundle)
@@ -1797,7 +1926,8 @@ cmd_export() {
       } >"$bundle_dir/bundle-manifest.tsv"
       tar -czf "$stage" -C "$bundle_dir" okf bundle-manifest.tsv
       rm -rf "$bundle_dir"
-      mv "$stage" "$out"; printf '%s  %s\n' "$(sha256_file "$out")" "$(basename "$out")" >"$out.sha256"; audit_v2 "$dir" "export-bundle" "$(basename "$out")" "" "built" "$(sha256_file "$out")" ""; printf 'export=bundle path=%s\n' "$out"
+      acquire_lock "project-$project_id"
+      mv "$stage" "$out"; printf '%s  %s\n' "$(sha256_file "$out")" "$(basename "$out")" >"$out.sha256"; audit_v2 "$dir" "export-bundle" "$(basename "$out")" "" "built" "$(sha256_file "$out")" ""; release_lock; printf 'export=bundle path=%s\n' "$out"
       ;;
     *) die 64 "export requires okf, knowledge-catalog, or bundle" ;;
   esac
@@ -2401,7 +2531,7 @@ cmd_migrate() {
       [ "${output#/}" != "$output" ] || die 64 "migrate stage output must be absolute"
       [ ! -e "$output" ] || die 73 "migrate stage output already exists: $output"
       cmd_lint >/dev/null || die 73 "migration preflight failed; resolve lint errors first"
-      if [ -d "$ROOT/.locks" ] && find "$ROOT/.locks" -mindepth 1 -maxdepth 1 -type d | grep -q .; then die 73 "migration refused while project locks are present"; fi
+      recover_stale_project_locks || die 73 "migration refused while project locks are present"
       saved_root="$ROOT"
       clone_tree "$ROOT" "$output"
       ROOT="$output"
@@ -2417,10 +2547,11 @@ cmd_migrate() {
       [ "$all" = 1 ] || die 64 "migrate apply requires --all"
       [ -d "$ROOT" ] || die 66 "brain root missing: $ROOT"
       cmd_lint >/dev/null || die 73 "migration preflight failed; resolve lint errors first"
-      if [ -d "$ROOT/.locks" ] && find "$ROOT/.locks" -mindepth 1 -maxdepth 1 -type d | grep -q .; then die 73 "migration refused while project locks are present"; fi
+      recover_stale_project_locks || die 73 "migration refused while project locks are present"
       root_parent="$(dirname "$ROOT")"; base="$(basename "$ROOT")"; migration_id="v3-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
       local external_lock="$root_parent/.${base}.migration.lock"
       mkdir "$external_lock" 2>/dev/null || die 73 "migration lock held: $external_lock"
+      write_lock_owner "$external_lock" "migration-$migration_id"
       MIGRATION_LOCK="$external_lock"
       inventory="$root_parent/.${base}.${migration_id}.inventory.tsv"
       migration_inventory "$ROOT" "$inventory"
@@ -2453,7 +2584,7 @@ cmd_migrate() {
         mv "$rollback" "$ROOT" || die 73 "post-migration verification failed and rollback could not be restored"
         die 1 "post-migration verification failed; original vault restored; failed staging retained at $failed"
       fi
-      MIGRATION_LOCK=""; rmdir "$external_lock" 2>/dev/null || true
+      MIGRATION_LOCK=""; rm -f "$external_lock/owner"; rmdir "$external_lock" 2>/dev/null || true
       printf 'migration=ok root=%s snapshot=%s rollback=%s\n' "$ROOT" "$snapshot" "$rollback"
       ;;
     reconcile-sources)
@@ -2936,7 +3067,7 @@ upgrade_restore_installation() {
 upgrade_release_locks() {
   local locks="$1" lock
   [ -f "$locks" ] || return 0
-  while IFS= read -r lock; do [ -n "$lock" ] && rmdir "$lock" 2>/dev/null || true; done <"$locks"
+  while IFS= read -r lock; do [ -n "$lock" ] && rm -f "$lock/owner" && rmdir "$lock" 2>/dev/null || true; done <"$locks"
 }
 
 upgrade_failpoint() {
@@ -3082,6 +3213,7 @@ cmd_upgrade_apply() {
   while IFS= read -r root; do
     parent="$(dirname "$root")"; base="$(basename "$root")"; local external_lock="$parent/.${base}.upgrade.lock"
     if ! mkdir "$external_lock" 2>/dev/null; then upgrade_abort 73 "upgrade lock held: $external_lock"; fi
+    write_lock_owner "$external_lock" "upgrade-$upgrade_id"
     printf '%s\n' "$external_lock" >>"$locks"
   done <"$roots"
   if ! source="$(upgrade_prepare_source "$target" "$work" "$target_checksum" "$detected_host")"; then upgrade_abort 69 "target release preparation failed; vaults untouched"; fi
@@ -3232,6 +3364,7 @@ main() {
       --root) ROOT="${2:-}"; [ -n "$ROOT" ] || die 64 "--root requires PATH"; ROOT_EXPLICIT=1; shift 2 ;;
       --cwd) CWD="${2:-}"; [ -n "$CWD" ] || die 64 "--cwd requires DIR"; shift 2 ;;
       --project-id) PROJECT_OVERRIDE="${2:-}"; shift 2 ;;
+      --bypass-locks) die 64 "lock bypass was removed; project locks now wait and recover stale owners safely" ;;
       --version) printf '%s\n' "$VERSION"; return 0 ;;
       --help|-h|help) usage; return 0 ;;
       *) break ;;
@@ -3252,7 +3385,12 @@ main() {
       [ -n "$source" ] || die 64 "ingest requires FILE"
       while [ $# -gt 0 ]; do case "$1" in --topic) topic="${2:-}"; shift 2 ;; --capture-only) capture_only=1; shift ;; --manual-only) manual_only=1; shift ;; --provider) provider="${2:-}"; shift 2 ;; *) die 64 "unknown ingest option" ;; esac; done
       [ "$capture_only" = 0 ] || [ "$manual_only" = 0 ] || die 64 "--capture-only and --manual-only are mutually exclusive"
-      resolve_source_identity "$CWD"; ensure_registry; local id="${PROJECT_OVERRIDE:-$(project_from_identity)}"; [ -d "$(project_dir "$id")" ] || cmd_project_ensure "$CWD" --id "$id" >/dev/null
+      resolve_source_identity "$CWD"
+      acquire_lock registry
+      ensure_registry
+      local id="${PROJECT_OVERRIDE:-$(project_from_identity)}"
+      release_lock
+      [ -d "$(project_dir "$id")" ] || cmd_project_ensure "$CWD" --id "$id" >/dev/null
       local result; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
       if [ "$manual_only" = 1 ]; then printf 'reflection=deferred reason=manual-only\n'; elif [ "$capture_only" = 0 ] && [ -n "$provider" ]; then cmd_reflect run "$id" --provider "$provider"; elif [ "$capture_only" = 0 ]; then printf 'reflection=deferred reason=provider-unconfigured\n'; fi
       ;;
