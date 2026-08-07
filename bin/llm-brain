@@ -95,6 +95,10 @@ Commands:
   association status PROJECT_ID
   feedback record PROJECT_ID --pack REF --usefulness useful|not-useful|partial [--principal ID] [--notes TEXT]
   feedback status PROJECT_ID
+  experiment status PROJECT_ID
+  experiment record PROJECT_ID NAME --status negative|blocked|enabled --reason TEXT [--evidence REF]
+  experiment prediction PROJECT_ID EPISODE_REF --expected TEXT --observed TEXT [--recalled REF]
+  experiment replay PROJECT_ID RUN_ID --mode success|failure
   eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -581,6 +585,8 @@ ensure_project_layout() {
   ensure_dir "$dir/runs/outcomes"
   ensure_dir "$dir/projections/retractions"
   ensure_dir "$dir/feedback"
+  ensure_dir "$dir/experiments/predictions"
+  ensure_dir "$dir/experiments/replays"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -1792,6 +1798,142 @@ cmd_feedback() {
       done
       ;;
     *) die 64 "feedback requires record or status" ;;
+  esac
+}
+
+experiment_flag() {
+  case "$1" in
+    prediction-error) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_PREDICTION_ERROR:-0}" ;;
+    goal-allocation) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_GOAL_ALLOCATION:-0}" ;;
+    procedure-replay) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_PROCEDURE_REPLAY:-0}" ;;
+    causal-selection) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_CAUSAL_SELECTION:-0}" ;;
+    learned-routing) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_LEARNED_ROUTING:-0}" ;;
+    latent-adapter) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_LATENT_ADAPTER:-0}" ;;
+    kv-adapter) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_KV_ADAPTER:-0}" ;;
+    multimodal-reconstruction) printf '%s\n' "${LLM_BRAIN_EXPERIMENT_MULTIMODAL_RECONSTRUCTION:-0}" ;;
+    *) return 64 ;;
+  esac
+}
+
+experiment_record() {
+  local project_id="$1" name="$2" status="" reason="" evidence_ref="" dir record_id record_file evidence_hash="none" evidence_file
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status) status="${2:-}"; shift 2 ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      --evidence) evidence_ref="${2:-}"; shift 2 ;;
+      *) die 64 "unknown experiment record option: $1" ;;
+    esac
+  done
+  validate_id "$name" || die 64 "invalid experiment name"
+  case "$status" in negative|blocked|enabled) ;; *) die 64 "experiment status must be negative, blocked, or enabled" ;; esac
+  [ -n "$reason" ] || die 64 "experiment record requires --reason TEXT"
+  validate_scalar "$reason" || die 65 "experiment reason must be a single line"
+  validate_scalar "$evidence_ref" || die 65 "experiment evidence must be a single line"
+  dir="$(require_project "$project_id")"
+  if [ -n "$evidence_ref" ]; then
+    case "$evidence_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "experiment evidence must stay inside the project" ;; esac
+    evidence_file="$dir/$evidence_ref"; [ -f "$evidence_file" ] || die 66 "experiment evidence missing: $evidence_ref"
+    evidence_hash="$(sha256_file "$evidence_file")"
+  fi
+  record_id="experiment_$(sha256_text "$project_id|$name|$status|$reason|$evidence_ref|$evidence_hash" | cut -c1-16)"
+  record_file="$dir/experiments/$record_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$record_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ExperimentGate\ntitle: %s\nbrain_project_id: %s\nbrain_experiment_id: %s\nbrain_experiment_name: %s\nbrain_experiment_status: %s\nbrain_experiment_reason: %s\nbrain_evidence_ref: %s\nbrain_evidence_hash_sha256: %s\nbrain_artifact_state: derived\nbrain_recorded_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Experiment gate $name")" "$project_id" "$record_id" "$name" "$status" "$(yaml_quote "$reason")" "$(yaml_quote "${evidence_ref:-none}")" "$evidence_hash" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' "# Experiment gate" '' "Capability: $name" '' "$reason"
+    } >"${record_file}.tmp.$$"
+    mv "${record_file}.tmp.$$" "$record_file"
+    audit_v2 "$dir" "experiment-gate" "$record_id" "" "$status" "$(sha256_file "$record_file")" "name=$name"
+  fi
+  release_lock
+  printf 'experiment=ok project_id=%s experiment_id=%s file=%s status=%s\n' "$project_id" "$record_id" "$record_file" "$status"
+}
+
+experiment_prediction() {
+  local project_id="$1" episode_ref="$2" expected="" observed="" recalled_ref="" dir episode state prediction_error prediction_id prediction_file review_id=""
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expected) expected="${2:-}"; shift 2 ;;
+      --observed) observed="${2:-}"; shift 2 ;;
+      --recalled) recalled_ref="${2:-}"; shift 2 ;;
+      *) die 64 "unknown experiment prediction option: $1" ;;
+    esac
+  done
+  [ -n "$expected" ] && [ -n "$observed" ] || die 64 "prediction requires --expected TEXT and --observed TEXT"
+  validate_scalar "$expected" || die 65 "prediction expected value must be a single line"
+  validate_scalar "$observed" || die 65 "prediction observed value must be a single line"
+  validate_scalar "$recalled_ref" || die 65 "prediction recalled reference must be a single line"
+  case "$episode_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "episode reference must stay inside the project" ;; esac
+  dir="$(require_project "$project_id")"; episode="$dir/$episode_ref"; [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
+  [ "$expected" = "$observed" ] && prediction_error=0 || prediction_error=1
+  [ "$(experiment_flag prediction-error)" = "1" ] && state=recorded || state=disabled
+  prediction_id="prediction_$(sha256_text "$project_id|$episode_ref|$expected|$observed|$recalled_ref|$state" | cut -c1-16)"
+  prediction_file="$dir/experiments/predictions/$prediction_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$prediction_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: PredictionRecord\ntitle: %s\nbrain_project_id: %s\nbrain_prediction_id: %s\nbrain_episode_ref: %s\nbrain_expected_state: %s\nbrain_observed_state: %s\nbrain_prediction_error: %s\nbrain_recalled_ref: %s\nbrain_experiment_state: %s\nbrain_artifact_state: derived\nbrain_observed_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Prediction $episode_ref")" "$project_id" "$prediction_id" "$(yaml_quote "$episode_ref")" "$(yaml_quote "$expected")" "$(yaml_quote "$observed")" "$prediction_error" "$(yaml_quote "${recalled_ref:-none}")" "$state" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Prediction record' '' "Expected: $expected" '' "Observed: $observed" '' "Prediction error: $prediction_error" '' "Experiment state: $state"
+    } >"${prediction_file}.tmp.$$"
+    mv "${prediction_file}.tmp.$$" "$prediction_file"
+    audit_v2 "$dir" "prediction-record" "$prediction_id" "" "$state" "$(sha256_file "$prediction_file")" "error=$prediction_error"
+  fi
+  release_lock
+  if [ "$state" = recorded ] && [ "$prediction_error" = 1 ] && [ -n "$recalled_ref" ]; then
+    case "$recalled_ref" in okf/*.md) ;; *) die 65 "prediction recalled reference must target okf/*.md" ;; esac
+    review_id="$(create_reconsolidation_review "$project_id" "$episode_ref" "$recalled_ref" "prediction:$prediction_id")"
+  fi
+  printf 'prediction=ok project_id=%s prediction_id=%s state=%s error=%s%s\n' "$project_id" "$prediction_id" "$state" "$prediction_error" "${review_id:+ review_id=$review_id}"
+}
+
+experiment_replay() {
+  local project_id="$1" run_id="$2" mode="" dir run_file outcome_ref replay_id replay_file state
+  shift 2 || true
+  [ "${1:-}" = "--mode" ] && mode="${2:-}"
+  case "$mode" in success|failure) ;; *) die 64 "experiment replay requires --mode success or failure" ;; esac
+  validate_id "$run_id" || die 64 "invalid run id"
+  dir="$(require_project "$project_id")"; run_file="$dir/runs/$run_id.md"; [ -f "$run_file" ] || die 66 "run missing: $run_id"
+  outcome_ref="$(frontmatter_field "$run_file" brain_last_outcome_ref)"; [ -n "$outcome_ref" ] && [ "$outcome_ref" != none ] || die 66 "run has no outcome to replay"
+  [ "$(experiment_flag procedure-replay)" = "1" ] && state=recorded || state=disabled
+  replay_id="replay_$(sha256_text "$project_id|$run_id|$outcome_ref|$mode|$state" | cut -c1-16)"
+  replay_file="$dir/experiments/replays/$replay_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$replay_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ProcedureReplay\ntitle: %s\nbrain_project_id: %s\nbrain_replay_id: %s\nbrain_run_ref: %s\nbrain_outcome_ref: %s\nbrain_replay_mode: %s\nbrain_experiment_state: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Replay $run_id $mode")" "$project_id" "$(yaml_quote "$replay_id")" "$(yaml_quote "runs/$run_id.md")" "$(yaml_quote "$outcome_ref")" "$mode" "$state" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Procedure replay' '' "Mode: $mode" '' "This is a derived replay plan. No procedure was executed. Experiment state: $state."
+    } >"${replay_file}.tmp.$$"
+    mv "${replay_file}.tmp.$$" "$replay_file"
+    audit_v2 "$dir" "procedure-replay" "$replay_id" "" "$state" "$(sha256_file "$replay_file")" "mode=$mode"
+  fi
+  release_lock
+  printf 'replay=ok project_id=%s replay_id=%s state=%s file=%s\n' "$project_id" "$replay_id" "$state" "$replay_file"
+}
+
+cmd_experiment() {
+  local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "experiment requires PROJECT_ID"; shift 2 || true
+  case "$action" in
+    status)
+      printf 'capability\tflag\tstate\tevidence_gate\n'
+      for capability in prediction-error goal-allocation procedure-replay causal-selection learned-routing latent-adapter kv-adapter multimodal-reconstruction; do
+        flag="LLM_BRAIN_EXPERIMENT_$(printf '%s' "$capability" | tr '[:lower:]-' '[:upper:]_')"
+        case "$capability" in multimodal-reconstruction) flag=LLM_BRAIN_EXPERIMENT_MULTIMODAL_RECONSTRUCTION ;; esac
+        if [ "$(experiment_flag "$capability")" = 1 ]; then state=enabled; else state=disabled; fi
+        case "$capability" in prediction-error|procedure-replay) gate=local-record-only ;; *) gate=negative-no-evidence ;; esac
+        printf '%s\t%s\t%s\t%s\n' "$capability" "$flag" "$state" "$gate"
+      done
+      ;;
+    record) [ -n "${1:-}" ] || die 64 "experiment record requires NAME"; experiment_record "$project_id" "$1" "${@:2}" ;;
+    prediction) [ -n "${1:-}" ] || die 64 "experiment prediction requires EPISODE_REF"; experiment_prediction "$project_id" "$1" "${@:2}" ;;
+    replay) [ -n "${1:-}" ] || die 64 "experiment replay requires RUN_ID"; experiment_replay "$project_id" "$1" "${@:2}" ;;
+    *) die 64 "experiment requires status, record, prediction, or replay" ;;
   esac
 }
 
@@ -4410,6 +4552,7 @@ main() {
     projection) cmd_projection "$@" ;;
     association) cmd_association "$@" ;;
     feedback) cmd_feedback "$@" ;;
+    experiment) cmd_experiment "$@" ;;
     eval) cmd_eval "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
