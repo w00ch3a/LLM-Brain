@@ -83,13 +83,18 @@ Commands:
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
-  run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--obligation TEXT]
+  run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--principal ID] [--obligation TEXT]
   run outcome PROJECT_ID RUN_ID --status success|failed|partial --summary TEXT [--evidence REF] [--verified-by ACTOR]
   run status PROJECT_ID
   reconcile scan PROJECT_ID [--episode EPISODE_REF] [--source-span TEXT]
   projection build PROJECT_ID EVIDENCE_REF [--resolution summary|detail] [--span START:END]
   projection retract PROJECT_ID PROJECTION_ID --reason TEXT
   projection status PROJECT_ID
+  association build PROJECT_ID REF_A REF_B [--reason TEXT]
+  association retract PROJECT_ID ASSOCIATION_ID --reason TEXT
+  association status PROJECT_ID
+  feedback record PROJECT_ID --pack REF --usefulness useful|not-useful|partial [--principal ID] [--notes TEXT]
+  feedback status PROJECT_ID
   eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -575,6 +580,7 @@ ensure_project_layout() {
   ensure_dir "$dir/evaluations"
   ensure_dir "$dir/runs/outcomes"
   ensure_dir "$dir/projections/retractions"
+  ensure_dir "$dir/feedback"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -916,7 +922,7 @@ candidate_valid() {
   case "$sensitivity" in public|internal|restricted) ;; *) return 65 ;; esac
   awk -v value="$confidence" 'BEGIN { exit !(value ~ /^[01](\.[0-9]+)?$/ && value + 0 >= 0 && value + 0 <= 1) }' || return 65
   [ -n "$provenance" ] && [ -n "$provider" ] && [ -n "$provider_version" ] || return 65
-  for field in brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at; do
+  for field in brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_principal brain_audience; do
     value="$(frontmatter_field "$file" "$field")"
     [ -z "$value" ] || brain_datetime_valid "$value" || return 65
   done
@@ -1009,7 +1015,7 @@ create_conflict_review() {
 }
 
 promote_review_locked() {
-  local project_id="$1" review_id="$2" actor="${3:-$ACTOR}" reason="${4:-automatic-policy}" dir review kind state title confidence sensitivity body dest hash old authority_origin authority_origin_line=""
+  local project_id="$1" review_id="$2" actor="${3:-$ACTOR}" reason="${4:-automatic-policy}" dir review kind state title confidence sensitivity body dest hash old authority_origin authority_origin_line="" principal_line="" audience_line=""
   dir="$(require_project "$project_id")"
   review="$dir/review/$review_id.md"
   [ -f "$review" ] || { say_error "missing review item: $review_id"; return 66; }
@@ -1039,6 +1045,8 @@ promote_review_locked() {
   sensitivity="$(frontmatter_field "$review" brain_sensitivity sensitivity)"
   authority_origin="$(frontmatter_field "$review" brain_authority_origin)"
   [ -z "$authority_origin" ] || authority_origin_line="brain_authority_origin: $(yaml_quote "$authority_origin")"
+  [ -z "$(frontmatter_field "$review" brain_principal)" ] || principal_line="brain_principal: $(yaml_quote "$(frontmatter_field "$review" brain_principal)")"
+  [ -z "$(frontmatter_field "$review" brain_audience)" ] || audience_line="brain_audience: $(yaml_quote "$(frontmatter_field "$review" brain_audience)")"
   body="$(review_body_for_canonical "$review")"
   local generated_by generated_at verified_line=""
   generated_by="$(frontmatter_field "$review" brain_provider_id)"
@@ -1063,6 +1071,8 @@ brain_sensitivity: $sensitivity
 brain_loading_temperature: $(frontmatter_field "$review" brain_loading_temperature)
 brain_source_authority: $(frontmatter_field "$review" brain_source_authority)
 $authority_origin_line
+$principal_line
+$audience_line
 brain_provenance: $(yaml_quote "review://$review_id")
 brain_provider_id: $(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")
 brain_provider_version: $(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")
@@ -1421,7 +1431,7 @@ cmd_work() {
 }
 
 run_start() {
-  local project_id="$1" procedure_ref="$2" task="" request_id="" branch="main" obligations="" dir run_id run_file
+  local project_id="$1" procedure_ref="$2" task="" request_id="" branch="main" obligations="" principal="" dir run_id run_file
   shift 2 || true
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1429,6 +1439,7 @@ run_start() {
       --request-id) request_id="${2:-}"; shift 2 ;;
       --branch) branch="${2:-}"; shift 2 ;;
       --obligation) obligations="${obligations}${obligations:+,}${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
       *) die 64 "unknown run start option: $1" ;;
     esac
   done
@@ -1436,6 +1447,7 @@ run_start() {
   validate_scalar "$task" || die 65 "run task must be a single line"
   validate_scalar "$branch" || die 65 "run branch must be a single line"
   validate_scalar "$obligations" || die 65 "run obligation must be a single line"
+  validate_scalar "$principal" || die 65 "run principal must be a single line"
   [ -z "$request_id" ] || validate_id "$request_id" || die 64 "invalid run request id"
   dir="$(require_project "$project_id")"
   if [ -n "$request_id" ]; then
@@ -1449,7 +1461,7 @@ run_start() {
     {
       printf '%s\n' '---'
       printf 'type: ProcedureRun\ntitle: %s\nbrain_project_id: %s\nbrain_run_id: %s\n' "$(yaml_quote "Run $procedure_ref")" "$project_id" "$run_id"
-      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")"
+      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\nbrain_principal: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")" "$(yaml_quote "${principal:-none}")"
       printf 'brain_run_state: active\nbrain_verification_state: unverified\nbrain_artifact_state: noncanonical\nbrain_started_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
       printf '%s\n' '---'
       printf '# Procedure run\n\nProcedure: `%s`  \nBranch: `%s`  \nTask: %s\n\nThis is append-only working state, not canonical OKF memory.\n' "$procedure_ref" "$branch" "${task:-none}"
@@ -1679,6 +1691,107 @@ cmd_projection() {
       done
       ;;
     *) die 64 "projection requires build, retract, or status" ;;
+  esac
+}
+
+association_build() {
+  local project_id="$1" ref_a="$2" ref_b="$3" reason="" dir file_a file_b hash_a hash_b association_id association_file
+  shift 3 || true
+  [ "${1:-}" = "--reason" ] && reason="${2:-}"
+  validate_scalar "$ref_a" || die 65 "association reference must be a single line"
+  validate_scalar "$ref_b" || die 65 "association reference must be a single line"
+  validate_scalar "$reason" || die 65 "association reason must be a single line"
+  [ "$ref_a" != "$ref_b" ] || die 65 "association references must differ"
+  case "$ref_a" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "association references must stay inside the project" ;; esac
+  case "$ref_b" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "association references must stay inside the project" ;; esac
+  dir="$(require_project "$project_id")"; file_a="$dir/$ref_a"; file_b="$dir/$ref_b"
+  [ -f "$file_a" ] || die 66 "association reference missing: $ref_a"
+  [ -f "$file_b" ] || die 66 "association reference missing: $ref_b"
+  hash_a="$(sha256_file "$file_a")"; hash_b="$(sha256_file "$file_b")"
+  association_id="association_$(sha256_text "$project_id|$ref_a|$hash_a|$ref_b|$hash_b" | cut -c1-16)"
+  association_file="$dir/projections/$association_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$association_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: AssociativeProjection\ntitle: %s\nbrain_project_id: %s\nbrain_association_id: %s\nbrain_association_relation: associates\nbrain_association_a: %s\nbrain_association_a_hash_sha256: %s\nbrain_association_b: %s\nbrain_association_b_hash_sha256: %s\nbrain_association_reason: %s\nbrain_projection_state: active\nbrain_reversible: true\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Association $ref_a $ref_b")" "$project_id" "$association_id" "$(yaml_quote "$ref_a")" "$hash_a" "$(yaml_quote "$ref_b")" "$hash_b" "$(yaml_quote "${reason:-derived-co-occurrence}")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Associative projection\n\nThis derived relation connects `%s` and `%s` without changing either source.\n\nReason: %s\n' "$ref_a" "$ref_b" "${reason:-derived-co-occurrence}"
+    } >"${association_file}.tmp.$$"
+    mv "${association_file}.tmp.$$" "$association_file"
+    audit_v2 "$dir" "association-build" "$association_id" "" "active" "$(sha256_file "$association_file")" "relation=associates"
+  fi
+  release_lock
+  printf 'association=ok project_id=%s association_id=%s file=%s\n' "$project_id" "$association_id" "$association_file"
+}
+
+cmd_association() {
+  local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "association requires PROJECT_ID"; shift 2 || true
+  case "$action" in
+    build) [ -n "${1:-}" ] && [ -n "${2:-}" ] || die 64 "association build requires REF_A REF_B"; association_build "$project_id" "$1" "$2" "${@:3}" ;;
+    retract) [ -n "${1:-}" ] || die 64 "association retract requires ASSOCIATION_ID"; projection_retract "$project_id" "$1" "${@:2}" ;;
+    status)
+      local dir association_file
+      dir="$(require_project "$project_id")"
+      printf 'association_id\tstate\ta\tb\tpath\n'
+      find "$dir/projections" -maxdepth 1 -type f -name 'association_*.md' 2>/dev/null | sort | while IFS= read -r association_file; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$association_file" brain_association_id)" "$(frontmatter_field "$association_file" brain_projection_state)" "$(frontmatter_field "$association_file" brain_association_a)" "$(frontmatter_field "$association_file" brain_association_b)" "${association_file#"$dir"/}"
+      done
+      ;;
+    *) die 64 "association requires build, retract, or status" ;;
+  esac
+}
+
+feedback_record() {
+  local project_id="$1" pack_ref="" usefulness="" principal="" notes="" dir pack pack_hash feedback_id feedback_file
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pack) pack_ref="${2:-}"; shift 2 ;;
+      --usefulness) usefulness="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --notes) notes="${2:-}"; shift 2 ;;
+      *) die 64 "unknown feedback record option: $1" ;;
+    esac
+  done
+  [ -n "$pack_ref" ] || die 64 "feedback record requires --pack REF"
+  case "$usefulness" in useful|not-useful|partial) ;; *) die 64 "feedback usefulness must be useful, not-useful, or partial" ;; esac
+  validate_scalar "$pack_ref" || die 65 "feedback pack reference must be a single line"
+  validate_scalar "$principal" || die 65 "feedback principal must be a single line"
+  validate_scalar "$notes" || die 65 "feedback notes must be a single line"
+  case "$pack_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "feedback pack reference must stay inside the project" ;; esac
+  dir="$(require_project "$project_id")"; pack="$dir/$pack_ref"; [ -f "$pack" ] || die 66 "pack missing: $pack_ref"
+  pack_hash="$(sha256_file "$pack")"
+  feedback_id="feedback_$(sha256_text "$project_id|$pack_ref|$pack_hash|$usefulness|$principal|$notes" | cut -c1-16)"
+  feedback_file="$dir/feedback/$feedback_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$feedback_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: RetrievalFeedback\ntitle: %s\nbrain_project_id: %s\nbrain_feedback_id: %s\nbrain_pack_ref: %s\nbrain_pack_hash_sha256: %s\nbrain_usefulness: %s\nbrain_principal: %s\nbrain_notes: %s\nbrain_artifact_state: derived\nbrain_recorded_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Feedback $pack_ref")" "$project_id" "$feedback_id" "$(yaml_quote "$pack_ref")" "$pack_hash" "$usefulness" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${notes:-none}")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Retrieval feedback\n\nPack: `%s`  \nPack hash: `%s`  \nUsefulness: `%s`  \nPrincipal: `%s`\n\n%s\n' "$pack_ref" "$pack_hash" "$usefulness" "${principal:-none}" "${notes:-No notes recorded.}"
+    } >"${feedback_file}.tmp.$$"
+    mv "${feedback_file}.tmp.$$" "$feedback_file"
+    audit_v2 "$dir" "retrieval-feedback" "$feedback_id" "" "$usefulness" "$(sha256_file "$feedback_file")" "pack=$(slug "$pack_ref")"
+  fi
+  release_lock
+  printf 'feedback=ok project_id=%s feedback_id=%s file=%s usefulness=%s\n' "$project_id" "$feedback_id" "$feedback_file" "$usefulness"
+}
+
+cmd_feedback() {
+  local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "feedback requires PROJECT_ID"; shift 2 || true
+  case "$action" in
+    record) feedback_record "$project_id" "$@" ;;
+    status)
+      local dir feedback_file
+      dir="$(require_project "$project_id")"
+      printf 'feedback_id\tusefulness\tprincipal\tpack\tpath\n'
+      find "$dir/feedback" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r feedback_file; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$feedback_file" brain_feedback_id)" "$(frontmatter_field "$feedback_file" brain_usefulness)" "$(frontmatter_field "$feedback_file" brain_principal)" "$(frontmatter_field "$feedback_file" brain_pack_ref)" "${feedback_file#"$dir"/}"
+      done
+      ;;
+    *) die 64 "feedback requires record or status" ;;
   esac
 }
 
@@ -4295,6 +4408,8 @@ main() {
     run) cmd_run "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     projection) cmd_projection "$@" ;;
+    association) cmd_association "$@" ;;
+    feedback) cmd_feedback "$@" ;;
     eval) cmd_eval "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
