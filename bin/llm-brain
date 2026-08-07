@@ -86,6 +86,10 @@ Commands:
   run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--obligation TEXT]
   run outcome PROJECT_ID RUN_ID --status success|failed|partial --summary TEXT [--evidence REF] [--verified-by ACTOR]
   run status PROJECT_ID
+  reconcile scan PROJECT_ID [--episode EPISODE_REF] [--source-span TEXT]
+  projection build PROJECT_ID EVIDENCE_REF [--resolution summary|detail] [--span START:END]
+  projection retract PROJECT_ID PROJECTION_ID --reason TEXT
+  projection status PROJECT_ID
   eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -570,6 +574,7 @@ ensure_project_layout() {
   ensure_dir "$dir/requests/.staging"
   ensure_dir "$dir/evaluations"
   ensure_dir "$dir/runs/outcomes"
+  ensure_dir "$dir/projections/retractions"
   ensure_dir "$dir/quarantine"
   ensure_dir "$dir/migrations"
   [ -f "$dir/audit.v2.tsv" ] || printf 'timestamp\tactor\taction\tproject_id\tobject_id\told_state\tnew_state\tcontent_hash\tdetails\tprev_hash\tevent_hash\n' >"$dir/audit.v2.tsv"
@@ -1376,6 +1381,9 @@ work_run_once() {
     audit_v2 "$dir" "reflection-complete" "$(frontmatter_field "$episode" brain_episode_id)" "captured" "reflected" "$(sha256_file "$episode")" "provider=$(slug "$(basename "$provider")")"
     audit_v2 "$dir" "work-commit" "$request_id" "running" "committed" "$(sha256_file "$request_file")" "candidates=$candidate_count"
     release_lock
+    if [ "${LLM_BRAIN_RECONCILIATION:-1}" != "0" ]; then
+      reconcile_scan "$project_id" --episode "$episode_ref" >/dev/null 2>&1 || true
+    fi
     printf 'work=committed project_id=%s request_id=%s candidates=%s\n' "$project_id" "$request_id" "$candidate_count"
   else
     local provider_status=$?
@@ -1527,6 +1535,153 @@ cmd_run() {
   esac
 }
 
+create_reconsolidation_review() {
+  local project_id="$1" episode_ref="$2" target_rel="$3" source_span="$4" dir episode target review_id review_file target_hash episode_hash
+  dir="$(require_project "$project_id")"
+  episode="$dir/$episode_ref"; target="$dir/$target_rel"
+  [ -f "$episode" ] || return 66
+  [ -f "$target" ] || return 66
+  review_id="reconsolidation_$(sha256_text "$project_id|$episode_ref|$target_rel|$source_span" | cut -c1-16)"
+  review_file="$dir/review/$review_id.md"
+  target_hash="$(sha256_file "$target")"; episode_hash="$(sha256_file "$episode")"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$review_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ReviewItem\ntitle: %s\nbrain_project_id: %s\nbrain_candidate_id: %s\n' "$(yaml_quote "Reconsolidate $target_rel")" "$project_id" "$review_id"
+      printf 'brain_review_kind: reconsolidation\nbrain_review_state: needs-validation\nbrain_confidence: 0.0\nbrain_risk: high\nbrain_sensitivity: internal\nbrain_loading_temperature: warm\nbrain_source_authority: source\nbrain_provenance: %s\n' "$(yaml_quote "episode://$(frontmatter_field "$episode" brain_episode_id)")"
+      printf 'brain_recalled_ref: %s\nbrain_recalled_hash_sha256: %s\nbrain_new_evidence_ref: %s\nbrain_new_evidence_hash_sha256: %s\nbrain_prediction_error: explicit-contradiction\nbrain_source_span: %s\nbrain_version_of: %s\nbrain_projection_state: proposed\nbrain_artifact_state: review\nbrain_schema_version: %s\nbrain_created_at: %s\n' "$(yaml_quote "$target_rel")" "$target_hash" "$(yaml_quote "$episode_ref")" "$episode_hash" "$(yaml_quote "$source_span")" "$(yaml_quote "$target_rel")" "$SCHEMA_VERSION" "$(yaml_quote "$(now_utc)")"
+      printf '%s\n' '---'
+      printf '# Reconsolidation review\n\nNew evidence explicitly contradicts recalled memory. No canonical file was rewritten.\n\n- Recalled: `%s` (`%s`)\n- New evidence: `%s` (`%s`)\n- Source span: `%s`\n- Proposed action: validate, supersede or retract through review.\n' "$target_rel" "$target_hash" "$episode_ref" "$episode_hash" "$source_span"
+    } >"${review_file}.tmp.$$"
+    mv "${review_file}.tmp.$$" "$review_file"
+    audit_v2 "$dir" "reconsolidation-review" "$review_id" "" "needs-validation" "$(sha256_file "$review_file")" "target=$(slug "$target_rel")"
+  fi
+  release_lock
+  printf '%s\n' "$review_id"
+}
+
+reconcile_scan() {
+  local project_id="$1" episode_ref="" source_span="marker:CONTRADICTS" dir episode source targets target target_rel episodes count=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --episode) episode_ref="${2:-}"; shift 2 ;;
+      --source-span) source_span="${2:-}"; shift 2 ;;
+      *) die 64 "unknown reconcile option: $1" ;;
+    esac
+  done
+  validate_scalar "$source_span" || die 65 "source span must be a single line"
+  dir="$(require_project "$project_id")"
+  if [ -n "$episode_ref" ]; then
+    case "$episode_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "episode reference must stay inside the project" ;; esac
+    episode="$dir/$episode_ref"; [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
+    episodes="$episode"
+  else
+    episodes="$(find "$dir/episodes" -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)"
+  fi
+  while IFS= read -r episode; do
+    [ -f "$episode" ] || continue
+    episode_ref="${episode#"$dir"/}"
+    source_ref="$(frontmatter_field "$episode" brain_source_ref)"; source="$dir/$source_ref"
+    targets="$(grep -Eio '((contradicts|reconsolidates)[[:space:]]*:[[:space:]]*)okf/[A-Za-z0-9._/-]+' "$episode" "$source" 2>/dev/null | sed -E 's#.*(okf/[A-Za-z0-9._/-]+).*#\1#' | sed 's/:$//' | sort -u || true)"
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      target_rel="$target"; case "$target_rel" in *.md) ;; *) target_rel="${target_rel}.md" ;; esac
+      case "$target_rel" in okf/*.md) ;; *) continue ;; esac
+      [ -f "$dir/$target_rel" ] || continue
+      create_reconsolidation_review "$project_id" "$episode_ref" "$target_rel" "$source_span" >/dev/null
+      count=$((count + 1))
+    done <<<"$targets"
+  done <<<"$episodes"
+  printf 'reconcile=ok project_id=%s reviews=%s\n' "$project_id" "$count"
+}
+
+projection_build() {
+  local project_id="$1" evidence_ref="$2" resolution="summary" span="" dir source projection_id projection_file source_hash excerpt start_line end_line
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --resolution) resolution="${2:-}"; shift 2 ;;
+      --span) span="${2:-}"; shift 2 ;;
+      *) die 64 "unknown projection build option: $1" ;;
+    esac
+  done
+  case "$resolution" in summary|detail) ;; *) die 64 "projection resolution must be summary or detail" ;; esac
+  validate_scalar "$evidence_ref" || die 65 "evidence reference must be a single line"
+  validate_scalar "$span" || die 65 "projection span must be a single line"
+  case "$evidence_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "evidence reference must stay inside the project" ;; esac
+  dir="$(require_project "$project_id")"; source="$dir/$evidence_ref"; [ -f "$source" ] || die 66 "evidence reference missing: $evidence_ref"
+  if [ -n "$span" ]; then
+    case "$span" in *:*) start_line="${span%%:*}"; end_line="${span#*:}" ;; *) die 65 "projection span must be START:END" ;; esac
+    case "$start_line:$end_line" in *[!0-9:]*|:*) die 65 "projection span must be START:END" ;; esac
+    [ "$start_line" -gt 0 ] && [ "$end_line" -ge "$start_line" ] || die 65 "invalid projection span"
+  fi
+  source_hash="$(sha256_file "$source")"
+  projection_id="projection_$(sha256_text "$project_id|$evidence_ref|$source_hash|$resolution|$span" | cut -c1-16)"
+  projection_file="$dir/projections/$projection_id.md"
+  if [ -n "$span" ]; then excerpt="$(sed -n "${start_line},${end_line}p" "$source")"; elif [ "$resolution" = summary ]; then excerpt="$(body_after_frontmatter "$source" | head -c 600)"; else excerpt="$(body_after_frontmatter "$source" | head -c "$MAX_SOURCE_BYTES")"; fi
+  acquire_lock "project-$project_id"
+  if [ ! -f "$projection_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: EvidenceProjection\ntitle: %s\nbrain_project_id: %s\nbrain_projection_id: %s\nbrain_source_ref: %s\nbrain_source_hash_sha256: %s\nbrain_projection_resolution: %s\nbrain_projection_span: %s\nbrain_projection_state: active\nbrain_reversible: true\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(basename "$source" .md) $resolution projection")" "$project_id" "$projection_id" "$(yaml_quote "$evidence_ref")" "$source_hash" "$resolution" "$(yaml_quote "${span:-none}")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---'
+      printf '# Evidence projection\n\nSource: `%s`  \nSource hash: `%s`  \nResolution: `%s`\n\n%s\n' "$evidence_ref" "$source_hash" "$resolution" "$excerpt"
+    } >"${projection_file}.tmp.$$"
+    mv "${projection_file}.tmp.$$" "$projection_file"
+    audit_v2 "$dir" "projection-build" "$projection_id" "" "active" "$(sha256_file "$projection_file")" "resolution=$resolution"
+  fi
+  release_lock
+  printf 'projection=ok project_id=%s projection_id=%s file=%s resolution=%s\n' "$project_id" "$projection_id" "$projection_file" "$resolution"
+}
+
+projection_retract() {
+  local project_id="$1" projection_id="$2" reason="" dir projection_file retraction_file
+  shift 2 || true
+  [ "${1:-}" = "--reason" ] && reason="${2:-}"
+  [ -n "$reason" ] || die 64 "projection retract requires --reason TEXT"
+  validate_id "$projection_id" || die 64 "invalid projection id"
+  validate_scalar "$reason" || die 65 "projection reason must be a single line"
+  dir="$(require_project "$project_id")"; projection_file="$dir/projections/$projection_id.md"; [ -f "$projection_file" ] || die 66 "projection missing: $projection_id"
+  retraction_file="$dir/projections/retractions/$projection_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$retraction_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ProjectionRetraction\nstatus: stable\nbrain_project_id: %s\nbrain_retracts: %s\nbrain_review_state: superseded\nbrain_reason: %s\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$project_id" "$projection_id" "$(yaml_quote "$reason")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' "# Projection retraction" '' "$reason"
+    } >"${retraction_file}.tmp.$$"
+    mv "${retraction_file}.tmp.$$" "$retraction_file"
+    set_frontmatter_field "$projection_file" brain_projection_state retracted
+    audit_v2 "$dir" "projection-retract" "$projection_id" "active" "retracted" "$(sha256_file "$retraction_file")" "reason=$(slug "$reason")"
+  fi
+  release_lock
+  printf 'projection=retracted project_id=%s projection_id=%s\n' "$project_id" "$projection_id"
+}
+
+cmd_reconcile() {
+  local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "reconcile requires PROJECT_ID"; shift 2 || true
+  case "$action" in scan) reconcile_scan "$project_id" "$@" ;; *) die 64 "reconcile requires scan" ;; esac
+}
+
+cmd_projection() {
+  local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "projection requires PROJECT_ID"; shift 2 || true
+  case "$action" in
+    build) [ -n "${1:-}" ] || die 64 "projection build requires EVIDENCE_REF"; projection_build "$project_id" "$1" "${@:2}" ;;
+    retract) [ -n "${1:-}" ] || die 64 "projection retract requires PROJECTION_ID"; projection_retract "$project_id" "$1" "${@:2}" ;;
+    status)
+      local dir projection_file
+      dir="$(require_project "$project_id")"
+      printf 'projection_id\tstate\tresolution\tsource\tpath\n'
+      find "$dir/projections" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r projection_file; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$projection_file" brain_projection_id)" "$(frontmatter_field "$projection_file" brain_projection_state)" "$(frontmatter_field "$projection_file" brain_projection_resolution)" "$(frontmatter_field "$projection_file" brain_source_ref brain_source_path)" "${projection_file#"$dir"/}"
+      done
+      ;;
+    *) die 64 "projection requires build, retract, or status" ;;
+  esac
+}
+
 cmd_reflect() {
   local action="$1"; shift || true
   case "$action" in
@@ -1615,7 +1770,7 @@ cmd_review() {
       dir="$(require_project "$project_id")"; cat "$dir/review/$id.md" 2>/dev/null || die 66 "review missing: $id"
       ;;
     decide)
-      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason=""
+      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind
       shift 3 || true
       while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
@@ -1623,8 +1778,21 @@ cmd_review() {
       local dir file old
       dir="$(require_project "$project_id")"; file="$dir/review/$id.md"; [ -f "$file" ] || die 66 "review missing: $id"
       old="$(frontmatter_field "$file" brain_review_state review_state)"
+      kind="$(frontmatter_field "$file" brain_review_kind)"
       acquire_lock "project-$project_id"
       if [ "$state" = "approved" ]; then
+        case "$kind" in
+          reconsolidation|conflict)
+            set_frontmatter_field "$file" brain_review_state approved
+            set_frontmatter_field "$file" brain_reviewed_by "$actor"
+            set_frontmatter_field "$file" brain_review_reason "$reason"
+            set_frontmatter_field "$file" brain_reviewed_at "$(now_utc)"
+            audit_v2 "$dir" "review-decide" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
+            release_lock
+            printf 'review=decided review_id=%s state=approved action=noncanonical-record\n' "$id"
+            return 0
+            ;;
+        esac
         local promotion_status=0
         if promote_review_locked "$project_id" "$id" "$actor" "$reason"; then :; else promotion_status=$?; fi
         release_lock
@@ -4079,7 +4247,7 @@ main() {
     project) [ "${1:-}" = "ensure" ] || die 64 "project requires ensure"; shift; cmd_project_ensure "$@" ;;
     topic) [ "${1:-}" = "add" ] || die 64 "topic requires add"; shift; cmd_topic_add "$@" ;;
     ingest-source)
-      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result legacy_episode_ref; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; legacy_episode_ref="$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"; reflection_schedule_record "$project_id" "${legacy_episode_ref#"$(project_dir "$project_id")/"}" deferred capture-only >/dev/null; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$legacy_episode_ref" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
+      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result legacy_episode_ref; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; legacy_episode_ref="$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"; reflection_schedule_record "$project_id" "${legacy_episode_ref#"$(project_dir "$project_id")/"}" deferred capture-only >/dev/null; [ "${LLM_BRAIN_RECONCILIATION:-1}" = "0" ] || reconcile_scan "$project_id" --episode "${legacy_episode_ref#"$(project_dir "$project_id")/"}" >/dev/null 2>&1 || true; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$legacy_episode_ref" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
       ;;
     ingest)
       local source="${1:-}" topic="" capture_only=0 manual_only=0 provider="$REFLECTOR"; shift || true
@@ -4118,10 +4286,15 @@ main() {
         reflection_schedule_record "$id" "$episode_ref" deferred capture-only >/dev/null
         printf 'reflection=deferred reason=capture-only\n'
       fi
+      if [ "${LLM_BRAIN_RECONCILIATION:-1}" != "0" ]; then
+        reconcile_scan "$id" --episode "$episode_ref" >/dev/null 2>&1 || true
+      fi
       ;;
     reflect) cmd_reflect "$@" ;;
     work) cmd_work "$@" ;;
     run) cmd_run "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
+    projection) cmd_projection "$@" ;;
     eval) cmd_eval "$@" ;;
     review) cmd_review "$@" ;;
     validate-source) cmd_validate_source "$@" ;;
