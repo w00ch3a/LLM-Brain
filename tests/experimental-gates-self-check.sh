@@ -30,6 +30,18 @@ disabled="$($cli --root "$vault" experiment prediction "$project_id" "$episode_r
 grep -Fq 'state=disabled error=1' <<<"$disabled"
 [ "$(find "$project_dir/review" -maxdepth 1 -type f -name 'reconsolidation_*.md' | wc -l | tr -d ' ')" = 0 ]
 
+cat >"$fixture/shadow-evidence.md" <<'SHADOW'
+PREDICTION_EXPECTED: old
+PREDICTION_OBSERVED: changed
+PREDICTION_RECALLED: okf/claims/recalled-rule.md
+SHADOW
+LLM_BRAIN_EXPERIMENT_PREDICTION_ERROR=shadow "$cli" --root "$vault" ingest-source "$project_id" "$fixture/shadow-evidence.md" >/dev/null
+grep -Fq 'brain_experiment_state: shadow' "$project_dir"/experiments/predictions/*.md
+[ "$(find "$project_dir/review" -maxdepth 1 -type f -name 'reconsolidation_*.md' | wc -l | tr -d ' ')" = 0 ]
+prediction_count="$(find "$project_dir/experiments/predictions" -type f -name '*.md' | wc -l | tr -d ' ')"
+LLM_BRAIN_EXPERIMENT_PREDICTION_ERROR=shadow "$cli" --root "$vault" ingest-source "$project_id" "$fixture/shadow-evidence.md" >/dev/null
+[ "$(find "$project_dir/experiments/predictions" -type f -name '*.md' | wc -l | tr -d ' ')" = "$prediction_count" ]
+
 enabled="$(LLM_BRAIN_EXPERIMENT_PREDICTION_ERROR=1 "$cli" --root "$vault" experiment prediction "$project_id" "$episode_ref" --expected old --observed new --recalled okf/claims/recalled-rule.md)"
 grep -Fq 'state=recorded error=1' <<<"$enabled"
 [ "$(find "$project_dir/review" -maxdepth 1 -type f -name 'reconsolidation_*.md' | wc -l | tr -d ' ')" = 1 ]
@@ -39,8 +51,20 @@ run_id="$(printf '%s\n' "$run" | sed -n 's/.*run_id=\([^ ]*\).*/\1/p')"
 "$cli" --root "$vault" run outcome "$project_id" "$run_id" --status failed --summary 'fixture failure' >/dev/null
 replay="$($cli --root "$vault" experiment replay "$project_id" "$run_id" --mode failure)"
 grep -Fq 'state=disabled' <<<"$replay"
+
+successful_run="$($cli --root "$vault" run start "$project_id" okf/claims/recalled-rule.md --request-id replay-success-request)"
+successful_run_id="$(printf '%s\n' "$successful_run" | sed -n 's/.*run_id=\([^ ]*\).*/\1/p')"
+"$cli" --root "$vault" run outcome "$project_id" "$successful_run_id" --status success --summary 'fixture success' >/dev/null
 replay_enabled="$(LLM_BRAIN_EXPERIMENT_PROCEDURE_REPLAY=1 "$cli" --root "$vault" experiment replay "$project_id" "$run_id" --mode failure)"
-grep -Fq 'state=recorded' <<<"$replay_enabled"
+grep -Fq 'state=recorded recommendation=compare-successful-run-differences comparisons=1' <<<"$replay_enabled"
+replay_file="$(printf '%s\n' "$replay_enabled" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq 'brain_success_count: 1' "$replay_file"
+grep -Fq 'brain_failed_count: 1' "$replay_file"
+[ "$(find "$project_dir/review" -maxdepth 1 -type f -name 'procedure_replay_*.md' | wc -l | tr -d ' ')" = 1 ]
+replay_review_id="$(printf '%s\n' "$replay_enabled" | sed -n 's/.*review_id=\([^ ]*\).*/\1/p')"
+canonical_before="$(shasum -a 256 "$project_dir/okf/claims/recalled-rule.md" | awk '{print $1}')"
+"$cli" --root "$vault" review decide "$project_id" "$replay_review_id" approved --actor human:test --reason 'fixture review' >/dev/null
+[ "$(shasum -a 256 "$project_dir/okf/claims/recalled-rule.md" | awk '{print $1}')" = "$canonical_before" ]
 
 gate="$($cli --root "$vault" experiment record "$project_id" causal-selection --status negative --reason 'No causal evidence gate passed' --evidence "$episode_ref")"
 gate_file="$(printf '%s\n' "$gate" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"

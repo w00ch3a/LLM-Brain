@@ -77,7 +77,7 @@ Commands:
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT
   index build|status PROJECT_ID [--embedder EXECUTABLE]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold]
   pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory]
   adapters build PROJECT_ID [--agent NAME|all]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
@@ -99,7 +99,7 @@ Commands:
   experiment record PROJECT_ID NAME --status negative|blocked|enabled --reason TEXT [--evidence REF]
   experiment prediction PROJECT_ID EPISODE_REF --expected TEXT --observed TEXT [--recalled REF]
   experiment replay PROJECT_ID RUN_ID --mode success|failure
-  eval run PROJECT_ID --cases FILE --strategies LIST [--answer-runner EXECUTABLE] [--output DIR]
+  eval run PROJECT_ID --cases FILE --strategies LIST [--query-embedder EXECUTABLE] [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
   import bundle FILE --dry-run|--apply [--project-id ID]
   map PROJECT_ID [ROOT]
@@ -1871,7 +1871,7 @@ experiment_prediction() {
   case "$episode_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "episode reference must stay inside the project" ;; esac
   dir="$(require_project "$project_id")"; episode="$dir/$episode_ref"; [ -f "$episode" ] || die 66 "episode missing: $episode_ref"
   [ "$expected" = "$observed" ] && prediction_error=0 || prediction_error=1
-  [ "$(experiment_flag prediction-error)" = "1" ] && state=recorded || state=disabled
+  case "$(experiment_flag prediction-error)" in 1) state=recorded ;; shadow) state=shadow ;; *) state=disabled ;; esac
   prediction_id="prediction_$(sha256_text "$project_id|$episode_ref|$expected|$observed|$recalled_ref|$state" | cut -c1-16)"
   prediction_file="$dir/experiments/predictions/$prediction_id.md"
   acquire_lock "project-$project_id"
@@ -1892,29 +1892,68 @@ experiment_prediction() {
   printf 'prediction=ok project_id=%s prediction_id=%s state=%s error=%s%s\n' "$project_id" "$prediction_id" "$state" "$prediction_error" "${review_id:+ review_id=$review_id}"
 }
 
+prediction_scan_source() {
+  local project_id="$1" episode_ref="$2" source="$3" expected observed recalled flag
+  flag="$(experiment_flag prediction-error)"
+  case "$flag" in 1|shadow) ;; *) return 0 ;; esac
+  expected="$(sed -n 's/^PREDICTION_EXPECTED:[[:space:]]*//p' "$source" | head -n 1)"
+  observed="$(sed -n 's/^PREDICTION_OBSERVED:[[:space:]]*//p' "$source" | head -n 1)"
+  recalled="$(sed -n 's/^PREDICTION_RECALLED:[[:space:]]*//p' "$source" | head -n 1)"
+  [ -n "$expected" ] && [ -n "$observed" ] || return 0
+  if [ -n "$recalled" ]; then
+    experiment_prediction "$project_id" "$episode_ref" --expected "$expected" --observed "$observed" --recalled "$recalled"
+  else
+    experiment_prediction "$project_id" "$episode_ref" --expected "$expected" --observed "$observed"
+  fi
+}
+
 experiment_replay() {
-  local project_id="$1" run_id="$2" mode="" dir run_file outcome_ref replay_id replay_file state
+  local project_id="$1" run_id="$2" mode="" dir run_file outcome_ref outcome_file target_status procedure_ref replay_id replay_file state run other_outcome other_status compared_refs="" comparison_count=0 success_count=0 failed_count=0 partial_count=0 recommendation review_id=""
   shift 2 || true
   [ "${1:-}" = "--mode" ] && mode="${2:-}"
   case "$mode" in success|failure) ;; *) die 64 "experiment replay requires --mode success or failure" ;; esac
   validate_id "$run_id" || die 64 "invalid run id"
   dir="$(require_project "$project_id")"; run_file="$dir/runs/$run_id.md"; [ -f "$run_file" ] || die 66 "run missing: $run_id"
   outcome_ref="$(frontmatter_field "$run_file" brain_last_outcome_ref)"; [ -n "$outcome_ref" ] && [ "$outcome_ref" != none ] || die 66 "run has no outcome to replay"
+  outcome_file="$dir/$outcome_ref"; [ -f "$outcome_file" ] || die 66 "run outcome missing: $outcome_ref"
+  target_status="$(frontmatter_field "$outcome_file" brain_outcome_status)"
+  case "$mode:$target_status" in success:success|failure:failed) ;; *) die 65 "replay mode does not match run outcome: $target_status" ;; esac
+  procedure_ref="$(frontmatter_field "$run_file" brain_procedure_ref)"
+  while IFS= read -r run; do
+    [ "$(frontmatter_field "$run" brain_procedure_ref)" = "$procedure_ref" ] || continue
+    other_outcome="$(frontmatter_field "$run" brain_last_outcome_ref)"
+    [ -n "$other_outcome" ] && [ "$other_outcome" != none ] && [ -f "$dir/$other_outcome" ] || continue
+    other_status="$(frontmatter_field "$dir/$other_outcome" brain_outcome_status)"
+    case "$other_status" in success) success_count=$((success_count + 1)) ;; failed) failed_count=$((failed_count + 1)) ;; partial) partial_count=$((partial_count + 1)) ;; esac
+    [ "$run" = "$run_file" ] && continue
+    compared_refs="${compared_refs}${compared_refs:+,}${run#"$dir"/}"
+    comparison_count=$((comparison_count + 1))
+  done < <(find "$dir/runs" -maxdepth 1 -type f -name 'run_*.md' | sort)
+  if [ "$comparison_count" = 0 ]; then recommendation=insufficient-comparison-evidence
+  elif [ "$target_status" = failed ] && [ "$success_count" -gt 0 ]; then recommendation=compare-successful-run-differences
+  elif [ "$target_status" = failed ]; then recommendation=review-procedure-or-preconditions
+  elif [ "$failed_count" -gt 0 ]; then recommendation=preserve-success-and-compare-failures
+  else recommendation=review-repeatable-success-evidence
+  fi
   [ "$(experiment_flag procedure-replay)" = "1" ] && state=recorded || state=disabled
-  replay_id="replay_$(sha256_text "$project_id|$run_id|$outcome_ref|$mode|$state" | cut -c1-16)"
+  replay_id="replay_$(sha256_text "$project_id|$run_id|$outcome_ref|$mode|$state|$compared_refs|$recommendation" | cut -c1-16)"
   replay_file="$dir/experiments/replays/$replay_id.md"
   acquire_lock "project-$project_id"
   if [ ! -f "$replay_file" ]; then
     {
       printf '%s\n' '---'
-      printf 'type: ProcedureReplay\ntitle: %s\nbrain_project_id: %s\nbrain_replay_id: %s\nbrain_run_ref: %s\nbrain_outcome_ref: %s\nbrain_replay_mode: %s\nbrain_experiment_state: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Replay $run_id $mode")" "$project_id" "$(yaml_quote "$replay_id")" "$(yaml_quote "runs/$run_id.md")" "$(yaml_quote "$outcome_ref")" "$mode" "$state" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
-      printf '%s\n' '---' '# Procedure replay' '' "Mode: $mode" '' "This is a derived replay plan. No procedure was executed. Experiment state: $state."
+      printf 'type: ProcedureReplay\ntitle: %s\nbrain_project_id: %s\nbrain_replay_id: %s\nbrain_procedure_ref: %s\nbrain_run_ref: %s\nbrain_outcome_ref: %s\nbrain_replay_mode: %s\nbrain_target_status: %s\nbrain_compared_run_refs: %s\nbrain_comparison_count: %s\nbrain_success_count: %s\nbrain_failed_count: %s\nbrain_partial_count: %s\nbrain_replay_recommendation: %s\nbrain_experiment_state: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Replay $run_id $mode")" "$project_id" "$(yaml_quote "$replay_id")" "$(yaml_quote "$procedure_ref")" "$(yaml_quote "runs/$run_id.md")" "$(yaml_quote "$outcome_ref")" "$mode" "$target_status" "$(yaml_quote "${compared_refs:-none}")" "$comparison_count" "$success_count" "$failed_count" "$partial_count" "$recommendation" "$state" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Procedure replay' '' "Mode: $mode" '' "Compared runs: $comparison_count" '' "Recommendation: $recommendation" '' "This is derived evidence. No procedure was executed or rewritten. Experiment state: $state."
     } >"${replay_file}.tmp.$$"
     mv "${replay_file}.tmp.$$" "$replay_file"
     audit_v2 "$dir" "procedure-replay" "$replay_id" "" "$state" "$(sha256_file "$replay_file")" "mode=$mode"
   fi
+  if [ "$state" = recorded ] && [ "$comparison_count" -gt 0 ]; then
+    review_id="procedure_replay_$(sha256_text "$replay_id|$recommendation" | cut -c1-16)"
+    write_review_item "$dir" "$review_id" procedure-replay "Procedure replay proposal for $run_id" needs-validation 0.0 medium internal source llm-brain "run://$run_id" "Replay evidence: experiments/replays/$replay_id.md. Proposed action: $recommendation. Approval records the decision only and cannot rewrite canonical memory." >/dev/null
+  fi
   release_lock
-  printf 'replay=ok project_id=%s replay_id=%s state=%s file=%s\n' "$project_id" "$replay_id" "$state" "$replay_file"
+  printf 'replay=ok project_id=%s replay_id=%s state=%s recommendation=%s comparisons=%s%s file=%s\n' "$project_id" "$replay_id" "$state" "$recommendation" "$comparison_count" "${review_id:+ review_id=$review_id}" "$replay_file"
 }
 
 cmd_experiment() {
@@ -1925,7 +1964,7 @@ cmd_experiment() {
       for capability in prediction-error goal-allocation procedure-replay causal-selection learned-routing latent-adapter kv-adapter multimodal-reconstruction; do
         flag="LLM_BRAIN_EXPERIMENT_$(printf '%s' "$capability" | tr '[:lower:]-' '[:upper:]_')"
         case "$capability" in multimodal-reconstruction) flag=LLM_BRAIN_EXPERIMENT_MULTIMODAL_RECONSTRUCTION ;; esac
-        if [ "$(experiment_flag "$capability")" = 1 ]; then state=enabled; else state=disabled; fi
+        case "$(experiment_flag "$capability")" in 1) state=enabled ;; shadow) state=shadow ;; *) state=disabled ;; esac
         case "$capability" in prediction-error|procedure-replay) gate=local-record-only ;; *) gate=negative-no-evidence ;; esac
         printf '%s\t%s\t%s\t%s\n' "$capability" "$flag" "$state" "$gate"
       done
@@ -2037,7 +2076,7 @@ cmd_review() {
       acquire_lock "project-$project_id"
       if [ "$state" = "approved" ]; then
         case "$kind" in
-          reconsolidation|conflict)
+          reconsolidation|conflict|procedure-replay)
             set_frontmatter_field "$file" brain_review_state approved
             set_frontmatter_field "$file" brain_reviewed_by "$actor"
             set_frontmatter_field "$file" brain_review_reason "$reason"
@@ -2536,7 +2575,7 @@ cmd_search() {
     evidence) require_evidence=1 ;;
     exploratory) exploratory=1 ;;
   esac
-  case "$strategy" in lexical|hybrid) ;; *) die 64 "search strategy must be lexical or hybrid" ;; esac
+  case "$strategy" in lexical|vector|hybrid) ;; *) die 64 "search strategy must be lexical, vector, or hybrid" ;; esac
   require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   dir="$(require_project "$project_id")"
   INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
@@ -2568,7 +2607,7 @@ cmd_search() {
   done < <(canonical_files "$dir")
   sort -t $'\t' -k2,2nr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
 
-  if [ "$strategy" = "hybrid" ]; then
+  if [ "$strategy" = "hybrid" ] || [ "$strategy" = "vector" ]; then
     if [ "$vectors_state" != "current" ] || [ -z "$query_embedder" ] || [ ! -x "$query_embedder" ]; then
       degraded=1
     else
@@ -2602,15 +2641,22 @@ cmd_search() {
     fi
   fi
   if [ "$strategy" = "hybrid" ] && [ "$semantic_ok" = "1" ]; then mode="hybrid-rrf"; fi
+  if [ "$strategy" = "vector" ]; then mode="vector"; [ "$semantic_ok" = "1" ] || degraded=1; fi
 
-  { cut -f1 "$lexical_rank"; if [ "$semantic_ok" = "1" ]; then cut -f1 "$semantic_rank"; fi; } | sort -u >"$union"
+  {
+    [ "$strategy" = "vector" ] || cut -f1 "$lexical_rank"
+    if [ "$semantic_ok" = "1" ]; then cut -f1 "$semantic_rank"; fi
+  } | sort -u >"$union"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    local lexical_position lexical_score semantic_position final_score
+    local lexical_position lexical_score semantic_position semantic_score final_score
     lexical_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$lexical_rank")"
     lexical_score="$(awk -F '\t' -v path="$rel" '$1 == path { print $3; exit }' "$lexical_rank")"
     semantic_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$semantic_rank")"
-    if [ "$semantic_ok" = "1" ]; then
+    semantic_score="$(awk -F '\t' -v path="$rel" '$1 == path { print $3; exit }' "$semantic_rank")"
+    if [ "$strategy" = "vector" ]; then
+      final_score="${semantic_score:-0}"
+    elif [ "$semantic_ok" = "1" ]; then
       final_score="$(awk -v lexical="$lexical_position" -v semantic="$semantic_position" 'BEGIN { value=0; if (lexical != "") value += 1 / (60 + lexical); if (semantic != "") value += 1 / (60 + semantic); printf "%.12f", value }')"
     else
       final_score="${lexical_score:-0}"
@@ -2722,7 +2768,7 @@ eval_case_hit() {
     while IFS= read -r wanted; do
       [ -n "$wanted" ] && [ "$path" = "$wanted" ] && return 0
     done < <(printf '%s\n' "$expected" | tr ',' '\n')
-  done <"$ranked"
+  done < <(head -n 20 "$ranked")
   return 1
 }
 
@@ -2737,8 +2783,15 @@ eval_context_bytes() {
   printf '%s\n' "$total"
 }
 
+eval_history_hash() {
+  local dir="$1" file
+  while IFS= read -r file; do
+    printf '%s\t%s\n' "${file#"$dir"/}" "$(sha256_file "$file")"
+  done < <(find "$dir/sources" "$dir/episodes" "$dir/okf" -type f -name '*.md' 2>/dev/null | sort)
+}
+
 cmd_eval() {
-  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" output="" dir cases_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
+  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
   shift 2 || true
   [ "$action" = "run" ] || die 64 "eval requires run"
   [ -n "$project_id" ] || die 64 "eval run requires PROJECT_ID"
@@ -2747,6 +2800,7 @@ cmd_eval() {
       --cases) cases="${2:-}"; shift 2 ;;
       --strategies) strategies="${2:-}"; shift 2 ;;
       --answer-runner) answer_runner="${2:-}"; shift 2 ;;
+      --query-embedder) query_embedder="${2:-}"; shift 2 ;;
       --output) output="${2:-}"; shift 2 ;;
       *) die 64 "unknown eval option: $1" ;;
     esac
@@ -2754,13 +2808,19 @@ cmd_eval() {
   [ -f "$cases" ] || die 66 "evaluation cases file missing: $cases"
   is_regular_text_file "$cases" || die 65 "evaluation cases must be a regular text file"
   [ -z "$answer_runner" ] || [ -x "$answer_runner" ] || die 69 "answer runner is not executable: $answer_runner"
+  [ -z "$query_embedder" ] || [ -x "$query_embedder" ] || die 69 "query embedder is not executable: $query_embedder"
   [ -n "$strategies" ] || die 64 "eval run requires --strategies"
   dir="$(require_project "$project_id")"
   cases_hash="$(sha256_file "$cases")"
   for strategy in $(printf '%s' "$strategies" | tr ',' ' '); do
     case "$strategy" in none|source|episode|lexical|vector|hybrid|graph) ;; *) die 64 "unsupported evaluation strategy: $strategy" ;; esac
   done
-  eval_id="eval_$(sha256_text "$project_id|$cases_hash|$strategies|$answer_runner" | cut -c1-16)"
+  history_hash="$(eval_history_hash "$dir" | sha256_file /dev/stdin)"
+  manifest_hash="$(index_manifest_hash "$dir")"; [ -n "$manifest_hash" ] || manifest_hash=none
+  vectors_hash=none; [ ! -f "$dir/indexes/vectors.tsv" ] || vectors_hash="$(sha256_file "$dir/indexes/vectors.tsv")"
+  answer_runner_hash=none; [ -z "$answer_runner" ] || answer_runner_hash="$(sha256_file "$answer_runner")"
+  query_embedder_hash=none; [ -z "$query_embedder" ] || query_embedder_hash="$(sha256_file "$query_embedder")"
+  eval_id="eval_$(sha256_text "$project_id|$cases_hash|$strategies|$answer_runner_hash|$query_embedder_hash|$history_hash|$manifest_hash|$vectors_hash" | cut -c1-16)"
   [ -n "$output" ] || output="$dir/evaluations/$eval_id"
   case "$output" in /*) ;; *) die 65 "evaluation output must be an absolute directory" ;; esac
   if [ -f "$output/report.md" ]; then
@@ -2800,7 +2860,7 @@ cmd_eval() {
           actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
           ;;
         hybrid)
-          cmd_search "$project_id" "$query" --limit 20 --strategy hybrid --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
+          cmd_search "$project_id" "$query" --limit 20 --strategy hybrid --query-embedder "$query_embedder" --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
           cut -f1,10 "$stage/${case_id}.${strategy}.search" | tail -n +2 | awk -F '\t' '{ print $1 "\t" (NR) }' >"$ranked"
           actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
           ;;
@@ -2810,7 +2870,9 @@ cmd_eval() {
           actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
           ;;
         vector)
-          : >"$ranked"; actual=unsupported; degraded=true
+          cmd_search "$project_id" "$query" --limit 20 --strategy vector --query-embedder "$query_embedder" --explain --metadata-file "$metadata" >"$stage/${case_id}.${strategy}.search"
+          cut -f1,11 "$stage/${case_id}.${strategy}.search" | tail -n +2 | awk -F '\t' '{ print $1 "\t" (NR) }' >"$ranked"
+          actual="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"
           ;;
       esac
       candidate_paths="$(cut -f1 "$ranked" | head -n 20 | paste -sd, -)"
@@ -2848,7 +2910,8 @@ cmd_eval() {
     printf '%s\n' '---'
     printf 'type: EvaluationReport\nbrain_project_id: %s\nbrain_evaluation_id: %s\n' "$project_id" "$eval_id"
     printf 'brain_cases_hash_sha256: %s\nbrain_result_hash_sha256: %s\nbrain_requested_strategies: %s\n' "$cases_hash" "$deterministic_hash" "$(yaml_quote "$strategies")"
-    printf 'brain_answer_runner: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\n' "$(yaml_quote "${answer_runner:-none}")" "$(yaml_quote "$(now_utc)")"
+    printf 'brain_source_history_hash_sha256: %s\nbrain_index_manifest_hash_sha256: %s\nbrain_vector_index_hash_sha256: %s\n' "$history_hash" "$manifest_hash" "$vectors_hash"
+    printf 'brain_answer_runner: %s\nbrain_answer_runner_hash_sha256: %s\nbrain_query_embedder: %s\nbrain_query_embedder_hash_sha256: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\n' "$(yaml_quote "${answer_runner:-none}")" "$answer_runner_hash" "$(yaml_quote "${query_embedder:-none}")" "$query_embedder_hash" "$(yaml_quote "$(now_utc)")"
     printf '%s\n' '---'
     printf '# Memory evaluation %s\n\nCases: %s\n\n' "$eval_id" "$case_count"
     printf 'The trace is derived data. Retrieval is read-only; memory write cost is recorded as zero. Token values are conservative four-byte estimates unless an answer runner reports its own outcome.\n\n'
@@ -4502,7 +4565,7 @@ main() {
     project) [ "${1:-}" = "ensure" ] || die 64 "project requires ensure"; shift; cmd_project_ensure "$@" ;;
     topic) [ "${1:-}" = "add" ] || die 64 "topic requires add"; shift; cmd_topic_add "$@" ;;
     ingest-source)
-      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result legacy_episode_ref; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; legacy_episode_ref="$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"; reflection_schedule_record "$project_id" "${legacy_episode_ref#"$(project_dir "$project_id")/"}" deferred capture-only >/dev/null; [ "${LLM_BRAIN_RECONCILIATION:-1}" = "0" ] || reconcile_scan "$project_id" --episode "${legacy_episode_ref#"$(project_dir "$project_id")/"}" >/dev/null 2>&1 || true; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$legacy_episode_ref" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
+      local project_id="${1:-}" source="${2:-}" legacy_root="${3:-}" legacy_result legacy_episode_ref legacy_episode_rel; [ -n "$project_id" ] && [ -n "$source" ] || die 64 "ingest-source requires PROJECT_ID FILE [ROOT]"; [ -n "$legacy_root" ] && ROOT="$legacy_root"; legacy_result="$(capture_source "$project_id" "$source")"; legacy_episode_ref="$(printf '%s\n' "$legacy_result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"; legacy_episode_rel="${legacy_episode_ref#"$(project_dir "$project_id")/"}"; reflection_schedule_record "$project_id" "$legacy_episode_rel" deferred capture-only >/dev/null; prediction_scan_source "$project_id" "$legacy_episode_rel" "$source" >/dev/null 2>&1 || true; [ "${LLM_BRAIN_RECONCILIATION:-1}" = "0" ] || reconcile_scan "$project_id" --episode "$legacy_episode_rel" >/dev/null 2>&1 || true; printf '%s\n' "$legacy_result"; printf 'ingest-source=ok project=%s source_hash=%s episode=%s review=%s\n' "$project_id" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*source_hash=\([^ ]*\).*/\1/p')" "$legacy_episode_ref" "$(printf '%s\n' "$legacy_result" | sed -n 's/.*review=\([^ ]*\).*/\1/p')"
       ;;
     ingest)
       local source="${1:-}" topic="" capture_only=0 manual_only=0 provider="$REFLECTOR"; shift || true
@@ -4518,6 +4581,7 @@ main() {
       local result episode_file episode_ref schedule decision reason; result="$(capture_source "$id" "$source" "$topic")"; printf '%s\n' "$result"
       episode_file="$(printf '%s\n' "$result" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"
       episode_ref="${episode_file#"$(project_dir "$id")"/}"
+      prediction_scan_source "$id" "$episode_ref" "$source" >/dev/null 2>&1 || true
       if [ "$manual_only" = 1 ]; then
         reflection_schedule_record "$id" "$episode_ref" deferred manual-only >/dev/null
         printf 'reflection=deferred reason=manual-only\n'
