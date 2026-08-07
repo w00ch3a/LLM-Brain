@@ -41,6 +41,8 @@ The `eval run` command writes a derived Markdown report and TSV trace under `eva
 
 Canonical records may carry optional temporal and lineage extensions: `brain_observed_at`, `brain_valid_from`, `brain_valid_to`, `brain_last_verified_at`, `brain_version_of`, `brain_derived_from` and `brain_authority_origin`. OKF `sources` remains the primary lineage field. Search applies known validity intervals only when current or as-of retrieval is requested; unknown intervals remain visible in historical mode. Provider or external-observation origin cannot silently increase source authority during automatic promotion.
 
+The retrieval planner is deliberately a thin deterministic layer over the existing lexical, hybrid and graph paths. `search` and `pack build` accept intent, principal, evidence and exploratory hints without changing the legacy defaults: exact identifiers force lexical matching; historical intent includes superseded history; principal filters scoped records while retaining unscoped records; evidence requests follow canonical provenance to review, episodes and source custody; exploratory retrieval removes duplicate titles. Search metadata and context-pack frontmatter record the planner, temporal scope, evidence references and actual degraded/fallback mode. Supporting evidence is a derived pack section with hashes and excerpts; it never becomes canonical memory and is bounded by the requested budget.
+
 ## Provider and promotion policy
 
 The core invokes only explicit trusted reflector, document embedder and query-embedder executables. Provider output is untrusted data and must pass bounded-file, YAML, secret, policy and custody checks.
