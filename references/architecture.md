@@ -98,4 +98,4 @@ The public `upgrade` transaction:
 
 Codex package updates are source-aware. Git marketplaces use Codex's native marketplace refresh; local marketplaces are atomically replaced from the checksum-verified polyglot plugin archive before Codex refreshes its installed cache. Host inventory failures abort detection instead of silently falling back to a different installation type.
 
-Package v0.5.1 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.
+Package v0.5.2 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.

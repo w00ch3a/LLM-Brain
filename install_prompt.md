@@ -1,168 +1,106 @@
-# Install LLM-Brain
+# Install LLM-Brain for me
+
+Give this entire file to the local agent or interface where you want LLM-Brain installed.
+
+---
 
 You are installing LLM-Brain for this user from the official repository:
 
 `https://github.com/w00ch3a/LLM-Brain`
 
-Treat this as a local infrastructure change. Inspect the host before writing, use the latest stable GitHub Release unless the user selects another version, verify published checksums, and preserve any existing installation or vault.
+Your goal is to get useful, automatic memory working with the least effort from the user. Inspect first, recommend a safe setup, install it, test it and explain the result in plain language.
 
-## Ask before installation
+## Start here
 
-Inspect the machine and identify the available agent hosts, current LLM-Brain installation, existing vaults and relevant workspace paths. Then ask the user to reply with `recommended` or override any of these choices:
+Inspect the current agent host, operating system, existing LLM-Brain installation and existing vaults without changing anything.
 
-1. **Agent hosts**
-   - Which hosts should use LLM-Brain: Codex, Claude Code, Gemini CLI, Hermes Agent or another local agent?
-   - Recommended: configure each detected host that the user confirms.
+Then show one short confirmation in this format:
 
-2. **Release source**
-   - Latest stable GitHub Release, a specific version, or a local checkout?
-   - Recommended: latest stable release from the official repository.
+```text
+Ready to install LLM-Brain
 
-3. **Vault and project scope**
-   - Create a new vault or use an existing one?
-   - Ask for the vault path when the user does not accept the platform default.
-   - Should each workspace resolve its own project, or should the host use one fixed project ID?
-   - Recommended: platform-default vault path and automatic project resolution per workspace.
+It will:
+- remember useful project context between sessions;
+- show where recalled information came from;
+- save memory as readable local Markdown;
+- stay out of the way during normal work.
 
-4. **Automatic behaviour**
-   - Enable passive-to-the-user retrieval and authorised closeout capture?
-   - Use selective reflection or the legacy reflect-all policy?
-   - Recommended: automatic retrieval and capture with selective reflection. Do not require the user to invoke memory commands during normal work.
+Choose one:
+1. Install it for me (Recommended)
+2. Show me options
+3. Cancel
+```
 
-5. **Retrieval**
-   - Choose lexical, configured vector or hybrid retrieval.
-   - Ask whether recalled context must include supporting evidence and which token budget to use.
-   - Ask for an existing local embedder only when the user chooses vector or hybrid retrieval. Do not install or download an embedding model without approval.
-   - Recommended: hybrid with lexical fallback, evidence required and a 4,000-token recall budget.
+Do not present a technical questionnaire before this choice.
 
-6. **Privacy and visibility**
-   - Ask which workspaces, file patterns, tool outputs or data classes capture must exclude.
-   - Ask whether memory is shared or scoped by principal/audience.
-   - Recommended: internal sensitivity, secret scanning, digest-only restricted tool results and no capture outside confirmed workspaces.
+If the user chooses **Install it for me**, continue without asking about retrieval strategies, token budgets, reflection policies, project IDs, timeouts, migration modes or experimental flags.
 
-7. **Hermes options**, when Hermes is selected
-   - Enable the `LLMBrainMemoryProvider` for automatic recall and durable capture?
-   - Keep Hermes' built-in `compressor`, or opt into `LLMBrainContextEngine` for request-scoped memory selection?
-   - Confirm the recall timeout and token budget.
-   - Recommended: MemoryProvider enabled, built-in compressor retained, six-second timeout and 4,000-token budget.
+Ask one additional question only when there is no safe default, an existing installation conflicts with the new one, or installation needs a separate download or external change not covered by installing LLM-Brain. Put the recommended answer first and explain the choice in one sentence.
 
-8. **Experimental capabilities**
-   - Prediction-error reflection: off, shadow or enabled?
-   - Procedure replay: off or enabled?
-   - Recommended: both off until the user has evaluation evidence.
+## Recommended settings
 
-9. **Existing-vault changes**
-   - Ask whether the user wants read-only compatibility checks or a separately approved migration plan.
-   - Recommended: run `migrate check` only. Never run `migrate apply`, `upgrade apply`, retraction, deletion or canonical promotion without explicit approval after showing the preflight.
+Apply this setup without making the user choose each item:
 
-Present the detected state and the proposed settings in one compact summary. Wait for the user's answer before installing.
+- Install the latest stable official release for the current agent host and verify its checksum.
+- Use the normal local Markdown vault, with one memory project per workspace.
+- Enable automatic recall, authorised end-of-task capture and selective reflection.
+- Use an existing local vector provider when available; otherwise use built-in lexical search. Include evidence and use the standard 4,000-token budget.
+- Enable privacy protections. Keep experiments and migrations off. For Hermes, enable the MemoryProvider and retain the built-in context compressor.
+
+Configure only the agent host receiving this prompt. Mention other detected hosts after installation as optional additions; do not modify them automatically.
+
+## If the user chooses Show me options
+
+Offer this short menu and ask which item they want to change:
+
+1. **Apps** — choose which local agents use the memory.
+2. **Memory location** — choose where the Markdown vault lives and whether projects share memory.
+3. **Search** — keep fast built-in search or add an approved local vector model for broader matching.
+4. **Privacy** — exclude particular workspaces, files or tool outputs.
+5. **Advanced** — Hermes ContextEngine, experimental features, migration planning or other expert settings.
+
+Show the recommended value beside each selected item. Ask only questions needed for the items the user chose, then return to the install confirmation.
 
 ## Installation rules
 
-- Use argument arrays or quoted shell arguments. Do not execute downloaded text as a shell script.
-- Download release archives and their `.sha256` files from the matching GitHub Release. Verify the checksum before extraction.
-- Use `VERSION` as the package-version authority. Confirm every packaged CLI and host manifest reports the selected version.
-- Install the pinned PyYAML runtime from `requirements-okf.lock`; do not substitute an unpinned dependency.
-- Back up each host configuration or existing package before replacing it. Report the backup path.
+Must:
+
+- Use the official release archive and matching `.sha256` file. Verify the checksum before extraction.
+- Confirm the packaged CLI and host manifest match the selected `VERSION`.
+- Install the PyYAML version pinned by `requirements-okf.lock`.
+- Back up existing host configuration or packages before replacing them and report the backup location.
 - Keep durable memory as Markdown. Do not add a database, daemon, remote memory service or external graph store.
-- Preserve source custody, episodes and review separately from canonical `okf/` memory.
+
+Never:
+
 - Never bypass locks. Wait for a live owner or recover ownership only when LLM-Brain proves the owner died.
-- Keep provider calls, embeddings and index construction outside the short project commit lease.
-- Do not copy credentials, private keys, tokens, personal records or unrelated private files into prompts, logs, test fixtures or public repositories.
-- Do not commit, push, publish, migrate a live vault, activate experimental features or make paid model calls unless the user authorises that action.
+- Do not copy credentials, private keys, tokens, personal records or unrelated files into tests, logs or public repositories.
+- Do not migrate a live vault, enable experimental capabilities, make paid model calls, commit, push or publish without separate approval.
 
-## Host installation
+Prefer the host's trusted plugin or extension manager when it is already configured. Do not change marketplace sources without approval.
 
-### Codex, Claude Code and Gemini CLI
+For Hermes, install the standalone plugin under `$HERMES_HOME/plugins/llm-brain/`, run `hermes memory setup llm-brain`, and confirm `hermes memory status`. Keep `context.engine` set to `compressor` unless the user explicitly chose the LLM-Brain ContextEngine.
 
-Prefer the host's native plugin or extension manager when the user already has a trusted marketplace or extension source configured. Use the published polyglot plugin archive for the selected release. Do not switch marketplace sources without approval.
+For another local agent without a native plugin, use the host-neutral `bridge recall` and `bridge capture` commands rather than creating a second memory store.
 
-If native plugin installation is unavailable, install the standalone package and add the repository's generic instructions only to the user-approved agent configuration.
+## Test before claiming success
 
-Start a fresh host session after installation. Confirm automatic retrieval and closeout work without requiring the user to mention LLM-Brain.
+1. Confirm LLM-Brain reports the selected version and passes `detect`, `doctor` and `lint` for the configured vault.
+2. Resolve one approved workspace and recall a small provenance-labelled context block.
+3. Capture one clearly marked synthetic turn, replay it and prove the replay creates no duplicate episode.
+4. Confirm the test did not directly change canonical `okf/` memory and left no stuck work item.
+5. Confirm unavailable or malformed recall fails open so the user's agent still works.
 
-### Hermes Agent
+Do not use a real secret, private document or paid model call for testing.
 
-Use the source tree from the verified release tag and build the standalone Hermes package:
+## Finish with a simple result
 
-```bash
-bash scripts/package-hermes-plugin.sh /path/to/staging/llm-brain
-```
+Report only:
 
-Install that directory under:
+- **Installed:** version and current agent host.
+- **Working:** automatic recall, automatic capture and tests that passed.
+- **Stored at:** vault location and project ID.
+- **Restart needed:** yes or no, with the exact action.
+- **Not changed:** migrations, experimental features and any other detected agent hosts.
 
-```text
-$HERMES_HOME/plugins/llm-brain/
-```
-
-Write only these settings to `$HERMES_HOME/llm-brain.json`:
-
-```json
-{
-  "vault_root": "/path/to/llm-brain-vault",
-  "cli_path": "/path/to/llm-brain",
-  "project_id": "",
-  "strategy": "hybrid",
-  "recall_budget_tokens": 4000,
-  "timeout_seconds": 6
-}
-```
-
-Activate and inspect the provider:
-
-```bash
-hermes memory setup llm-brain
-hermes memory status
-```
-
-Keep `context.engine: compressor` unless the user selected the LLM-Brain ContextEngine. For the opt-in engine:
-
-```bash
-hermes plugins enable llm-brain --no-allow-tool-override
-hermes config set context.engine llm-brain
-```
-
-The MemoryProvider must stop injecting recall while the ContextEngine owns it. Durable capture must continue.
-
-### Other local agents
-
-Use the host-neutral bridge instead of inventing another memory store:
-
-```text
-llm-brain bridge recall --source-root PATH --query-file FILE --principal ID --require-evidence
-llm-brain bridge capture --source-root PATH --record FILE
-```
-
-JSON is transport only. Markdown in the vault remains authoritative.
-
-## Verification
-
-Run checks that match the installed host and report every skipped check:
-
-1. Confirm the CLI and manifests report the selected version.
-2. Run `detect`, `doctor`, and `lint` against the configured vault.
-3. Confirm project resolution for one approved workspace.
-4. Test provenance-labelled recall with a bounded budget.
-5. Capture one clearly marked synthetic turn through the host integration.
-6. Replay the same deterministic turn and prove it creates no second source or episode.
-7. Confirm capture changed no canonical `okf/` file.
-8. Confirm no pending or running work remains after the bounded drain.
-9. Confirm timeout or malformed recall fails open.
-10. For Hermes, confirm `memory status` reports `llm-brain` installed, available and active, and confirm the selected context engine matches the user's choice.
-
-Do not use a real secret, private document or paid model call for the smoke test.
-
-## Closeout
-
-Report:
-
-- selected version and verified checksums;
-- installed hosts and package paths;
-- vault and project IDs;
-- effective retrieval, evidence, privacy and experimental settings;
-- backup paths;
-- tests passed, failed or skipped;
-- whether a new session is required;
-- any remaining migration, provider or host limitation.
-
-Separate source state, installed state and runtime proof. Do not claim success from installation alone.
+Keep technical logs available, but do not make the user read them unless a test failed.
