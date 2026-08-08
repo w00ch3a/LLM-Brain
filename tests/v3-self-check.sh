@@ -102,6 +102,13 @@ cat >"$source" <<'SOURCE'
 This repository uses calm deterministic memory files.
 SOURCE
 
+if missing_project_output="$($cli --root "$vault" ingest-source proj_missing "$source" 2>&1)"; then
+  fail "missing project unexpectedly accepted an ingest"
+fi
+assert_contains "$missing_project_output" 'missing project: proj_missing'
+[ ! -e "$vault/projects/proj_missing" ] || fail "missing project ingest created project state"
+[ ! -e "$vault/.locks/project-proj_missing.lock" ] || fail "missing project ingest left a lock"
+
 capture="$($cli --root "$vault" ingest-source "$project_id" "$source")"
 assert_contains "$capture" 'ingest-source=ok'
 episode_ref="$(printf '%s\n' "$capture" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -1)"

@@ -1,0 +1,89 @@
+# LLM-Brain for Hermes Agent
+
+This standalone plugin connects Hermes Agent to a local LLM-Brain vault. Hermes receives automatic project recall and durable turn capture while Markdown remains the source of truth.
+
+## Components
+
+### `LLMBrainMemoryProvider`
+
+Hermes activates the provider through `memory.provider: llm-brain`. It supports:
+
+- local availability checks and profile-scoped configuration;
+- pre-request recall through `llm-brain bridge recall`;
+- non-blocking turn capture through `llm-brain bridge capture`;
+- session switch/end and pre-compression capture;
+- built-in memory-write and parent-delegation capture;
+- an atomic, recoverable Markdown outbox;
+- bounded shutdown draining;
+- the `llm_brain_search` agent tool.
+
+Primary-agent turns store full user and assistant text plus session, principal, platform and delegation lineage. Tool evidence stores names, call IDs, outcomes and result hashes. Each safe excerpt is capped at 8 KiB, with a 64 KiB total cap per turn. Sensitive results keep the hash and call lineage without content-derived paths, status text or excerpts.
+
+The provider captures evidence into `sources/`, `episodes/` and `review/`. It cannot write `okf/` directly.
+
+### `LLMBrainContextEngine`
+
+The optional context engine subclasses Hermes' `ContextCompressor`. It keeps native compression, model updates and token counters, then inserts one bounded memory block into the current request. It preserves system/developer messages, tool-call/result pairing and the latest user request.
+
+Select it with:
+
+```bash
+hermes plugins enable llm-brain --no-allow-tool-override
+hermes config set context.engine llm-brain
+```
+
+The provider stops injecting recall while this engine owns context selection. Capture continues. Set `context.engine` back to `compressor` to restore Hermes' built-in context selection.
+
+## Install
+
+```bash
+export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+bash scripts/package-hermes-plugin.sh dist/hermes/llm-brain
+mkdir -p "$HERMES_HOME/plugins"
+cp -R dist/hermes/llm-brain "$HERMES_HOME/plugins/"
+hermes memory setup llm-brain
+hermes memory status
+```
+
+Create `$HERMES_HOME/llm-brain.json` when the vault or CLI is outside the normal search paths:
+
+```json
+{
+  "vault_root": "/path/to/llm-brain-vault",
+  "cli_path": "/path/to/LLM-Brain/bin/llm-brain",
+  "project_id": "",
+  "strategy": "hybrid",
+  "recall_budget_tokens": 4000,
+  "timeout_seconds": 6
+}
+```
+
+The plugin accepts only those six keys. An empty project ID resolves the registered Hermes workspace or creates a project for it.
+
+## Capture lifecycle
+
+Each deterministic request ID identifies one Markdown record:
+
+```text
+pending → running → committed
+                 └→ failed → retry
+```
+
+Records live under `$HERMES_HOME/llm-brain/outbox/`. A short-lived standard-library worker claims a record, calls the CLI outside the project commit lease, then moves the record to `committed/`. A dead owner leaves recoverable Markdown. Replaying a committed request does not create another episode.
+
+Hermes keeps working when recall times out or returns malformed JSON. Capture failures stay in the outbox with bounded attempts and error state.
+
+## Host-neutral bridge
+
+Other local agents can use the same JSON transport:
+
+```text
+llm-brain bridge recall --source-root PATH --query-file FILE --principal ID --require-evidence
+llm-brain bridge capture --source-root PATH --record FILE
+```
+
+JSON is transport only. Source custody, episodes, reviews and canonical OKF remain Markdown in the vault.
+
+## Runtime footprint
+
+The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service or Python dependency.

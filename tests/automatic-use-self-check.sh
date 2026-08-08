@@ -2,8 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
 contract="$("$repo_root/hooks/session-start.sh")"
-archive_members="$(tar -tzf "$repo_root/dist/llm-brain-0.4.0-plugin.tar.gz")"
+archive_members="$(tar -tzf "$repo_root/dist/llm-brain-${version}-plugin.tar.gz")"
 
 grep -Fq 'Do not require the user to name LLM-Brain.' <<<"$contract"
 [ -z "$(LLM_BRAIN_PASSIVE=0 "$repo_root/hooks/session-start.sh")" ]

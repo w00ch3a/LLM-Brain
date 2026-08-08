@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cli="$repo_root/bin/llm-brain"
+version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
@@ -24,7 +25,7 @@ make_runtime() {
   local home="$1" data="$2" real_python yaml_parent wrapper
   real_python="$(command -v python3)"
   yaml_parent="$("$real_python" -c 'import os, yaml; print(os.path.dirname(os.path.dirname(yaml.__file__)))')"
-  wrapper="$data/llm-brain/runtimes/0.4.0/bin/python"
+  wrapper="$data/llm-brain/runtimes/$version/bin/python"
   mkdir -p "$(dirname "$wrapper")" "$home"
   cat >"$wrapper" <<WRAPPER
 #!/bin/sh
@@ -73,7 +74,7 @@ upgrade_env() {
 }
 
 plan_hash() {
-  upgrade_env "$cli" upgrade check --all --host "$1" --target 0.4.0 |
+  upgrade_env "$cli" upgrade check --all --host "$1" --target "$version" |
     sed -n 's/^plan_hash=//p'
 }
 
@@ -90,7 +91,7 @@ assert_failure_rolls_back() {
   before2="$(tree_hash "$case_vault2")"
   hash="$(plan_hash standalone)"
   if LLM_BRAIN_UPGRADE_FAIL_AT="$point" upgrade_env "$cli" upgrade apply --all \
-      --host standalone --target 0.4.0 --plan-hash "$hash" \
+      --host standalone --target "$version" --plan-hash "$hash" \
       --root "$case_vault1" --root "$case_vault2" >/dev/null 2>&1; then
     fail "injected failure passed: $point"
   fi
@@ -112,13 +113,13 @@ make_case success
 before1="$(tree_hash "$case_vault1")"
 before2="$(tree_hash "$case_vault2")"
 hash="$(plan_hash standalone)"
-apply_output="$(upgrade_env "$cli" upgrade apply --all --host standalone --target 0.4.0 \
+apply_output="$(upgrade_env "$cli" upgrade apply --all --host standalone --target "$version" \
   --plan-hash "$hash" --root "$case_vault1" --root "$case_vault2")"
 receipt="$(printf '%s\n' "$apply_output" | sed -n 's/.*receipt=\([^ ]*\).*/\1/p' | tail -1)"
 [ -f "$receipt" ] || fail "successful apply did not produce a receipt"
 contains_file "$receipt" $'receipt\tcurrent_package_checksum\t'
 contains_file "$receipt" $'receipt\ttarget_package_checksum\t'
-[ "$("$case_home/.local/bin/llm-brain" --version)" = 0.4.0 ] || fail "standalone version verification failed"
+[ "$("$case_home/.local/bin/llm-brain" --version)" = "$version" ] || fail "standalone version verification failed"
 [ "$(cat "$case_vault1/projects/proj_schema_1/schema.version")" = 3 ] || fail "schema 1 was not upgraded"
 [ "$(cat "$case_vault2/projects/proj_schema_2/schema.version")" = 3 ] || fail "schema 2 was not upgraded"
 cmp "$repo_root/adapters/generic.md" "$case_home/global/AGENTS.md" >/dev/null || fail "generic adapter was not installed"
@@ -127,7 +128,7 @@ verify_hash2="$(tree_hash "$case_vault2")"
 upgrade_env "$cli" upgrade verify --receipt "$receipt" >/dev/null
 [ "$(tree_hash "$case_vault1")" = "$verify_hash1" ] || fail "upgrade verify mutated schema-1 vault"
 [ "$(tree_hash "$case_vault2")" = "$verify_hash2" ] || fail "upgrade verify mutated schema-2 vault"
-installed_plan="$(upgrade_env "$case_home/.local/bin/llm-brain" upgrade check --all --host standalone --target 0.4.0 --root "$case_vault1" --root "$case_vault2" | sed -n 's/^plan_hash=//p')"
+installed_plan="$(upgrade_env "$case_home/.local/bin/llm-brain" upgrade check --all --host standalone --target "$version" --root "$case_vault1" --root "$case_vault2" | sed -n 's/^plan_hash=//p')"
 printf '%s' "$installed_plan" | grep -Eq '^[a-f0-9]{64}$' || fail "installed standalone package root was not usable"
 drift_file="$case_vault1/projects/proj_schema_1/okf/project.md"
 cp "$drift_file" "$case_dir/project.before-rollback-drift"
@@ -187,13 +188,13 @@ case "$host:$*" in
     ;;
   "codex:plugin add llm-brain@personal"|"claude:plugin update llm-brain@personal")
     if [ "$host" = codex ]; then
-      printf '{"name":"llm-brain","version":"0.4.0"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/.codex-plugin/plugin.json"
+      printf '{"name":"llm-brain","version":"%s"}\n' "$LLM_BRAIN_TEST_TARGET_VERSION" >"$LLM_BRAIN_TEST_PACKAGE_ROOT/.codex-plugin/plugin.json"
     else
-      printf '{"name":"llm-brain","version":"0.4.0"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json"
+      printf '{"name":"llm-brain","version":"%s"}\n' "$LLM_BRAIN_TEST_TARGET_VERSION" >"$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json"
     fi
     ;;
   "gemini:extensions update llm-brain")
-    printf '{"name":"llm-brain","version":"0.4.0"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json"
+    printf '{"name":"llm-brain","version":"%s"}\n' "$LLM_BRAIN_TEST_TARGET_VERSION" >"$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json"
     ;;
 esac
 STUB
@@ -209,13 +210,14 @@ assert_host_commands() {
   export LLM_BRAIN_TEST_HOST_LOG="$case_dir/host.log"
   export LLM_BRAIN_TEST_HOST_STATE="$case_dir/host.state"
   export LLM_BRAIN_TEST_SOURCE_TYPE="$source_type"
+  export LLM_BRAIN_TEST_TARGET_VERSION="$version"
   if [ "$host" != gemini ]; then LLM_BRAIN_TEST_PACKAGE_ROOT="$case_dir/current-package"; fi
   export LLM_BRAIN_TEST_PACKAGE_ROOT
   PATH="$case_dir/bin:$PATH"
   export PATH
   hash="$(plan_hash "$host")"
   if LLM_BRAIN_UPGRADE_FAIL_AT=staging-verification:1 upgrade_env "$cli" upgrade apply --all \
-      --host "$host" --target 0.4.0 --plan-hash "$hash" \
+      --host "$host" --target "$version" --plan-hash "$hash" \
       --root "$case_vault1" --root "$case_vault2" >/dev/null 2>&1; then
     fail "$host staging failure passed"
   fi
@@ -239,7 +241,7 @@ assert_host_commands() {
     gemini:*) contains_file "$case_dir/host.log" 'extensions update llm-brain' ;;
   esac
   [ "$host" = gemini ] || contains_file "$case_dir/host.log" 'plugin list --json'
-  unset LLM_BRAIN_TEST_HOST_LOG LLM_BRAIN_TEST_HOST_STATE LLM_BRAIN_TEST_PACKAGE_ROOT LLM_BRAIN_TEST_SOURCE_TYPE
+  unset LLM_BRAIN_TEST_HOST_LOG LLM_BRAIN_TEST_HOST_STATE LLM_BRAIN_TEST_PACKAGE_ROOT LLM_BRAIN_TEST_SOURCE_TYPE LLM_BRAIN_TEST_TARGET_VERSION
 }
 
 assert_host_commands codex local
@@ -259,11 +261,11 @@ cat >"$case_dir/bin/codex" <<'STUB'
 printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"0.3.1","source":{"source":"git","url":"https://example.invalid/llm-brain.git"}}]}\n'
 STUB
 chmod +x "$case_dir/bin/codex"
-PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target 0.4.0 >"$case_dir/cache.out"
+PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target "$version" >"$case_dir/cache.out"
 contains_file "$case_dir/cache.out" 'package_source_type=git'
 contains_file "$case_dir/cache.out" 'target_archive_kind=plugin'
 mv "$cache_root" "${cache_root}.missing"
-if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target 0.4.0 >"$case_dir/cache-missing.out" 2>&1; then
+if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target "$version" >"$case_dir/cache-missing.out" 2>&1; then
   fail "missing Codex Git cache passed preflight"
 fi
 contains_file "$case_dir/cache-missing.out" 'Codex plugin cache is missing'
@@ -275,7 +277,7 @@ cat >"$case_dir/bin/codex" <<'STUB'
 exit 1
 STUB
 chmod +x "$case_dir/bin/codex"
-if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host auto --target 0.4.0 >"$case_dir/auto.out" 2>&1; then
+if PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host auto --target "$version" >"$case_dir/auto.out" 2>&1; then
   fail "automatic host detection ignored a Codex inventory failure"
 fi
 contains_file "$case_dir/auto.out" 'unable to inspect codex plugins'

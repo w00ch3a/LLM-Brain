@@ -51,6 +51,26 @@ The `eval run` command writes a derived Markdown report and TSV trace under `eva
 
 Canonical records may carry optional temporal and lineage extensions: `brain_observed_at`, `brain_valid_from`, `brain_valid_to`, `brain_last_verified_at`, `brain_version_of`, `brain_derived_from` and `brain_authority_origin`. OKF `sources` remains the primary lineage field. Search applies known validity intervals only when current or as-of retrieval is requested; unknown intervals remain visible in historical mode. Provider or external-observation origin cannot silently increase source authority during automatic promotion.
 
+## Hermes and host bridges
+
+The standalone Hermes integration under `integrations/hermes/llm-brain/` uses
+the host's `MemoryProvider` for automatic recall and durable turn observation.
+It writes structured, secret-filtered Markdown outbox records under the
+Hermes profile and hands them to `bridge capture`; it never writes `okf/`
+directly. The optional `ContextEngine` subclasses Hermes' native
+`ContextCompressor` and adds only request-scoped recall. When selected, it is
+the sole recall injector and the memory provider continues capture. Its
+`select_context()` result is deterministic, bounded and fail-open, and never
+mutates persisted conversation history.
+
+`bridge recall` and `bridge capture` are host-neutral JSON transport commands.
+Project resolution uses a configured ID, the supplied workspace identity, or
+automatic `project ensure`; all durable state remains Markdown and existing
+project locks, atomic renames and idempotent custody rules remain authoritative.
+Recall emits only complete UTF-8 Markdown blocks within the requested budget.
+Restricted Hermes tool results retain their call lineage and full-result hash,
+but no content-derived excerpt, path or outcome text.
+
 The retrieval planner is deliberately a thin deterministic layer over the existing lexical, hybrid and graph paths. `search` and `pack build` accept intent, principal, evidence and exploratory hints without changing the legacy defaults: exact identifiers force lexical matching; historical intent includes superseded history; principal filters scoped records while retaining unscoped records; evidence requests follow canonical provenance to review, episodes and source custody; exploratory retrieval removes duplicate titles. Search metadata and context-pack frontmatter record the planner, temporal scope, evidence references and actual degraded/fallback mode. Supporting evidence is a derived pack section with hashes and excerpts; it never becomes canonical memory and is bounded by the requested budget.
 
 ## Provider and promotion policy
@@ -78,4 +98,4 @@ The public `upgrade` transaction:
 
 Codex package updates are source-aware. Git marketplaces use Codex's native marketplace refresh; local marketplaces are atomically replaced from the checksum-verified polyglot plugin archive before Codex refreshes its installed cache. Host inventory failures abort detection instead of silently falling back to a different installation type.
 
-Package v0.4.0 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.
+Package v0.5.0 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.

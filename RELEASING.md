@@ -39,6 +39,6 @@ Present every review, scaffold, custody-gap and OKF transformation count. Never 
 
 ## Publication
 
-Commit, push, tag `v0.4.0`, publish GitHub archives, update public marketplaces or synchronise the configured personal marketplace source only after explicit release authority. After publication, download the published artefacts and repeat checksum, extraction, manifest and packaged-CLI verification in a fresh task.
+Commit, push, tag the version declared by `VERSION`, publish GitHub archives, update public marketplaces or synchronise the configured personal marketplace source only after explicit release authority. After publication, download the published artefacts and repeat checksum, extraction, manifest and packaged-CLI verification in a fresh task.
 
 Release proof is four separate checks: the intended commit is on the public branch, the tag resolves to that commit, the GitHub Release exists with both archives and checksum assets, and a normal release-based `upgrade check` resolves the published checksum. Local installation or a pushed feature branch does not prove publication.
