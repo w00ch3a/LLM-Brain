@@ -44,6 +44,8 @@ Canonical knowledge follows [Google Open Knowledge Format v0.2](https://github.c
 
 LLM-Brain uses Bash, Python and pinned PyYAML. It does not require a database or daemon.
 
+Want your agent to handle setup? Give [`install_prompt.md`](install_prompt.md) to Codex, Claude Code, Gemini CLI, Hermes or another capable local agent. It asks for your vault, retrieval, privacy, automation and experimental preferences before changing the machine.
+
 ```bash
 git clone https://github.com/w00ch3a/LLM-Brain.git
 cd LLM-Brain
@@ -221,8 +223,8 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.5.0
-./bin/llm-brain upgrade apply --all --host auto --target 0.5.0 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.5.1
+./bin/llm-brain upgrade apply --all --host auto --target 0.5.1 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -241,4 +243,4 @@ bash scripts/package-hermes-plugin.sh /tmp/llm-brain-hermes-package
 git diff --check
 ```
 
-Read [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and [the v0.5.0 release notes](docs/releases/v0.5.0.md) for this release.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and [the v0.5.1 release notes](docs/releases/v0.5.1.md) for this release.

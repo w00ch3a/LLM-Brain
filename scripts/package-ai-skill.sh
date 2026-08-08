@@ -50,7 +50,7 @@ mkdir -p \
   "$standalone/lib" \
   "$standalone/adapters"
 
-for item in LICENSE README.md SKILL.md VERSION GEMINI.md gemini-extension.json requirements-okf.lock; do
+for item in LICENSE README.md install_prompt.md SKILL.md VERSION GEMINI.md gemini-extension.json requirements-okf.lock; do
   install -m 0644 "$repo_root/$item" "$plugin/$item"
 done
 for directory in .codex-plugin .claude-plugin adapters hooks; do
@@ -62,7 +62,7 @@ install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py
 install -m 0644 "$repo_root/references/architecture.md" "$plugin/skills/llm-brain/references/architecture.md"
 install -m 0644 "$repo_root/VERSION" "$plugin/skills/llm-brain/VERSION"
 
-install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
+install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
