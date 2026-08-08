@@ -10,6 +10,14 @@ LLM-Brain gives Codex, Claude Code, Gemini CLI, Hermes Agent and custom agents a
 
 The infrastructure stays active. You do not have to invoke it, clear lock files or manage a memory queue during normal work.
 
+## Easiest install
+
+1. Open [`install_prompt.md`](install_prompt.md).
+2. Give the whole file to Codex, Claude Code, Gemini CLI, Hermes or another capable local agent.
+3. Choose **Install it for me**.
+
+The agent detects the current host, proposes safe defaults, installs a checksum-verified release and tests it. Choose **Show me options** only when you want to change the memory location, search, privacy or advanced settings.
+
 ```text
 authoritative files
        │
@@ -43,8 +51,6 @@ Canonical knowledge follows [Google Open Knowledge Format v0.2](https://github.c
 ## Install
 
 LLM-Brain uses Bash, Python and pinned PyYAML. It does not require a database or daemon.
-
-Want your agent to handle setup? Give [`install_prompt.md`](install_prompt.md) to Codex, Claude Code, Gemini CLI, Hermes or another capable local agent. Choose **Install it for me** for a guided setup with no technical questionnaire, or **Show me options** to change advanced settings.
 
 ```bash
 git clone https://github.com/w00ch3a/LLM-Brain.git
