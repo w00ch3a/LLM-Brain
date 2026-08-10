@@ -1,5 +1,7 @@
 # LLM-Brain
 
+![LLM-Brain logo](docs/assets/llm-brain-logo.png)
+
 [![Release](https://img.shields.io/github/v/release/w00ch3a/LLM-Brain)](https://github.com/w00ch3a/LLM-Brain/releases)
 [![License](https://img.shields.io/github/license/w00ch3a/LLM-Brain)](LICENSE)
 [![Storage](https://img.shields.io/badge/storage-Markdown-4B5563)](references/architecture.md)
