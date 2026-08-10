@@ -1,6 +1,8 @@
 # LLM-Brain
 
-![LLM-Brain logo](docs/assets/llm-brain-logo.png)
+<p align="center">
+  <img src="docs/assets/llm-brain-logo.png" alt="LLM-Brain" width="640">
+</p>
 
 [![Release](https://img.shields.io/github/v/release/w00ch3a/LLM-Brain)](https://github.com/w00ch3a/LLM-Brain/releases)
 [![License](https://img.shields.io/github/license/w00ch3a/LLM-Brain)](LICENSE)
