@@ -57,9 +57,92 @@ episode_count="$(find "$vault/projects/$project_id/episodes" -type f -name '*.md
 [ "$episode_count" -ge 2 ]
 
 recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/query.txt" --strategy lexical --require-evidence)"
-printf '%s\n' "$recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); c=p["context_markdown"]; assert p["status"] == "ok"; assert p["results"]; assert "okf/claims/bridge.md" in p["evidence_refs"]; assert p["actual_strategy"] == "lexical"; assert "Hermes bridge contract" in c; assert len(c.encode("utf-8")) <= 16000; assert c.endswith(".\n")'
+printf '%s\n' "$recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); c=p["context_markdown"]; assert p["status"] == "ok"; assert p["results"]; assert "okf/claims/bridge.md" in p["evidence_refs"]; assert p["actual_strategy"].startswith("lexical"); assert "Hermes bridge contract" in c; assert len(c.encode("utf-8")) <= 16000; assert c.endswith(".\n")'
 tiny_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/query.txt" --strategy lexical --budget-tokens 1)"
 printf '%s\n' "$tiny_recall" | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["context_markdown"].encode("utf-8")) <= 4'
+
+cat >"$fixture/embedder.sh" <<'EMBEDDER'
+#!/usr/bin/env bash
+if grep -Fqi 'residence changed' "$1" || grep -Fqi 'relocated to Melbourne' "$1"; then vector='1 0'; else vector='0 1'; fi
+printf 'model: fixture-evidence\ndimensions: 2\nvector: %s\n' "$vector"
+EMBEDDER
+chmod 755 "$fixture/embedder.sh"
+cat >"$fixture/evidence.md" <<'EOF'
+---
+type: HermesTurn
+title: "Residence update"
+brain_request_id: hermes_evidence_request
+brain_principal: "hermes:test"
+brain_observed_at: "2026-08-08T12:00:00Z"
+---
+# Residence update
+
+The user relocated to Melbourne.
+EOF
+LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$fixture/evidence.md" >/dev/null
+printf '%s\n' 'Did the residence change?' >"$fixture/evidence-query.txt"
+evidence_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/evidence-query.txt" --principal hermes:test --strategy hybrid)"
+printf '%s\n' "$evidence_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert "hybrid-evidence-rrf" in p["actual_strategy"]; assert p["degraded"] is False; assert "relocated to Melbourne" in p["context_markdown"]; assert "2026-08-08T12:00:00Z" in p["context_markdown"]'
+project="$vault/projects/$project_id"
+evidence_index="$project/indexes/evidence-vectors.tsv"
+evidence_source="$project/$(sed -n '2s/\t.*//p' "$evidence_index")"
+for number in $(seq 1 20); do
+  rel="sources/evidence-load-$number.md"
+  cp "$evidence_source" "$project/$rel"
+  awk -F '\t' -v OFS='\t' -v rel="$rel" 'NR == 2 { $1=rel; print; exit }' "$evidence_index" >>"$evidence_index"
+done
+loaded_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/evidence-query.txt" --principal hermes:test --strategy hybrid)"
+printf '%s\n' "$loaded_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["results"]; assert p["status"] == "ok"'
+
+make_evidence_fixture() {
+  local file="$1" title="$2" request_id="$3" observed="$4" user_content="$5" assistant_content="$6"
+  {
+    printf '%s\n' '---'
+    printf 'type: HermesTurn\ntitle: "%s"\nbrain_request_id: %s\nbrain_principal: "hermes:test"\nbrain_observed_at: "%s"\n' "$title" "$request_id" "$observed"
+    printf '%s\n' '---' "# $title" '' '## User content' '' "$user_content" '' '## Assistant content' '' "$assistant_content"
+  } >"$file"
+}
+
+make_evidence_fixture "$fixture/user-basketball.md" "User basketball preference" hermes_user_basketball 2026-08-09T00:00:00Z 'I prefer casual basketball pickup games in summer to keep cardio fun.' 'Jackson prefers basketball in summer too.'
+make_evidence_fixture "$fixture/jackson-basketball.md" "Jackson basketball preference" hermes_jackson_basketball 2026-08-10T00:00:00Z 'Jackson enjoys basketball in summer.' 'The user prefers basketball every weekend.'
+make_evidence_fixture "$fixture/old-company.md" "Old company" hermes_old_company 2026-08-01T00:00:00Z 'My company was Future Intelligence in the media industry.' 'The company history is recorded.'
+make_evidence_fixture "$fixture/new-company.md" "New company" hermes_new_company 2026-08-11T00:00:00Z 'My company is Northern Logistics in the legal industry.' 'The user changed company.'
+make_evidence_fixture "$fixture/new-company-repeat-1.md" "New company repeat 1" hermes_new_company_repeat_1 2026-08-12T00:00:00Z 'I continue working at Northern Logistics in the legal industry.' 'The same employer is repeated.'
+make_evidence_fixture "$fixture/new-company-repeat-2.md" "New company repeat 2" hermes_new_company_repeat_2 2026-08-13T00:00:00Z 'Northern Logistics remains my employer in the legal sector.' 'The same employer is repeated again.'
+make_evidence_fixture "$fixture/new-company-repeat-3.md" "New company repeat 3" hermes_new_company_repeat_3 2026-08-14T00:00:00Z 'My current job is still at Northern Logistics.' 'The same employer is repeated once more.'
+make_evidence_fixture "$fixture/old-birthdate.md" "Old birthdate" hermes_old_birthdate 2026-08-02T00:00:00Z 'My birthdate is 1988-05-14.' 'The birthdate is fixed.'
+make_evidence_fixture "$fixture/new-birthdate.md" "New birthdate conflict" hermes_new_birthdate 2026-08-12T00:00:00Z 'My birthdate is 1990-05-14.' 'The birthdate is 1990-05-14.'
+make_evidence_fixture "$fixture/user-audiobook.md" "User audiobook condition" hermes_user_audiobook 2026-08-13T00:00:00Z 'I prefer audiobooks for professional self-improvement while commuting.' 'Jackson prefers audiobooks at bedtime.'
+for evidence_fixture in "$fixture/user-basketball.md" "$fixture/jackson-basketball.md" "$fixture/old-company.md" "$fixture/new-company.md" "$fixture/old-birthdate.md" "$fixture/new-birthdate.md" "$fixture/user-audiobook.md"; do
+  LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$evidence_fixture" >/dev/null
+done
+
+printf '%s\n' 'When does the user prefer basketball?' >"$fixture/basketball-query.txt"
+basketball_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/basketball-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$basketball_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); rows=[r for r in p["results"] if r["type"] == "HermesTurn"]; c=p["context_markdown"]; assert rows and rows[0]["title"] == "User basketball preference"; assert "correct subject and condition" in c and "summer" in c and "User basketball preference" in c'
+
+printf '%s\n' 'What changed about my company?' >"$fixture/company-query.txt"
+company_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/company-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$company_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; assert "Old company" in titles[:3] and "New company" in titles[:3]; assert "earlier and later evidence" in p["context_markdown"]'
+for evidence_fixture in "$fixture/new-company-repeat-1.md" "$fixture/new-company-repeat-2.md" "$fixture/new-company-repeat-3.md"; do
+  LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$evidence_fixture" >/dev/null
+done
+company_repeat_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/company-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$company_repeat_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; assert "Old company" in titles[:5]'
+printf '%s\n' "$company_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; assert "Old company" in titles[:5]; assert sum("New company" in title for title in titles[:5]) < 5'
+
+printf '%s\n' 'What is my birthdate?' >"$fixture/birthdate-query.txt"
+birthdate_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/birthdate-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$birthdate_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; c=p["context_markdown"]; assert "Old birthdate" in titles[:3] and "New birthdate conflict" in titles[:3]; assert "Answer mode: `static`" in c and "STATIC CLAIMS ARE NOT CANONICAL" in c and "sources disagree" in c and "relation birthdate" in c'
+
+legacy_index="$project/indexes/evidence-vectors.tsv"
+printf '%s\n' 'path\thash\tmodel\tdimensions\tprincipal\tobserved_at\ttitle\tvector' >"$legacy_index"
+make_evidence_fixture "$fixture/rebuild-trigger.md" "Rebuild trigger" hermes_rebuild_trigger 2026-08-14T00:00:00Z 'My company is still Northern Logistics.' 'The index must rebuild from custody.'
+LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$fixture/rebuild-trigger.md" >/dev/null
+expected_evidence_header="$(printf 'path\thash\tview_version\tview_hash\tview_path\tmodel\tdimensions\tprincipal\tobserved_at\ttitle\tvector\tclaims_version')"
+printf '%s\n' "$(head -1 "$legacy_index")" | grep -Fqx -- "$expected_evidence_header" || { printf 'stale evidence index was not rebuilt\n' >&2; exit 1; }
+claims_projection="$(find "$project/indexes/evidence-claims" -maxdepth 1 -type f -name '*-claims-v2.txt' -print -quit)"
+[ -n "$claims_projection" ] && grep -Fqx -- 'derived=claim-projection-v2' "$claims_projection"
 
 if [ ! -d "$hermes_root" ]; then
   printf 'Hermes source unavailable; bridge checks passed, provider checks skipped\n'

@@ -421,7 +421,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
         context = payload.get("context_markdown") if payload else ""
         return context if isinstance(context, str) else ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None, observed_at: str = "") -> None:
         if self._agent_context not in {"", "primary"}:
             return
         messages = messages or []
@@ -435,6 +435,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
         record = _turn_record(
             request_id, self._source_root, session, self._principal, self._platform,
             self._agent_identity, "turn", user_content, assistant_content, messages,
+            {"observed_at": observed_at} if observed_at else None,
         )
         _atomic_write(self._hermes_home / "llm-brain" / "outbox" / f"{request_id}.md", record)
         self._start_drain()
@@ -533,7 +534,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
         self._start_drain()
         thread = self._drain_thread
         if thread and thread.is_alive():
-            thread.join(timeout=4.0)
+            thread.join(timeout=float(self._config.get("timeout_seconds", DEFAULT_TIMEOUT)) + 1.0)
 
     def _start_drain(self) -> None:
         with self._drain_lock:
