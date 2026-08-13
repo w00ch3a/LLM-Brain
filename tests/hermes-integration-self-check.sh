@@ -83,10 +83,11 @@ LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$c
 printf '%s\n' 'Did the residence change?' >"$fixture/evidence-query.txt"
 evidence_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/evidence-query.txt" --principal hermes:test --strategy hybrid)"
 printf '%s\n' "$evidence_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert "hybrid-evidence-rrf" in p["actual_strategy"]; assert p["degraded"] is False; assert "relocated to Melbourne" in p["context_markdown"]; assert "2026-08-08T12:00:00Z" in p["context_markdown"]'
+printf '%s\n' "$evidence_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); rows=[r for r in p["results"] if r["type"] == "HermesTurn"]; assert rows and all(r["principal"] == "hermes:test" for r in rows); assert all(r["source_hash"] and r["excerpt"] and r["observed_at"] for r in rows)'
 project="$vault/projects/$project_id"
 evidence_index="$project/indexes/evidence-vectors.tsv"
 evidence_source="$project/$(sed -n '2s/\t.*//p' "$evidence_index")"
-for number in $(seq 1 20); do
+for number in $(seq 1 220); do
   rel="sources/evidence-load-$number.md"
   cp "$evidence_source" "$project/$rel"
   awk -F '\t' -v OFS='\t' -v rel="$rel" 'NR == 2 { $1=rel; print; exit }' "$evidence_index" >>"$evidence_index"
@@ -113,7 +114,15 @@ make_evidence_fixture "$fixture/new-company-repeat-3.md" "New company repeat 3" 
 make_evidence_fixture "$fixture/old-birthdate.md" "Old birthdate" hermes_old_birthdate 2026-08-02T00:00:00Z 'My birthdate is 1988-05-14.' 'The birthdate is fixed.'
 make_evidence_fixture "$fixture/new-birthdate.md" "New birthdate conflict" hermes_new_birthdate 2026-08-12T00:00:00Z 'My birthdate is 1990-05-14.' 'The birthdate is 1990-05-14.'
 make_evidence_fixture "$fixture/user-audiobook.md" "User audiobook condition" hermes_user_audiobook 2026-08-13T00:00:00Z 'I prefer audiobooks for professional self-improvement while commuting.' 'Jackson prefers audiobooks at bedtime.'
-for evidence_fixture in "$fixture/user-basketball.md" "$fixture/jackson-basketball.md" "$fixture/old-company.md" "$fixture/new-company.md" "$fixture/old-birthdate.md" "$fixture/new-birthdate.md" "$fixture/user-audiobook.md"; do
+make_evidence_fixture "$fixture/old-marital.md" "Old marital status" hermes_old_marital 2026-08-03T00:00:00Z 'I was married.' 'The earlier marital status is recorded.'
+make_evidence_fixture "$fixture/new-marital.md" "New marital status" hermes_new_marital 2026-08-15T00:00:00Z 'I am divorced.' 'The later marital status is recorded.'
+make_evidence_fixture "$fixture/old-children.md" "Old children status" hermes_old_children 2026-08-04T00:00:00Z 'I did not have children.' 'The earlier children status is recorded.'
+make_evidence_fixture "$fixture/new-children.md" "New children status" hermes_new_children 2026-08-16T00:00:00Z 'I have two children.' 'The later children status is recorded.'
+make_evidence_fixture "$fixture/old-employment-status.md" "Earlier employment status" hermes_old_employment 2026-08-05T00:00:00Z 'I was employed.' 'The earlier employment status is recorded.'
+make_evidence_fixture "$fixture/new-employment-status.md" "Later employment status" hermes_new_employment 2026-08-17T00:00:00Z 'I am employed.' 'The later employment status is recorded.'
+make_evidence_fixture "$fixture/user-sibling.md" "User sibling count" hermes_user_sibling 2026-08-06T00:00:00Z 'I have one sibling, my sister Sophie.' 'The user sibling count is recorded.'
+make_evidence_fixture "$fixture/friend-sibling.md" "Friend sibling count" hermes_friend_sibling 2026-08-07T00:00:00Z 'My friend Liam has two siblings.' 'The unrelated family reference is recorded.'
+for evidence_fixture in "$fixture/user-basketball.md" "$fixture/jackson-basketball.md" "$fixture/old-company.md" "$fixture/new-company.md" "$fixture/old-birthdate.md" "$fixture/new-birthdate.md" "$fixture/user-audiobook.md" "$fixture/old-marital.md" "$fixture/new-marital.md" "$fixture/old-children.md" "$fixture/new-children.md" "$fixture/old-employment-status.md" "$fixture/new-employment-status.md" "$fixture/user-sibling.md" "$fixture/friend-sibling.md"; do
   LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$evidence_fixture" >/dev/null
 done
 
@@ -123,7 +132,22 @@ printf '%s\n' "$basketball_recall" | python3 -c 'import json,sys; p=json.load(sy
 
 printf '%s\n' 'What changed about my company?' >"$fixture/company-query.txt"
 company_recall="$("$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/company-query.txt" --principal hermes:test --strategy lexical)"
-printf '%s\n' "$company_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; assert "Old company" in titles[:3] and "New company" in titles[:3]; assert "earlier and later evidence" in p["context_markdown"]'
+printf '%s\n' "$company_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"] if r["type"] == "HermesTurn"]; assert "Old company" in titles[:3] and "New company" in titles[:3]; assert p["resolution_mode"] == "dynamic"; assert "earlier and later evidence" in p["context_markdown"]'
+printf '%s\n' 'Which company did I switch from and to?' >"$fixture/company-switch-query.txt"
+company_switch_recall="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/company-switch-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$company_switch_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["resolution_mode"] == "dynamic"; assert "Old company" in [r["title"] for r in p["results"][:3]]; assert "New company" in [r["title"] for r in p["results"][:3]]'
+printf '%s\n' 'Did my employment status stay the same?' >"$fixture/employment-stayed-query.txt"
+employment_stayed_recall="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/employment-stayed-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$employment_stayed_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"][:3]]; assert p["resolution_mode"] == "dynamic"; assert "Earlier employment status" in titles and "Later employment status" in titles; assert "earlier and later evidence" in p["context_markdown"]'
+printf '%s\n' "Did the user's marital status change?" >"$fixture/marital-query.txt"
+marital_recall="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/marital-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$marital_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"][:3]]; c=p["context_markdown"]; assert p["resolution_mode"] == "dynamic"; assert "Old marital status" in titles and "New marital status" in titles; assert c.index("Old marital status") < c.index("New marital status")'
+printf '%s\n' "Has the user's children status changed recently?" >"$fixture/children-query.txt"
+children_recall="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/children-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$children_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"][:3]]; c=p["context_markdown"]; assert p["resolution_mode"] == "dynamic"; assert "Old children status" in titles and "New children status" in titles; assert c.index("Old children status") < c.index("New children status")'
+printf '%s\n' 'How many siblings does the user have?' >"$fixture/sibling-query.txt"
+sibling_recall="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/sibling-query.txt" --principal hermes:test --strategy lexical)"
+printf '%s\n' "$sibling_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); titles=[r["title"] for r in p["results"][:3]]; assert p["resolution_mode"] == "static"; assert "User sibling count" in titles; assert "Friend sibling count" not in titles[:1]'
 for evidence_fixture in "$fixture/new-company-repeat-1.md" "$fixture/new-company-repeat-2.md" "$fixture/new-company-repeat-3.md"; do
   LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$evidence_fixture" >/dev/null
 done

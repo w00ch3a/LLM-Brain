@@ -206,6 +206,7 @@ Each bridge command writes one JSON object to stdout. JSON carries transport dat
 LLM-Brain supports:
 
 - lexical, configured vector, hybrid and graph-expanded retrieval;
+- conflict-aware Hermes evidence retrieval that ranks user content separately from assistant suggestions, preserves competing dates, and exposes resolution mode and provenance in bridge JSON;
 - exact identifier, factual, current-state, historical, procedure, evidence and exploratory intents;
 - current and as-of temporal views with unknown-validity handling;
 - principal and audience visibility;

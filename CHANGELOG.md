@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Improved Hermes conflict retrieval by indexing user content separately from assistant text, preserving temporal alternatives and principal boundaries, and rebuilding stale derived evidence indexes from source custody.
+- Added dynamic, static and conditional answer guidance plus bridge provenance fields for observed time, source hash, principal and user-only excerpts.
+- Extended Hermes regression coverage for employer, employment, marital, children and sibling conflicts, repeated evidence caps, lexical fallback and deterministic index rebuilds.
+
 ## 0.4.0 - 2026-07-31
 
 See the [v0.4.0 release review](docs/releases/v0.4.0.md) for defect classification, root causes, verification and lessons learned.
