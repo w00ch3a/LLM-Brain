@@ -234,8 +234,8 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.5.2
-./bin/llm-brain upgrade apply --all --host auto --target 0.5.2 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.5.3
+./bin/llm-brain upgrade apply --all --host auto --target 0.5.3 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -254,4 +254,4 @@ bash scripts/package-hermes-plugin.sh /tmp/llm-brain-hermes-package
 git diff --check
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and [the v0.5.2 release notes](docs/releases/v0.5.2.md) for this release.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and [the v0.5.3 release notes](docs/releases/v0.5.3.md) for this release.
