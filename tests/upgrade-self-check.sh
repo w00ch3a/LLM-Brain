@@ -52,13 +52,15 @@ make_case() {
   case_backups="$case_dir/backups"
   case_vault1="$case_dir/vault-one"
   case_vault2="$case_dir/vault-two"
+  case_vault3="$case_dir/vault-three"
   mkdir -p "$case_dir" "$case_state" "$case_backups"
   make_runtime "$case_home" "$case_data"
   make_vault "$case_vault1" 1 "$case_dir/repo-one"
   make_vault "$case_vault2" 2 "$case_dir/repo-two"
+  make_vault "$case_vault3" 3 "$case_dir/repo-three"
   mkdir -p "$case_state/llm-brain"
-  printf 'schema_version\troot\tkind\tstatus\tupdated_at\n3\t%s\tshared\tactive\t2026-07-31T00:00:00Z\n3\t%s\tshared\tactive\t2026-07-31T00:00:00Z\n' \
-    "$case_vault1" "$case_vault2" >"$case_state/llm-brain/roots.tsv"
+  printf 'schema_version\troot\tkind\tstatus\tupdated_at\n3\t%s\tshared\tactive\t2026-07-31T00:00:00Z\n3\t%s\tshared\tactive\t2026-07-31T00:00:00Z\n3\t%s\tshared\tactive\t2026-07-31T00:00:00Z\n' \
+    "$case_vault1" "$case_vault2" "$case_vault3" >"$case_state/llm-brain/roots.tsv"
 }
 
 upgrade_env() {
@@ -79,7 +81,7 @@ plan_hash() {
 }
 
 assert_failure_rolls_back() {
-  local point="$1" before1 before2 hash original_adapter=""
+  local point="$1" before1 before2 before3 hash original_adapter=""
   make_case "failure-${point//:/-}"
   if [ "$point" = "staging-verification:1" ]; then
     original_adapter="$case_dir/original-adapter"
@@ -89,6 +91,7 @@ assert_failure_rolls_back() {
   fi
   before1="$(tree_hash "$case_vault1")"
   before2="$(tree_hash "$case_vault2")"
+  before3="$(tree_hash "$case_vault3")"
   hash="$(plan_hash standalone)"
   if LLM_BRAIN_UPGRADE_FAIL_AT="$point" upgrade_env "$cli" upgrade apply --all \
       --host standalone --target "$version" --plan-hash "$hash" \
@@ -97,6 +100,7 @@ assert_failure_rolls_back() {
   fi
   [ "$(tree_hash "$case_vault1")" = "$before1" ] || fail "$point changed schema-1 vault"
   [ "$(tree_hash "$case_vault2")" = "$before2" ] || fail "$point changed schema-2 vault"
+  [ "$(tree_hash "$case_vault3")" = "$before3" ] || fail "$point changed schema-3 vault"
   [ ! -L "$case_home/.local/bin/llm-brain" ] || fail "$point left standalone launcher active"
   if [ -n "$original_adapter" ]; then
     cmp "$original_adapter" "$case_home/global/AGENTS.md" >/dev/null || fail "$point did not restore the existing generic adapter"
@@ -112,6 +116,7 @@ done
 make_case success
 before1="$(tree_hash "$case_vault1")"
 before2="$(tree_hash "$case_vault2")"
+before3="$(tree_hash "$case_vault3")"
 hash="$(plan_hash standalone)"
 apply_output="$(upgrade_env "$cli" upgrade apply --all --host standalone --target "$version" \
   --plan-hash "$hash" --root "$case_vault1" --root "$case_vault2")"
@@ -122,12 +127,15 @@ contains_file "$receipt" $'receipt\ttarget_package_checksum\t'
 [ "$("$case_home/.local/bin/llm-brain" --version)" = "$version" ] || fail "standalone version verification failed"
 [ "$(cat "$case_vault1/projects/proj_schema_1/schema.version")" = 3 ] || fail "schema 1 was not upgraded"
 [ "$(cat "$case_vault2/projects/proj_schema_2/schema.version")" = 3 ] || fail "schema 2 was not upgraded"
+[ "$(cat "$case_vault3/projects/proj_schema_3/schema.version")" = 3 ] || fail "schema 3 changed version"
 cmp "$repo_root/adapters/generic.md" "$case_home/global/AGENTS.md" >/dev/null || fail "generic adapter was not installed"
 verify_hash1="$(tree_hash "$case_vault1")"
 verify_hash2="$(tree_hash "$case_vault2")"
+verify_hash3="$(tree_hash "$case_vault3")"
 upgrade_env "$cli" upgrade verify --receipt "$receipt" >/dev/null
 [ "$(tree_hash "$case_vault1")" = "$verify_hash1" ] || fail "upgrade verify mutated schema-1 vault"
 [ "$(tree_hash "$case_vault2")" = "$verify_hash2" ] || fail "upgrade verify mutated schema-2 vault"
+[ "$(tree_hash "$case_vault3")" = "$verify_hash3" ] || fail "upgrade verify mutated schema-3 vault"
 installed_plan="$(upgrade_env "$case_home/.local/bin/llm-brain" upgrade check --all --host standalone --target "$version" --root "$case_vault1" --root "$case_vault2" | sed -n 's/^plan_hash=//p')"
 printf '%s' "$installed_plan" | grep -Eq '^[a-f0-9]{64}$' || fail "installed standalone package root was not usable"
 drift_file="$case_vault1/projects/proj_schema_1/okf/project.md"
@@ -137,11 +145,13 @@ if upgrade_env "$cli" upgrade rollback --receipt "$receipt" >/dev/null 2>&1; the
   fail "explicit rollback accepted a drifted vault"
 fi
 [ "$(tree_hash "$case_vault2")" = "$verify_hash2" ] || fail "failed rollback changed an unaffected vault"
+[ "$(tree_hash "$case_vault3")" = "$verify_hash3" ] || fail "failed rollback changed schema-3 vault"
 cmp "$repo_root/adapters/generic.md" "$case_home/global/AGENTS.md" >/dev/null || fail "failed rollback changed the generic adapter"
 cp "$case_dir/project.before-rollback-drift" "$drift_file"
 upgrade_env "$cli" upgrade rollback --receipt "$receipt" >/dev/null
 [ "$(tree_hash "$case_vault1")" = "$before1" ] || fail "explicit rollback did not restore schema-1 vault"
 [ "$(tree_hash "$case_vault2")" = "$before2" ] || fail "explicit rollback did not restore schema-2 vault"
+[ "$(tree_hash "$case_vault3")" = "$before3" ] || fail "explicit rollback did not restore schema-3 vault"
 [ ! -L "$case_home/.local/bin/llm-brain" ] || fail "explicit rollback did not restore launcher"
 [ ! -e "$case_home/global/AGENTS.md" ] || fail "explicit rollback did not restore generic adapter"
 contains_file "$receipt" $'receipt\tstatus\trolled-back'
@@ -152,21 +162,21 @@ make_host_stub() {
   mkdir -p "$(dirname "$stub")" "$case_dir/current-package/skills/llm-brain/scripts"
   cp "$cli" "$case_dir/current-package/skills/llm-brain/scripts/llm-brain"
   chmod +x "$case_dir/current-package/skills/llm-brain/scripts/llm-brain"
-  printf '0.3.1\n' >"$case_dir/current-package/VERSION"
+  printf '0.5.3\n' >"$case_dir/current-package/VERSION"
   case "$host" in
     codex)
       mkdir -p "$case_dir/current-package/.codex-plugin"
-      printf '{"name":"llm-brain","version":"0.3.1"}\n' >"$case_dir/current-package/.codex-plugin/plugin.json"
+      printf '{"name":"llm-brain","version":"0.5.3"}\n' >"$case_dir/current-package/.codex-plugin/plugin.json"
       ;;
     claude)
       mkdir -p "$case_dir/current-package/.claude-plugin"
-      printf '{"name":"llm-brain","version":"0.3.1"}\n' >"$case_dir/current-package/.claude-plugin/plugin.json"
+      printf '{"name":"llm-brain","version":"0.5.3"}\n' >"$case_dir/current-package/.claude-plugin/plugin.json"
       ;;
     gemini)
       mkdir -p "$case_home/.gemini/extensions"
       mv "$case_dir/current-package" "$case_home/.gemini/extensions/llm-brain"
       LLM_BRAIN_TEST_PACKAGE_ROOT="$case_home/.gemini/extensions/llm-brain"
-      printf '{"name":"llm-brain","version":"0.3.1"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json"
+      printf '{"name":"llm-brain","version":"0.5.3"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json"
       printf '{"type":"git"}\n' >"$LLM_BRAIN_TEST_PACKAGE_ROOT/.gemini-extension-install.json"
       ;;
   esac
@@ -224,9 +234,9 @@ assert_host_commands() {
   [ "$(tree_hash "$case_vault1")" = "$before" ] || fail "$host failure changed vault"
   [ ! -e "$case_home/global/AGENTS.md" ] || fail "$host failure left generic adapter active"
   case "$host" in
-    codex) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/.codex-plugin/plugin.json" '"version":"0.3.1"' ;;
-    claude) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json" '"version":"0.3.1"' ;;
-    gemini) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json" '"version":"0.3.1"' ;;
+    codex) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/.codex-plugin/plugin.json" '"version":"0.5.3"' ;;
+    claude) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/.claude-plugin/plugin.json" '"version":"0.5.3"' ;;
+    gemini) contains_file "$LLM_BRAIN_TEST_PACKAGE_ROOT/gemini-extension.json" '"version":"0.5.3"' ;;
   esac
   case "$host:$source_type" in
     codex:local)
@@ -250,15 +260,15 @@ assert_host_commands claude local
 assert_host_commands gemini git
 
 make_case host-codex-git-cache-discovery
-cache_root="$case_home/.codex/plugins/cache/personal/llm-brain/0.3.1"
+cache_root="$case_home/.codex/plugins/cache/personal/llm-brain/0.5.3"
 mkdir -p "$case_dir/bin" "$cache_root/.codex-plugin" "$cache_root/skills/llm-brain/scripts"
 cp "$cli" "$cache_root/skills/llm-brain/scripts/llm-brain"
 chmod +x "$cache_root/skills/llm-brain/scripts/llm-brain"
-printf '0.3.1\n' >"$cache_root/VERSION"
-printf '{"name":"llm-brain","version":"0.3.1"}\n' >"$cache_root/.codex-plugin/plugin.json"
+printf '0.5.3\n' >"$cache_root/VERSION"
+printf '{"name":"llm-brain","version":"0.5.3"}\n' >"$cache_root/.codex-plugin/plugin.json"
 cat >"$case_dir/bin/codex" <<'STUB'
 #!/usr/bin/env bash
-printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"0.3.1","source":{"source":"git","url":"https://example.invalid/llm-brain.git"}}]}\n'
+printf '{"installed":[{"name":"llm-brain","marketplaceName":"personal","version":"0.5.3","source":{"source":"git","url":"https://example.invalid/llm-brain.git"}}]}\n'
 STUB
 chmod +x "$case_dir/bin/codex"
 PATH="$case_dir/bin:$PATH" upgrade_env "$cli" upgrade check --all --host codex --target "$version" >"$case_dir/cache.out"

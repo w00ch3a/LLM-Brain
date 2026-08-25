@@ -1,6 +1,6 @@
-# LLM-Brain v0.4 architecture reference
+# LLM-Brain v0.6 architecture reference
 
-LLM-Brain v0.4 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction.
+LLM-Brain v0.6.1 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction.
 
 ## Data layers
 
@@ -51,6 +51,18 @@ The `eval run` command writes a derived Markdown report and TSV trace under `eva
 
 Canonical records may carry optional temporal and lineage extensions: `brain_observed_at`, `brain_valid_from`, `brain_valid_to`, `brain_last_verified_at`, `brain_version_of`, `brain_derived_from` and `brain_authority_origin`. OKF `sources` remains the primary lineage field. Search applies known validity intervals only when current or as-of retrieval is requested; unknown intervals remain visible in historical mode. Provider or external-observation origin cannot silently increase source authority during automatic promotion.
 
+## State resolution and evidence independence
+
+`--intent current_state` is the only mode that resolves evolving state. It groups effective records by optional `brain_state_key`, honours validity intervals, retractions, deprecation, principal visibility, exact `brain_supersedes`/`brain_version_of` chains and `brain_depends_on` references. Lineage traversal is cycle-detected and capped at 32 hops. The resolver returns `current`, `unknown-validity`, `unresolved-conflict`, `unresolved-dependency`, `unresolved-inaccessible`, `invalid-cycle` or `historical`; factual and historical retrieval remain unchanged. Context packs and bridge context put anything other than `current` in a warning section. Missing validity is uncertainty, not an inferred date.
+
+For the selected top 20 results, derived custody, episode provenance and `brain_derived_from` references are followed to root hashes with an eight-level, cycle-safe bound. Records sharing a root are one evidence group; unknown provenance is unconfirmed. `--explain`, bridge JSON and packs expose `evidence_group`, `independent_source_count`, `correlated_record_count` and `provenance_state`. Restricted paths, titles and hashes are never added to visible explanations.
+
+## Commitment decisions and procedure capsules
+
+Candidate metadata can request `persist`, `use-now`, `reverify`, `ask` or `quarantine` with a reason, `brain_reverify_after` or clarification question. `LLM_BRAIN_COMMITMENT_POLICY` defaults to `shadow`: every accepted candidate receives a hash-bound derived `CommitmentDecision` under `reflection/commitments/`, while the existing promotion policy remains authoritative. `enforce` applies the transition gate (secret/custody/authority/staleness/conflict checks, then explicit action precedence); only custody, hashes, lineage, supersession and visibility are machine-verified. Semantic faithfulness remains a human concern. `use-now` is transient, `reverify`/`ask` are `needs-validation`, and quarantine never becomes canonical. Human review can override with an audited reason.
+
+`run prepare` creates an idempotent `ProcedureCapsule` under `runs/prepared/`. It requires declared target bindings, a visible current procedure, exact procedure hash, target/principal/task, evidence references and verification requirements. `run start --capsule` rechecks the procedure hash, visibility and state, applies capsule task/principal defaults and rejects conflicts. Capsules and runs are non-canonical; Hermes never executes or injects them automatically.
+
 ## Hermes and host bridges
 
 The standalone Hermes integration under `integrations/hermes/llm-brain/` uses
@@ -98,4 +110,4 @@ The public `upgrade` transaction:
 
 Codex package updates are source-aware. Git marketplaces use Codex's native marketplace refresh; local marketplaces are atomically replaced from the checksum-verified polyglot plugin archive before Codex refreshes its installed cache. Host inventory failures abort detection instead of silently falling back to a different installation type.
 
-Package v0.5.2 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No daemon or background scheduler exists.
+Package v0.6.1 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. No schema migration, daemon, model training, KV-cache integration or graph database is introduced.

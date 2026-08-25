@@ -247,6 +247,26 @@ def concept_issues(metadata: dict[str, Any], body: str) -> list[str]:
         values = derived_from if isinstance(derived_from, list) else [derived_from]
         if not values or not all(isinstance(value, str) and value.strip() for value in values):
             issues.append("brain_derived_from must contain non-empty references")
+    state_key = metadata.get("brain_state_key")
+    if state_key is not None and (not isinstance(state_key, str) or not state_key.strip()):
+        issues.append("brain_state_key must be a non-empty string")
+    depends_on = metadata.get("brain_depends_on")
+    if depends_on is not None:
+        values = depends_on if isinstance(depends_on, list) else [depends_on]
+        if not values or not all(isinstance(value, str) and value.strip() for value in values):
+            issues.append("brain_depends_on must contain non-empty references")
+    required_bindings = metadata.get("brain_required_bindings")
+    if required_bindings is not None and (
+        not isinstance(required_bindings, str) or not required_bindings.strip()
+    ):
+        issues.append("brain_required_bindings must be a non-empty string")
+    commitment = metadata.get("brain_commitment_action")
+    if commitment is not None and commitment not in {
+        "persist", "use-now", "reverify", "ask", "quarantine", "undetermined"
+    }:
+        issues.append("brain_commitment_action is not recognised")
+    if "brain_reverify_after" in metadata and not valid_datetime(metadata["brain_reverify_after"]):
+        issues.append("brain_reverify_after must be an ISO 8601 datetime with timezone")
     if "brain_authority_origin" in metadata and metadata["brain_authority_origin"] not in {
         "human-directive",
         "repository",

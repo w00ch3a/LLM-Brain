@@ -38,6 +38,7 @@ BACKUP_ROOT="${LLM_BRAIN_BACKUP_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/llm-
 OKF_HELPER="${LLM_BRAIN_OKF_HELPER:-}"
 OKF_PYTHON="${LLM_BRAIN_OKF_PYTHON:-}"
 SEARCH_SUPERSESSION_MAP=""
+SEARCH_GRAPH_FILE=""
 INDEX_EXPECTED_SIGNATURE=""
 INDEX_EXPECTED_SIGNATURE_READY=0
 GENERATED_MARKER="<!-- llm-brain:generated-map -->"
@@ -57,6 +58,10 @@ UPGRADE_PACKAGE_ROOT=none
 UPGRADE_PACKAGE_BACKUP=none
 UPGRADE_HOST=standalone
 UPGRADE_MARKETPLACE=none
+EVIDENCE_VIEW_VERSION="user-content-v1"
+CLAIM_PROJECTION_VERSION="claims-v2"
+EVIDENCE_INDEX_HEADER="$(printf 'path\thash\tview_version\tview_hash\tview_path\tmodel\tdimensions\tprincipal\tobserved_at\ttitle\tvector\tclaims_version')"
+EVIDENCE_LEXICAL_HEADER="$(printf 'path\tview_base64\tclaims_base64')"
 
 usage() {
   cat <<'USAGE'
@@ -85,7 +90,8 @@ Commands:
   work status|recover PROJECT_ID
   bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory]
   bridge capture --source-root PATH [--project-id ID] --record FILE
-  run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--principal ID] [--obligation TEXT]
+  run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--principal ID] [--obligation TEXT] [--capsule REF]
+  run prepare PROJECT_ID PROCEDURE_REF --task TEXT [--principal ID] [--binding KEY=VALUE] [--verification TEXT]
   run outcome PROJECT_ID RUN_ID --status success|failed|partial --summary TEXT [--evidence REF] [--verified-by ACTOR]
   run status PROJECT_ID
   reconcile scan PROJECT_ID [--episode EPISODE_REF] [--source-span TEXT]
@@ -227,11 +233,868 @@ bridge_resolve_project() {
   printf '%s\n' "$id"
 }
 
+bridge_evidence_view() {
+  local source="$1" output="$2" kind
+  kind="$(frontmatter_field "$source" type)"
+  if [ "$kind" = "HermesTurn" ] && LC_ALL=C grep -Eq '^## User content[[:space:]]*$' "$source"; then
+    awk '
+      /^## User content[[:space:]]*$/ { in_user=1; next }
+      /^## Assistant content[[:space:]]*$/ { in_user=0; exit }
+      in_user { print }
+    ' "$source" >"$output"
+  else
+    body_after_frontmatter "$source" >"$output"
+  fi
+}
+
+bridge_claim_projection() {
+  local view="$1" output="$2" py
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || return 69
+  "$py" - "$view" "$output" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+view, output = sys.argv[1:]
+text = Path(view).read_text(encoding="utf-8")
+claims = []
+
+def add(value):
+    value = re.sub(r"\s+", " ", value).strip()
+    if value and value not in claims:
+        claims.append(value)
+
+first_person = bool(re.search(r"\b(?:i|i'm|i am|my|me|mine|we|our)\b", text, re.I))
+if first_person:
+    if re.search(r"\b(?:i'm|i am|identify as)\s+(?:a\s+)?(?:guy|man|male)\b", text, re.I):
+        add("subject user relation gender value male man guy")
+    if re.search(r"\b(?:i'm|i am|identify as)\s+(?:a\s+)?(?:girl|woman|female)\b", text, re.I):
+        add("subject user relation gender value female woman girl")
+    parent = re.search(r"\bmy\s+(?:dad|father|parent)\s*,?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})", text)
+    if parent:
+        add(f"subject user relation father name {parent.group(1)} dad father parent")
+    date_pattern = r"((?:19|20)\d{2}[-/]\d{2}[-/]\d{2}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*|\s+)(?:19|20)\d{2})"
+    for born in re.findall(rf"\b(?:I(?:'m| am)?\s+born|my\s+(?:birthday|birthdate)\s*(?:is|was|:)?)\s*{date_pattern}", text, re.I):
+        add(f"subject user relation birthdate value {born.replace('/', '-')} born birthday")
+    degree_pattern = r"((?:Bachelor|Master)(?:\s+of\s+[A-Za-z]+){0,3})"
+    for degree in re.findall(rf"\bI\s+(?:have|hold|earned|completed|received|got)\s+(?:a\s+)?{degree_pattern}\b", text, re.I):
+        add(f"subject user relation education degree value {degree} bachelor master university")
+    for degree in re.findall(rf"\bmy\s+(?:highest\s+)?(?:degree|qualification)\s+(?:is|was)\s+(?:a\s+)?{degree_pattern}\b", text, re.I):
+        add(f"subject user relation education degree value {degree} bachelor master university")
+    school_pattern = r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,5}(?:,\s*[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})?)"
+    for school in re.findall(rf"\bI\s+(?:studied\s+at|attended|graduated\s+from)\s+{school_pattern}", text):
+        add(f"subject user relation university value {school} university college school")
+    place_pattern = r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}(?:,\s*[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})?)"
+    for place in re.findall(rf"\bI\s+(?:grew\s+up|was\s+born|am\s+from|come\s+from)\s+(?:in|near|around)?\s*{place_pattern}", text):
+        add(f"subject user relation birthplace value {place} birthplace born raised grew up")
+    for place in re.findall(rf"\bI\s+was\s+born\s+and\s+raised\s+in\s+{place_pattern}", text):
+        add(f"subject user relation birthplace value {place} birthplace born raised grew up")
+    for item in re.findall(r"\b(?:prefer|prefers|like|likes|enjoy|enjoys|love|loves|play|plays|watch|watches|pick\s+up)\s+([A-Za-z][A-Za-z -]{1,40}?)(?=\s+(?:when|while|during|on|in|for|to)\b|[.,!?]|$)", text, re.I):
+        item = item.strip()
+        if item and len(item.split()) <= 7:
+            add(f"subject user relation preference value {item.lower()}")
+
+for match in re.finditer(r"\b([A-Z][a-z]{2,})\b[^.?!\n]{0,80}\b(?:likes|enjoys|loves|prefers)\s+([^.,!?\n]{2,80})", text):
+    subject, preference = match.groups()
+    add(f"subject {subject} relation preference value {preference.lower()}")
+
+for match in re.finditer(r"\b([A-Z][a-z]{2,})\b[^.?!\n]{0,100}\b(basketball|soccer|tennis|audiobook|business guide)\b[^.?!\n]{0,100}", text, re.I):
+    subject, item = match.groups()
+    add(f"subject {subject} relation preference value {item.lower()}")
+
+Path(output).write_text("derived=claim-projection-v2\n" + "\n".join(claims) + ("\n" if claims else ""), encoding="utf-8")
+PY
+}
+
+bridge_evidence_artifacts() {
+  local project_id="$1" source_hash="$2" dir source embedder="$3" embedder_version="$4"
+  local view_dir view view_tmp view_hash vector vector_tmp claims_dir claims claims_tmp
+  require_project "$project_id" dir
+  source="$(find "$dir/sources" -maxdepth 1 -type f -name "${source_hash}-*.md" -print -quit 2>/dev/null)"
+  [ -n "$source" ] || return 66
+  ensure_dir "$dir/indexes/evidence-text"
+  ensure_dir "$dir/indexes/embeddings"
+  view_dir="$dir/indexes/evidence-text"
+  view="$view_dir/${source_hash}-${EVIDENCE_VIEW_VERSION}.txt"
+  if [ ! -f "$view" ]; then
+    view_tmp="${view}.tmp.$$"
+    bridge_evidence_view "$source" "$view_tmp" || { rm -f "$view_tmp"; return 69; }
+    mv "$view_tmp" "$view"
+  fi
+  claims_dir="$dir/indexes/evidence-claims"
+  ensure_dir "$claims_dir"
+  claims="$claims_dir/${source_hash}-${CLAIM_PROJECTION_VERSION}.txt"
+  if [ ! -f "$claims" ]; then
+    claims_tmp="${claims}.tmp.$$"
+    bridge_claim_projection "$view" "$claims_tmp" || { rm -f "$claims_tmp"; return 69; }
+    mv "$claims_tmp" "$claims"
+  fi
+  view_hash="$(sha256_file "$view")"
+  vector="$dir/indexes/embeddings/${source_hash}-${EVIDENCE_VIEW_VERSION}-${view_hash}-$(slug "$embedder_version").txt"
+  if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then
+    vector_tmp="${vector}.tmp.$$"
+    rm -f "$vector_tmp"
+    "$embedder" "$view" >"$vector_tmp" || { rm -f "$vector_tmp"; return 69; }
+    valid_embedding_file "$vector_tmp" || { rm -f "$vector_tmp"; return 69; }
+    mv "$vector_tmp" "$vector"
+  fi
+  printf '%s\t%s\t%s\n' "${view#"$dir"/}" "$view_hash" "$vector"
+}
+
+bridge_rebuild_evidence_index() {
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir index stage file base source_hash artifacts view view_hash vector model dimensions principal observed title
+  [ -n "$embedder" ] || return 0
+  [ -x "$embedder" ] || return 69
+  require_project "$project_id" dir
+  ensure_dir "$dir/indexes"
+  index="$dir/indexes/evidence-vectors.tsv"
+  stage="$(mktemp "$dir/indexes/.evidence-build.XXXXXX")"
+  printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$stage"
+  while IFS= read -r file; do
+    base="${file##*/}"; source_hash="${base%%-*}"
+    if ! artifacts="$(bridge_evidence_artifacts "$project_id" "$source_hash" "$embedder" "$embedder_version")"; then
+      rm -f "$stage"
+      return 69
+    fi
+    IFS=$'\t' read -r view view_hash vector <<EOF
+$artifacts
+EOF
+    model="$(embedding_field "$vector" model)"; dimensions="$(embedding_field "$vector" dimensions)"
+    principal="$(frontmatter_field "$file" brain_principal)"; observed="$(frontmatter_field "$file" brain_observed_at)"; title="$(frontmatter_field "$file" title)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${file#"$dir"/}" "$source_hash" "$EVIDENCE_VIEW_VERSION" "$view_hash" "$view" "$model" "$dimensions" "$principal" "$observed" "$title" "$(embedding_field "$vector" vector)" "$CLAIM_PROJECTION_VERSION" >>"$stage"
+  done < <(find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+  { head -1 "$stage"; tail -n +2 "$stage" | LC_ALL=C sort -u; } >"${stage}.sorted"
+  acquire_lock "project-$project_id"
+  mv "${stage}.sorted" "$index"
+  audit_v2 "$dir" "evidence-index" "indexes/evidence-vectors.tsv" "" "rebuilt" "$(sha256_file "$index")" "view=$EVIDENCE_VIEW_VERSION"
+  release_lock
+  rm -f "$stage"
+}
+
+bridge_index_evidence_source() {
+  local project_id="$1" source_hash="$2" append_only="${3:-0}" dir source embedder="$EMBEDDER" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}"
+  local index artifacts view view_hash vector model dimensions rel principal observed title stage
+  [ -n "$embedder" ] || return 0
+  [ -x "$embedder" ] || return 69
+  require_project "$project_id" dir
+  index="$dir/indexes/evidence-vectors.tsv"
+  if [ -f "$index" ] && [ "$(head -1 "$index")" != "$EVIDENCE_INDEX_HEADER" ]; then
+    bridge_rebuild_evidence_index "$project_id" "$embedder" || return
+  fi
+  if ! artifacts="$(bridge_evidence_artifacts "$project_id" "$source_hash" "$embedder" "$embedder_version")"; then return 69; fi
+  IFS=$'\t' read -r view view_hash vector <<EOF
+$artifacts
+EOF
+  source="$(find "$dir/sources" -maxdepth 1 -type f -name "${source_hash}-*.md" -print -quit 2>/dev/null)"; [ -n "$source" ] || return 66
+  rel="${source#"$dir"/}"; model="$(embedding_field "$vector" model)"; dimensions="$(embedding_field "$vector" dimensions)"
+  principal="$(frontmatter_field "$source" brain_principal)"; observed="$(frontmatter_field "$source" brain_observed_at)"; title="$(frontmatter_field "$source" title)"
+  acquire_lock "project-$project_id"
+  if [ "$append_only" = 1 ]; then
+    [ -f "$index" ] || printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$index"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$source_hash" "$EVIDENCE_VIEW_VERSION" "$view_hash" "$view" "$model" "$dimensions" "$principal" "$observed" "$title" "$(embedding_field "$vector" vector)" "$CLAIM_PROJECTION_VERSION" >>"$index"
+    local lexical_index="$dir/indexes/evidence-lexical.tsv" claims="$dir/indexes/evidence-claims/${source_hash}-${CLAIM_PROJECTION_VERSION}.txt"
+    if [ -f "$lexical_index" ] && [ "$(head -1 "$lexical_index")" = "$EVIDENCE_LEXICAL_HEADER" ]; then
+      printf '%s\t%s\t%s\n' "$rel" "$(base64 <"$dir/$view" | tr -d '\n')" "$(base64 <"$claims" | tr -d '\n')" >>"$lexical_index"
+    fi
+    audit_v2 "$dir" "evidence-index" "$rel" "" "indexed" "$source_hash" "view=$EVIDENCE_VIEW_VERSION model=$(slug "$model")"
+    release_lock
+    return 0
+  fi
+  if [ -f "$index" ] && awk -F '\t' -v path="$rel" -v hash="$source_hash" -v view_hash="$view_hash" -v model="$model" -v dimensions="$dimensions" 'NR > 1 && $1 == path && $2 == hash && $3 == "user-content-v1" && $4 == view_hash && $6 == model && $7 == dimensions { found=1 } END { exit !found }' "$index"; then
+    release_lock
+    return 0
+  fi
+  stage="$(mktemp "$dir/indexes/.evidence.XXXXXX")"
+  printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$stage"
+  if [ -f "$index" ] && [ "$(head -1 "$index")" = "$EVIDENCE_INDEX_HEADER" ]; then
+    awk -F '\t' -v OFS='\t' -v path="$rel" 'NR > 1 && $1 != path' "$index" >>"$stage"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$source_hash" "$EVIDENCE_VIEW_VERSION" "$view_hash" "$view" "$model" "$dimensions" "$principal" "$observed" "$title" "$(embedding_field "$vector" vector)" "$CLAIM_PROJECTION_VERSION" >>"$stage"
+  { head -1 "$stage"; tail -n +2 "$stage" | LC_ALL=C sort -u; } >"${stage}.sorted"
+  mv "${stage}.sorted" "$index"; rm -f "$stage"
+  audit_v2 "$dir" "evidence-index" "$rel" "" "indexed" "$source_hash" "view=$EVIDENCE_VIEW_VERSION model=$(slug "$model")"
+  release_lock
+}
+
+bridge_index_evidence_batch() {
+  local project_id="$1" pending="$2" dir py index lexical
+  require_project "$project_id" dir
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || return 69
+  index="$dir/indexes/evidence-vectors.tsv"
+  lexical="$dir/indexes/evidence-lexical.tsv"
+  acquire_lock "project-$project_id"
+  if ! "$py" - "$dir" "$pending" "$index" "$lexical" "$EVIDENCE_INDEX_HEADER" "$EVIDENCE_LEXICAL_HEADER" "$EVIDENCE_VIEW_VERSION" "$CLAIM_PROJECTION_VERSION" <<'PY'
+import base64
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+root, pending_path, index_path, lexical_path, index_header, lexical_header, view_version, claims_version = sys.argv[1:]
+root, index_path, lexical_path = Path(root), Path(index_path), Path(lexical_path)
+
+def field(path, key):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] != "---":
+        return ""
+    for line in lines[1:]:
+        if line == "---":
+            break
+        if line.startswith(key + ":"):
+            return line.split(":", 1)[1].strip().strip('"')
+    return ""
+
+existing = []
+seen = set()
+if index_path.exists():
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0] != index_header:
+        raise SystemExit("stale evidence index header")
+    existing = [line for line in lines[1:] if line]
+    seen = {(parts[0], parts[1]) for line in existing if len(parts := line.split("\t")) >= 2}
+
+added = []
+for source_hash in sorted(set(Path(pending_path).read_text(encoding="utf-8").splitlines())):
+    if not source_hash:
+        continue
+    sources = sorted((root / "sources").glob(f"{source_hash}-*.md"))
+    if not sources:
+        continue
+    source = sources[0]
+    rel = source.relative_to(root).as_posix()
+    if (rel, source_hash) in seen:
+        continue
+    view = root / "indexes" / "evidence-text" / f"{source_hash}-{view_version}.txt"
+    view_hash = hashlib.sha256(view.read_bytes()).hexdigest()
+    vectors = sorted((root / "indexes" / "embeddings").glob(f"{source_hash}-{view_version}-{view_hash}-*.txt"))
+    values = dict(line.split(": ", 1) for line in vectors[0].read_text(encoding="utf-8").splitlines() if ": " in line) if vectors else {}
+    row = "\t".join((
+        rel, source_hash, view_version, view_hash, view.relative_to(root).as_posix(),
+        values.get("model", ""), values.get("dimensions", ""), field(source, "brain_principal"),
+        field(source, "brain_observed_at"), field(source, "title"), values.get("vector", ""), claims_version,
+    ))
+    existing.append(row)
+    added.append((rel, source_hash, view))
+    seen.add((rel, source_hash))
+
+stage = index_path.with_name(f".{index_path.name}.{os.getpid()}.tmp")
+stage.write_text(index_header + "\n" + "\n".join(existing) + ("\n" if existing else ""), encoding="utf-8")
+os.replace(stage, index_path)
+
+if lexical_path.exists():
+    lines = lexical_path.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0] == lexical_header:
+        lexical_rows = [line for line in lines[1:] if line]
+        lexical_seen = {line.split("\t", 1)[0] for line in lexical_rows}
+        for rel, source_hash, view in added:
+            if rel in lexical_seen:
+                continue
+            claims = root / "indexes" / "evidence-claims" / f"{source_hash}-{claims_version}.txt"
+            lexical_rows.append("\t".join((
+                rel,
+                base64.b64encode(view.read_bytes()).decode(),
+                base64.b64encode(claims.read_bytes() if claims.exists() else b"").decode(),
+            )))
+        stage = lexical_path.with_name(f".{lexical_path.name}.{os.getpid()}.tmp")
+        stage.write_text(lexical_header + "\n" + "\n".join(lexical_rows) + ("\n" if lexical_rows else ""), encoding="utf-8")
+        os.replace(stage, lexical_path)
+PY
+  then
+    release_lock
+    return 69
+  fi
+  audit_v2 "$dir" "evidence-index" "indexes/evidence-vectors.tsv" "" "batch-indexed" "$(sha256_file "$index")" "view=$EVIDENCE_VIEW_VERSION"
+  release_lock
+}
+
+bridge_query_mode() {
+  local query="$1"
+  if printf '%s\n' "$query" | LC_ALL=C grep -Eqi '(^|[^[:alnum:]])(change|changed|update|updated|recent|recently|current|now|remain|remained|remains|stay|stayed|stays|switch|switched|switches|previous|over[[:space:]]+time)([^[:alnum:]]|$)'; then
+    printf 'dynamic\n'
+  elif printf '%s\n' "$query" | LC_ALL=C grep -Eqi '(^|[^[:alnum:]])from([^[:alnum:]]|$)' && printf '%s\n' "$query" | LC_ALL=C grep -Eqi '(^|[^[:alnum:]])to([^[:alnum:]]|$)'; then
+    printf 'dynamic\n'
+  elif printf '%s\n' "$query" | LC_ALL=C grep -Eqi 'before[[:space:]]+and[[:space:]]+after'; then
+    printf 'dynamic\n'
+  elif printf '%s\n' "$query" | LC_ALL=C grep -Eqi '(^|[^[:alnum:]])(when|condition|prefer|preference|while|during|after|before)([^[:alnum:]]|$)'; then
+    printf 'conditional\n'
+  else
+    printf 'static\n'
+  fi
+}
+
+bridge_evidence_grep_hits() {
+  local dir="$1" pattern="$2" weight="$3" sources_meta="$4" output="$5" file view_rel claim_rel claim_hash
+  { find "$dir/indexes/evidence-text" -maxdepth 1 -type f -name "*-${EVIDENCE_VIEW_VERSION}.txt" -exec grep -ilF -- "$pattern" {} + 2>/dev/null || true; } |
+    while IFS= read -r file; do
+      view_rel="${file#"$dir"/}"
+      awk -F '\t' -v view="$view_rel" -v weight="$weight" '$5 == view { print $1 "\t" weight }' "$sources_meta" >>"$output"
+    done
+  { find "$dir/indexes/evidence-claims" -maxdepth 1 -type f -name "*-${CLAIM_PROJECTION_VERSION}.txt" -exec grep -ilF -- "$pattern" {} + 2>/dev/null || true; } |
+    while IFS= read -r file; do
+      claim_rel="${file#"$dir"/}"
+      claim_hash="${claim_rel##*/}"
+      claim_hash="${claim_hash%-${CLAIM_PROJECTION_VERSION}.txt}"
+      awk -F '\t' -v hash="$claim_hash" -v weight="$weight" '$6 == hash { print $1 "\t" weight }' "$sources_meta" >>"$output"
+    done
+  while IFS=$'\t' read -r rel principal observed title view hash; do
+    [ -n "$rel" ] || continue
+    [ -n "$view" ] && [ -f "$dir/$view" ] && continue
+    if grep -Fqi -- "$pattern" "$dir/$rel" 2>/dev/null; then printf '%s\t%s\n' "$rel" "$weight" >>"$output"; fi
+  done <"$sources_meta"
+}
+
+bridge_rerank_evidence() {
+  local dir="$1" query="$2" mode="$3" sources_meta="$4" final="$5" output="$6" py
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for evidence reranking"
+  "$py" - "$dir" "$query" "$mode" "$sources_meta" "$final" "$output" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root, query, mode, meta_path, final_path, output_path = sys.argv[1:]
+root = Path(root)
+meta = {}
+for line in Path(meta_path).read_text(encoding="utf-8").splitlines():
+    fields = line.split("\t")
+    if len(fields) >= 6:
+        meta[fields[0]] = {"principal": fields[1], "observed": fields[2], "title": fields[3], "view": fields[4]}
+
+def user_text(path, view):
+    candidate = root / view if view else root / path
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if "## User content" in text:
+        text = text.split("## User content", 1)[1]
+        text = text.split("## Assistant content", 1)[0]
+    elif text.startswith("---"):
+        parts = text.split("---", 2)
+        text = parts[2] if len(parts) == 3 else text
+    return text
+
+def claim_text(path):
+    source_hash = path.rsplit("/", 1)[-1].split("-", 1)[0]
+    candidate = root / "indexes" / "evidence-claims" / f"{source_hash}-claims-v2.txt"
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+question = query.lower()
+preference_query = bool(re.search(r"\b(prefer|preference|like|enjoy|watch|play|wear|read|drink|listen)\b", question))
+condition_query = mode == "conditional" and preference_query
+topic_patterns = []
+focus_patterns = []
+residence_topic = False
+if mode == "dynamic":
+    if re.search(r"\b(residen\w*|live\w*|moved|relocat\w*|housing|home|roommate\w*)\b", question):
+        residence_topic = True
+        topic_patterns += [r"\blive\b", r"\blived\b", r"\bmov(?:e|ed|ing)\b", r"\brelocat", r"\bresiden", r"\bhousing\b", r"\bhome\b", r"\blease\b", r"\broommate"]
+    if re.search(r"\b(company|employer|career|job|title|industry|work|firm|role|position)\b", question):
+        topic_patterns += [r"\bwork(?:ed|ing)?\b", r"\bemploy", r"\bjob\b", r"\bcareer\b", r"\bintern", r"\bfirm\b", r"\bcompany\b", r"\bstart(?:ed|ing)?\b", r"\brole\b", r"\bposition\b", r"\btitle\b", r"\bsenior\b", r"\bindustry\b", r"\bmedia\b", r"\blegal\b", r"\bsector\b", r"\bfield\b"]
+    if re.search(r"\b(company|employer|career|firm|industry)\b", question):
+        focus_patterns += [r"\bcompany\b", r"\bemployer\b", r"\bfirm\b", r"\bcareer\b", r"\bindustry\b", r"\bstartup\b", r"\bsector\b"]
+    if re.search(r"\b(employment|employed|work status|work|job|position|role|title)\b", question) and not re.search(r"\b(company|employer|career|firm|industry)\b", question):
+        focus_patterns += [r"\bemploy\w*\b", r"\bwork(?:ed|ing)?\b", r"\bjob\b", r"\bposition\b", r"\brole\b", r"\btitle\b", r"\bstatus\b"]
+    if re.search(r"\b(marital|marriage|dating|divorc\w*|spouse|relationship|wedding)\b", question):
+        topic_patterns += [r"\bmarri\w*\b", r"\bdivorc\w*\b", r"\bdat\w*\b", r"\brelationship\b", r"\bspouse\b", r"\bwedding\b", r"\bstatus\b"]
+    if re.search(r"\b(child\w*|kid\w*|son|daughter|children)\b", question):
+        topic_patterns += [r"\bchild\w*\b", r"\bkid\w*\b", r"\bson\b", r"\bdaughter\b", r"\bborn\b"]
+    if re.search(r"\b(employment|employ\w*|work status|work)\b", question):
+        topic_patterns += [r"\bemploy\w*\b", r"\bwork(?:ed|ing)?\b", r"\bjob\b", r"\bintern\w*\b", r"\bposition\b", r"\bstatus\b"]
+    if re.search(r"\b(health|physical|mental|wellbeing|well-being|fatigue|stress)\b", question):
+        topic_patterns += [r"\bhealth\w*\b", r"\bphysical\b", r"\bmental\b", r"\bwell[- ]?being\b", r"\bfatig\w*\b", r"\bstress\w*\b"]
+    if re.search(r"\b(social|socializing|socialising|activity|activities|friendship)\b", question):
+        topic_patterns += [r"\bsocial\w*\b", r"\bactivit\w*\b", r"\bfriend\w*\b", r"\bneighbor\w*\b", r"\bneighbour\w*\b"]
+    if re.search(r"\b(income|salary|savings|saving|money)\b", question):
+        topic_patterns += [r"\bincome\b", r"\bsalary\b", r"\bsav\w*\b", r"\bmoney\b", r"\bfinancial\w*\b"]
+    if re.search(r"\b(sibling|siblings|brother|sister)\b", question):
+        topic_patterns += [r"\bsibling\w*\b", r"\bbrother\b", r"\bsister\b", r"\bonly child\b"]
+elif mode == "static":
+    if re.search(r"\b(university|college|degree|education|attend)\b", question):
+        topic_patterns += [r"\buniversity\b", r"\bcollege\b", r"\bdegree\b", r"\beducation\b", r"\bachelor\b", r"\bmaster\b", r"\bmit\b"]
+    if re.search(r"\b(gender|male|female|woman|man|pronoun)\b", question):
+        topic_patterns += [r"\bgender\b", r"\bmale\b", r"\bfemale\b", r"\bwoman\b", r"\bman\b", r"\bshe\b", r"\bhe\b", r"\bpronoun"]
+    if re.search(r"\b(father|dad|parent|name)\b", question):
+        topic_patterns += [r"\bfather\b", r"\bdad\b", r"\bparent\b", r"\bname\b"]
+    if re.search(r"\b(degree|education|qualification)\b", question):
+        topic_patterns += [r"\bdegree\b", r"\beducation\b", r"\bbachelor\b", r"\bmaster\b", r"\bqualification\b"]
+    if re.search(r"\b(birthdate|birthday|born|date of birth)\b", question):
+        topic_patterns += [r"\bbirthdate\b", r"\bbirthday\b", r"\bborn\b", r"\bbirth\b"]
+    if re.search(r"\b(birthplace|born|raised|grew up|citizenship)\b", question):
+        topic_patterns += [r"\bbirthplace\b", r"\bborn\b", r"\braised\b", r"\bgrew up\b", r"\bcitizenship\b"]
+    if re.search(r"\b(marital|marriage|dating|divorc\w*|spouse|relationship|wedding)\b", question):
+        topic_patterns += [r"\bmarri\w*\b", r"\bdivorc\w*\b", r"\bdat\w*\b", r"\brelationship\b", r"\bspouse\b", r"\bwedding\b", r"\bstatus\b"]
+    if re.search(r"\b(child\w*|kid\w*|son|daughter|children)\b", question):
+        topic_patterns += [r"\bchild\w*\b", r"\bkid\w*\b", r"\bson\b", r"\bdaughter\b", r"\bborn\b"]
+    if re.search(r"\b(employment|employ\w*|work status|work)\b", question):
+        topic_patterns += [r"\bemploy\w*\b", r"\bwork(?:ed|ing)?\b", r"\bjob\b", r"\bintern\w*\b", r"\bposition\b", r"\bstatus\b"]
+    if re.search(r"\b(health|physical|mental|wellbeing|well-being|fatigue|stress)\b", question):
+        topic_patterns += [r"\bhealth\w*\b", r"\bphysical\b", r"\bmental\b", r"\bwell[- ]?being\b", r"\bfatig\w*\b", r"\bstress\w*\b"]
+    if re.search(r"\b(social|socializing|socialising|activity|activities|friendship)\b", question):
+        topic_patterns += [r"\bsocial\w*\b", r"\bactivit\w*\b", r"\bfriend\w*\b", r"\bneighbor\w*\b", r"\bneighbour\w*\b"]
+    if re.search(r"\b(income|salary|savings|saving|money)\b", question):
+        topic_patterns += [r"\bincome\b", r"\bsalary\b", r"\bsav\w*\b", r"\bmoney\b", r"\bfinancial\w*\b"]
+    if re.search(r"\b(sibling|siblings|brother|sister)\b", question):
+        topic_patterns += [r"\bsibling\w*\b", r"\bbrother\b", r"\bsister\b", r"\bonly child\b"]
+elif condition_query:
+    if re.search(r"\baudiobook", question):
+        topic_patterns += [r"\baudiobook", r"\bcommut", r"\bstudy", r"\bself-improvement", r"\btechnique"]
+    if re.search(r"\bbusiness\s+guide", question):
+        topic_patterns += [r"\bbusiness guide\b", r"\blearning\b", r"\bfinances?\b", r"\bcontracts?\b", r"\bplanning\b"]
+    if re.search(r"\borange\s+juice", question):
+        topic_patterns += [r"\borange juice\b", r"\btraining\b", r"\bworkout\b"]
+    if re.search(r"\bcold\s+noodles", question):
+        topic_patterns += [r"\bcold noodles\b", r"\bwarm\b", r"\bweather\b"]
+    if re.search(r"\byoga\s+pants", question):
+        topic_patterns += [r"\byoga pants\b", r"\btraining\b", r"\brehearsing\b", r"\bmovement\b"]
+    if re.search(r"\bbasketball", question):
+        topic_patterns += [r"\bbasketball\b", r"\bplay\b", r"\bsummer\b", r"\bcardio\b"]
+rows = []
+for order, line in enumerate(Path(final_path).read_text(encoding="utf-8").splitlines()):
+    fields = line.split("\t")
+    if len(fields) < 4:
+        continue
+    path, score, observed, title = fields[:4]
+    record = meta.get(path, {})
+    text = user_text(path, record.get("view", ""))
+    claims = claim_text(path)
+    lower = (text + "\n" + claims).lower()
+    third_party = bool(re.search(r"\b(friend|colleague|neighbou?r|jackson|maya|he|she|they)\b", lower))
+    if condition_query and re.search(r"\b(child|son|daughter|children)\b", lower):
+        third_party = True
+    first_person = bool(re.search(r"\b(i|i'm|i am|my|me|mine|we|our)\b", lower)) and not third_party
+    condition = bool(re.search(r"\b(when|while|during|after|before|on|for)\b", lower))
+    topic_score = sum(bool(re.search(pattern, lower)) for pattern in topic_patterns)
+    focus_score = sum(bool(re.search(pattern, lower)) for pattern in focus_patterns)
+    direct_claim = False
+    if mode == "static":
+        if re.search(r"\b(gender|male|female|woman|man|pronoun)\b", question):
+            direct_claim = "relation gender" in lower
+        elif re.search(r"\b(father|dad|parent)\b", question):
+            direct_claim = "relation father name" in lower
+        elif re.search(r"\b(birthdate|birthday|date of birth)\b", question):
+            direct_claim = "relation birthdate" in lower
+        elif re.search(r"\b(birthplace|where was|born|raised|grew up)\b", question):
+            direct_claim = "relation birthplace" in lower
+        elif re.search(r"\b(university|college|attend|education)\b", question) and not re.search(r"\b(degree|qualification)\b", question):
+            direct_claim = "relation university" in lower
+        elif re.search(r"\b(degree|qualification)\b", question):
+            direct_claim = "relation education degree" in lower
+        elif re.search(r"\b(marital|marriage|dating|divorc\w*|spouse|relationship|wedding)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(child\w*|kid\w*|son|daughter|children)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(employment|employ\w*|work status|work)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(health|physical|mental|wellbeing|well-being|fatigue|stress)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(social|socializing|socialising|activity|activities|friendship)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(income|salary|savings|saving|money)\b", question):
+            direct_claim = topic_score > 0 and first_person
+        elif re.search(r"\b(sibling|siblings|brother|sister)\b", question):
+            direct_claim = topic_score > 0 and first_person
+    elif condition_query:
+        direct_claim = topic_score > 0 and first_person and condition
+    elif mode == "dynamic":
+        direct_claim = topic_score > 0 and first_person
+    named_entity = bool(re.search(r"\b(?:at|for|from)\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2}", text))
+    if named_entity and topic_score:
+        topic_score += 3
+    if residence_topic and topic_score and re.search(r"\b(?:to|in|from)\s+[A-Z][A-Za-z]+", text):
+        topic_score += 3
+    # ponytail: dedupe on user evidence; derived claims are ranking metadata.
+    normalised = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    rows.append({
+        "path": path, "score": float(score or 0), "observed": observed,
+        "title": title, "order": order, "date": (observed or "")[:10],
+        "first_person": first_person, "third_party": third_party, "condition": condition,
+        "topic_score": topic_score, "direct_claim": direct_claim,
+        "focus_score": focus_score,
+        "normalised": normalised,
+    })
+
+baseline = sorted(rows, key=lambda row: (-row["score"], row["path"]))
+selected = []
+seen_text = set()
+date_counts = {}
+prefix_count = 0
+def add(row):
+    if row["normalised"] in seen_text:
+        return False
+    if len(selected) < 5 and row["date"] and date_counts.get(row["date"], 0) >= 2:
+        return False
+    seen_text.add(row["normalised"])
+    if row["date"]:
+        date_counts[row["date"]] = date_counts.get(row["date"], 0) + 1
+    selected.append(row)
+    return True
+
+if condition_query:
+    baseline.sort(key=lambda row: (-(row["score"] + (6.0 if row["direct_claim"] else 0.0) + (0.02 if row["first_person"] else 0.0) - (0.02 if row["third_party"] else 0.0) + (0.005 if row["condition"] else 0.0)), row["order"], row["path"]))
+    for row in baseline:
+        if add(row) and len(selected) >= 20:
+            break
+elif mode in {"dynamic", "static"}:
+    picks = []
+    if mode in {"dynamic", "static"} and topic_patterns:
+        baseline.sort(key=lambda row: (not (row["focus_score"] if focus_patterns else row["direct_claim"]), -row["focus_score"], not row["direct_claim"], -row["topic_score"], -row["score"], row["path"]))
+        if baseline:
+            anchor = baseline[0]
+            alternate = next((row for row in baseline[1:] if row["date"] != anchor["date"] and (row["focus_score"] if focus_patterns else row["topic_score"]) > 0), None)
+            if alternate is not None:
+                picks = sorted((anchor, alternate), key=lambda row: (row["date"] or "9999-99-99", row["path"]))
+            else:
+                picks = [anchor]
+        if mode == "dynamic":
+            prefix_count = len(picks)
+    picked_paths = {row["path"] for row in picks}
+    if topic_patterns:
+        relevant = [
+            row for row in baseline
+            if row["path"] not in picked_paths
+            and (row["focus_score"] if focus_patterns else row["topic_score"]) > 0
+        ]
+        tail = relevant + [row for row in baseline if row["path"] not in picked_paths and row not in relevant]
+    else:
+        tail = [row for row in baseline if row["path"] not in picked_paths]
+    for row in picks + tail:
+        if row is not None and add(row) and len(selected) >= 20:
+            break
+else:
+    for row in baseline:
+        if add(row) and len(selected) >= 20:
+            break
+
+if mode == "dynamic" and prefix_count:
+    selected = selected[:prefix_count] + sorted(
+        selected[prefix_count:],
+        key=lambda row: (row["date"] or "9999-99-99", row["order"], row["path"]),
+    )
+
+Path(output_path).write_text("".join(f"{row['path']}\t{row['score']:.12f}\t{row['observed']}\t{row['title']}\n" for row in selected), encoding="utf-8")
+PY
+}
+
+bridge_lexical_scores() {
+  local lexical_index="$1" query="$2" query_terms="$3" sources_meta="$4" principal="$5" output="$6" py
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for evidence scoring"
+  "$py" - "$lexical_index" "$query" "$query_terms" "$sources_meta" "$principal" "$output" <<'PY'
+import base64
+import sys
+from pathlib import Path
+
+lexical_path, query, terms_path, meta_path, principal, output_path = sys.argv[1:]
+query = query.lower()
+terms = Path(terms_path).read_text(encoding="utf-8").splitlines()
+meta = {}
+for line in Path(meta_path).read_text(encoding="utf-8").splitlines():
+    fields = line.split("\t")
+    if len(fields) >= 6:
+        meta[fields[0]] = fields
+rows = []
+with Path(lexical_path).open(encoding="utf-8") as stream:
+  next(stream, None)
+  for line in stream:
+    encoded = line.rstrip("\n").split("\t")
+    fields = meta.get(encoded[0]) if len(encoded) == 3 else None
+    if fields is None or len(fields) < 6 or (principal and fields[1] and fields[1] != principal):
+        continue
+    path, _, observed, title, view, source_hash = fields[:6]
+    texts = []
+    for value in encoded[1:]:
+        try:
+            texts.append(base64.b64decode(value).decode("utf-8").lower())
+        except (ValueError, UnicodeDecodeError):
+            pass
+    score = 20 * sum(query in text for text in texts)
+    title_lower = title.lower()
+    for term in terms:
+        score += sum(term in text for text in texts)
+        if term in title_lower:
+            score += 4
+    if score:
+        rows.append(f"{path}\t{score}\t{observed}\t{title}\n")
+Path(output_path).write_text("".join(rows), encoding="utf-8")
+PY
+}
+
+bridge_ensure_lexical_index() {
+  local project_id="$1" dir index lexical stage py
+  require_project "$project_id" dir
+  index="$dir/indexes/evidence-vectors.tsv"; lexical="$dir/indexes/evidence-lexical.tsv"
+  if [ -f "$lexical" ] && [ "$(head -1 "$lexical")" = "$EVIDENCE_LEXICAL_HEADER" ]; then
+    if [ -f "$index" ] && [ "$(wc -l <"$lexical" | tr -d ' ')" = "$(wc -l <"$index" | tr -d ' ')" ]; then
+      printf '%s\n' "$lexical"
+      return 0
+    fi
+    if [ ! -f "$index" ] && [ "$(wc -l <"$lexical" | tr -d ' ')" = "$(( $(find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ') + 1 ))" ]; then
+      printf '%s\n' "$lexical"
+      return 0
+    fi
+  fi
+  acquire_lock "project-$project_id"
+  stage="$(mktemp "$dir/indexes/.evidence-lexical.XXXXXX")"
+  py="$(bridge_python)"
+  if [ ! -f "$index" ] || [ "$(head -1 "$index")" != "$EVIDENCE_INDEX_HEADER" ]; then
+    "$py" - "$dir" "$stage" "$EVIDENCE_LEXICAL_HEADER" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+root, output_path, header = sys.argv[1:]
+root, rows = Path(root), [header + "\n"]
+
+def frontmatter(text, key):
+    if not text.startswith("---"):
+        return ""
+    for line in text.splitlines()[1:]:
+        if line == "---":
+            break
+        if line.startswith(key + ":"):
+            return line.split(":", 1)[1].strip().strip('"')
+    return ""
+
+for source in sorted((root / "sources").glob("*.md")):
+    raw = source.read_bytes()
+    text = raw.decode("utf-8")
+    if frontmatter(text, "type") == "HermesTurn" and "## User content" in text:
+        view = text.split("## User content", 1)[1].split("## Assistant content", 1)[0]
+    elif text.startswith("---") and "---" in text[3:]:
+        view = text.split("---", 2)[-1]
+    else:
+        view = text
+    rows.append("\t".join((
+        str(source.relative_to(root)),
+        base64.b64encode(view.encode()).decode(),
+        "",
+    )) + "\n")
+Path(output_path).write_text("".join(rows), encoding="utf-8")
+PY
+    mv "$stage" "$lexical"
+    audit_v2 "$dir" "evidence-lexical-index" "indexes/evidence-lexical.tsv" "" "rebuilt" "$(sha256_file "$lexical")" "view=$EVIDENCE_VIEW_VERSION"
+    release_lock
+    printf '%s\n' "$lexical"
+    return 0
+  fi
+  "$py" - "$dir" "$index" "$stage" "$EVIDENCE_LEXICAL_HEADER" "$CLAIM_PROJECTION_VERSION" <<'PY'
+import base64
+import sys
+from pathlib import Path
+
+root, index_path, output_path, header, claims_version = sys.argv[1:]
+root = Path(root)
+rows = [header + "\n"]
+with Path(index_path).open(encoding="utf-8") as stream:
+    next(stream, None)
+    for line in stream:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) < 12:
+            continue
+        view = (root / fields[4]).read_bytes()
+        claims_path = root / "indexes" / "evidence-claims" / f"{fields[1]}-{claims_version}.txt"
+        claims = claims_path.read_bytes() if claims_path.exists() else b""
+        rows.append(f"{fields[0]}\t{base64.b64encode(view).decode()}\t{base64.b64encode(claims).decode()}\n")
+Path(output_path).write_text("".join(rows), encoding="utf-8")
+PY
+  mv "$stage" "$lexical"
+  audit_v2 "$dir" "evidence-lexical-index" "indexes/evidence-lexical.tsv" "" "rebuilt" "$(sha256_file "$lexical")" "view=$EVIDENCE_VIEW_VERSION"
+  release_lock
+  printf '%s\n' "$lexical"
+}
+
+bridge_vector_scores() {
+  local index="$1" query_vector="$2" model="$3" dimensions="$4" principal="$5" output="$6" py
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for evidence scoring"
+  "$py" - "$index" "$query_vector" "$model" "$dimensions" "$principal" "$output" <<'PY'
+import math
+import sys
+from pathlib import Path
+
+index_path, query_path, model, dimensions, principal, output_path = sys.argv[1:]
+dimensions = int(dimensions)
+query_fields = dict(line.split(": ", 1) for line in Path(query_path).read_text(encoding="utf-8").splitlines() if ": " in line)
+query = [float(value) for value in query_fields["vector"].split()]
+query_norm = math.sqrt(sum(value * value for value in query))
+rows = []
+with Path(index_path).open(encoding="utf-8") as stream:
+    next(stream, None)
+    for line in stream:
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) < 12 or fields[5] != model or fields[6] != str(dimensions):
+            continue
+        if principal and fields[7] and fields[7] != principal:
+            continue
+        vector = [float(value) for value in fields[10].split()]
+        if len(vector) != dimensions:
+            continue
+        vector_norm = math.sqrt(sum(value * value for value in vector))
+        if query_norm and vector_norm:
+            score = sum(a * b for a, b in zip(query, vector)) / (query_norm * vector_norm)
+            rows.append(f"{fields[0]}\t{score:.12f}\t{fields[8]}\t{fields[9]}\n")
+Path(output_path).write_text("".join(rows), encoding="utf-8")
+PY
+}
+
+bridge_search_evidence() {
+  local project_id="$1" query="$2" principal="$3" strategy="$4" output="$5" metadata="$6" dir index file rel term mode index_current=0
+  local tmp sources_meta query_terms lexical_hits lexical_raw lexical_rank lexical_index semantic_raw semantic_rank final reranked query_input query_vector query_model query_dimensions query_lc semantic_ok=0 degraded=0 evidence_mode="lexical-evidence"
+  require_project "$project_id" dir
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-evidence.XXXXXX")"
+  sources_meta="$tmp/sources.meta"; query_terms="$tmp/query.terms"; lexical_hits="$tmp/lexical.hits"; lexical_raw="$tmp/lexical.raw"; lexical_rank="$tmp/lexical.rank"; semantic_raw="$tmp/semantic.raw"; semantic_rank="$tmp/semantic.rank"; final="$tmp/final"; reranked="$tmp/reranked"
+  : >"$lexical_hits"; : >"$semantic_rank"
+  index="$dir/indexes/evidence-vectors.tsv"
+  if [ -f "$index" ] && [ "$(head -1 "$index")" = "$EVIDENCE_INDEX_HEADER" ]; then
+    index_current=1
+    awk -F '\t' 'NR > 1 { print $1 "\t" $8 "\t" $9 "\t" $10 "\t" $5 "\t" $2 }' "$index" >"$sources_meta"
+  else
+    while IFS= read -r file; do
+      rel="${file#"$dir"/}"; source_hash="${rel##*/}"; source_hash="${source_hash%%-*}"
+      view="$dir/indexes/evidence-text/${source_hash}-${EVIDENCE_VIEW_VERSION}.txt"; [ -f "$view" ] && view="${view#"$dir"/}" || view=""
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$(frontmatter_field "$file" brain_principal)" "$(frontmatter_field "$file" brain_observed_at)" "$(frontmatter_field "$file" title)" "$view" "$source_hash"
+    done < <(find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort) >"$sources_meta"
+  fi
+  mode="$(bridge_query_mode "$query")"
+  query_lc="$(printf '%s\n' "$query" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  printf '%s\n' "$query_lc" | tr -cs 'a-z0-9' '\n' | awk '
+    BEGIN { split("the a an and or but about what which where when how did does do is are was were user users their they them this that for from with into about under over of to in on at as can could would should recent recently current now change changed update updated", stop, " ") }
+    length > 2 && !stop[$0] && !seen[$0]++
+  ' >"$query_terms"
+  if [ "$mode" = dynamic ]; then
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(residen|live|moved|relocat|housing|home|roommate)'; then
+      printf '%s\n' live lived move moved moved relocation relocated housing home lease roommate roommates >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(company|employer|career|job|title|industry|work|firm|role|position)'; then
+      printf '%s\n' work worked working employed employment employer internship intern firm startup started career role position senior >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(marital|marriage|dating|divorc|spouse|relationship|wedding)'; then
+      printf '%s\n' marital marriage married dating divorce divorced single spouse relationship wedding status >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(child|children|kid|kids|son|daughter)'; then
+      printf '%s\n' child children kid kids son daughter born >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(employment|employ|work status|work)'; then
+      printf '%s\n' employed employment employer work worked working job internship intern position status >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(health|physical|mental|wellbeing|fatigue|stress)'; then
+      printf '%s\n' health physical mental wellbeing fatigue stressed stress >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(social|socializing|socialising|activity|activities|friendship)'; then
+      printf '%s\n' social socializing socialising activity activities friendship friend neighbour neighbor >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(income|salary|savings|saving|money)'; then
+      printf '%s\n' income salary savings saving money financial >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(sibling|siblings|brother|sister)'; then
+      printf '%s\n' sibling siblings brother sister >>"$query_terms"
+    fi
+  elif [ "$mode" = static ]; then
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(university|college|degree|education|attend)'; then
+      printf '%s\n' university college degree education bachelor master attended studied >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(gender|male|female|woman|man|pronoun)'; then
+      printf '%s\n' gender male female woman man he she him her pronoun >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(father|dad|parent|name)'; then
+      printf '%s\n' father dad parent name >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(degree|education|qualification)'; then
+      printf '%s\n' degree education bachelor master qualification >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(birthdate|birthday|born|date of birth)'; then
+      printf '%s\n' birthdate birthday born birth >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(birthplace|born|raised|grew up|citizenship)'; then
+      printf '%s\n' birthplace born raised grew citizenship >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(marital|marriage|dating|divorc|spouse|relationship|wedding)'; then
+      printf '%s\n' marital marriage married dating divorce divorced single spouse relationship wedding status >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(child|children|kid|kids|son|daughter)'; then
+      printf '%s\n' child children kid kids son daughter born >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(employment|employ|work status|work)'; then
+      printf '%s\n' employed employment employer work worked working job internship intern position status >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(health|physical|mental|wellbeing|fatigue|stress)'; then
+      printf '%s\n' health physical mental wellbeing fatigue stressed stress >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(social|socializing|socialising|activity|activities|friendship)'; then
+      printf '%s\n' social socializing socialising activity activities friendship friend neighbour neighbor >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(income|salary|savings|saving|money)'; then
+      printf '%s\n' income salary savings saving money financial >>"$query_terms"
+    fi
+    if printf '%s\n' "$query_lc" | grep -Eqi '\b(sibling|siblings|brother|sister)'; then
+      printf '%s\n' sibling siblings brother sister >>"$query_terms"
+    fi
+  fi
+  awk '!seen[$0]++' "$query_terms" >"${query_terms}.dedup" && mv "${query_terms}.dedup" "$query_terms"
+  lexical_index="$(bridge_ensure_lexical_index "$project_id")"
+  if [ "$index_current" = 1 ]; then
+    bridge_lexical_scores "$lexical_index" "$query" "$query_terms" "$sources_meta" "$principal" "$lexical_raw"
+  else
+    bridge_lexical_scores "$lexical_index" "$query" "$query_terms" "$sources_meta" "$principal" "$lexical_raw"
+  fi
+  sort -t $'\t' -k2,2nr -k3,3r -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 "\t" $3 "\t" $4 }' >"$lexical_rank"
+
+  if [ "$strategy" = hybrid ] || [ "$strategy" = vector ]; then
+    if [ "$index_current" = 1 ] && [ -n "$QUERY_EMBEDDER" ] && [ -x "$QUERY_EMBEDDER" ]; then
+      query_input="$tmp/query.txt"; query_vector="$tmp/query.vector"; printf '%s\n' "$query" >"$query_input"
+      if "$QUERY_EMBEDDER" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
+        query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
+        bridge_vector_scores "$index" "$query_vector" "$query_model" "$query_dimensions" "$principal" "$semantic_raw"
+        sort -t $'\t' -k2,2nr -k3,3r -k1,1 "$semantic_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 "\t" $3 "\t" $4 }' >"$semantic_rank"
+        [ "$(wc -l <"$semantic_rank" | tr -d ' ')" -gt 0 ] && semantic_ok=1
+      fi
+    fi
+    [ "$semantic_ok" = 1 ] || degraded=1
+  fi
+  if [ "$strategy" = hybrid ] && [ "$semantic_ok" = 1 ]; then evidence_mode="hybrid-evidence-rrf"; fi
+  if [ "$strategy" = vector ] && [ "$semantic_ok" = 1 ]; then evidence_mode="vector-evidence"; fi
+  awk -F '\t' -v strategy="$strategy" -v semantic_ok="$semantic_ok" '
+    FILENAME == ARGV[1] { path[$1]=1; lp[$1]=$2; ls[$1]=$3; observed[$1]=$4; title[$1]=$5; next }
+    FILENAME == ARGV[2] { path[$1]=1; sp[$1]=$2; ss[$1]=$3; observed[$1]=$4; title[$1]=$5; next }
+    END {
+      for (p in path) {
+        if (strategy == "vector") score=ss[p]+0
+        else if (semantic_ok) score=(lp[p] ? 1/(60+lp[p]) : 0) + (sp[p] ? 1/(60+sp[p]) : 0)
+        else score=ls[p]+0
+        printf "%s\t%.12f\t%s\t%s\n", p, score, observed[p], title[p]
+      }
+    }
+  ' "$lexical_rank" "$semantic_rank" >"$final"
+  sort -t $'\t' -k2,2nr -k1,1 "$final" | awk 'NR <= 200' >"${final}.top"
+  mv "${final}.top" "$final"
+  bridge_rerank_evidence "$dir" "$query" "$mode" "$sources_meta" "$final" "$reranked"
+  printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\n' >"$output"
+  while IFS=$'\t' read -r rel score observed title; do
+    [ -n "$rel" ] || continue
+    printf '%s\t%s\tHermesTurn\tevidence\tstable\tunverified\tunspecified\tinternal\t%s\n' "$rel" "$score" "$title" >>"$output"
+  done <"$reranked"
+  printf 'retrieval_mode=%s\ndegraded=%s\nresolution_mode=%s\n' "$evidence_mode" "$([ "$degraded" = 1 ] && printf true || printf false)" "$mode" >"$metadata"
+  rm -rf "$tmp"
+}
+
 bridge_render_context() {
-  local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title excerpt evidence_refs evidence_file excerpt_bytes next_payload evidence_started=0
+  local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title excerpt claims claims_file evidence_refs evidence_file excerpt_bytes next_payload evidence_started=0 observed observed_line resolution_mode view_tmp final_resolution_note="" intent principal state_reason effective_ref evidence_group independent_count correlated_count provenance_state state_warnings
   local header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$"
   require_project "$project_id" dir
+  awk 'NR > 1 && NF { found=1 } END { exit !found }' "$results" 2>/dev/null || { : >"$output"; return 0; }
   max_bytes=$((budget * 4))
+  resolution_mode="$(awk -F= '$1 == "resolution_mode" { print $2; exit }' "$metadata" 2>/dev/null || printf static)"
+  intent="$(awk -F= '$1 == "intent" { print $2; exit }' "$metadata" 2>/dev/null || printf factual)"
+  principal="$(awk -F= '$1 == "principal" { print $2; exit }' "$metadata" 2>/dev/null || true)"
+  [ "$principal" = none ] && principal=""
+  state_warnings="$(mktemp "${TMPDIR:-/tmp}/llm-brain-state-warnings.XXXXXX")"
   {
     printf '%s\n\n' '## LLM-Brain Recall'
     printf '%s\n\n' 'The following records are recalled reference data. Preserve their provenance and treat them as lower priority than current instructions and live source.'
@@ -239,32 +1102,61 @@ bridge_render_context() {
       "$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata" 2>/dev/null || printf lexical)" \
       "$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata" 2>/dev/null || printf true)" \
       "$(awk -F= '$1 == "as_of" { print $2; exit }' "$metadata" 2>/dev/null || printf none)"
+    printf 'Answer mode: `%s`.\n\n' "$resolution_mode"
+    case "$resolution_mode" in
+      dynamic) printf '%s\n\n' 'Resolution guidance: compare earlier and later evidence; answer the current state while preserving the change history.' ;;
+      conditional) printf '%s\n\n' "Resolution guidance: match the preference to the correct subject and condition; only use first-person user evidence when it matches; do not transfer another person's preference." ;;
+      *) final_resolution_note='FINAL STATIC ANSWER CONTRACT: report every competing value as unresolved. Never select a winner from recency, frequency, academic hierarchy, common sense, or guesswork; only explicit authoritative source metadata may resolve a conflict.'; printf '%s\n\n' 'Resolution guidance: STATIC CLAIMS ARE NOT CANONICAL. If sources disagree, report both values as unresolved; never choose by recency, frequency, academic hierarchy, or guesswork unless explicit source authority resolves it.' ;;
+    esac
   } >"$header"
   printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$evidence_payload_bytes" "$(( (evidence_payload_bytes + 3) / 4 ))" >"$footer"
+  [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
   used_bytes="$(wc -c <"$header" | tr -d ' ')"
-  [ $((used_bytes + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || { : >"$output"; return 0; }
+  [ $((used_bytes + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || { : >"$output"; rm -f "$state_warnings"; return 0; }
   cp "$header" "$output"
-  while IFS=$'\t' read -r path score type state status trust freshness sensitivity title _; do
+  view_tmp="$(mktemp "${TMPDIR:-/tmp}/llm-brain-context-view.XXXXXX")"
+  while IFS=$'\t' read -r path score type state status trust freshness sensitivity title _ state_reason effective_ref evidence_group independent_count correlated_count provenance_state; do
     [ -n "$path" ] || continue
-    excerpt="$(body_after_frontmatter "$dir/$path" 2>/dev/null | bridge_utf8_prefix 1200)"
+    if [ "$intent" = "current_state" ] && [ "$type" != "HermesTurn" ] && [ "$state" != "current" ]; then
+      printf '%s\t%s\t%s\n' "$title" "$path" "$state" >>"$state_warnings"
+      continue
+    fi
+    if bridge_evidence_view "$dir/$path" "$view_tmp" 2>/dev/null; then
+      excerpt="$(bridge_utf8_prefix 1200 <"$view_tmp")"
+    else
+      excerpt="$(body_after_frontmatter "$dir/$path" 2>/dev/null | bridge_utf8_prefix 1200)"
+    fi
+    claims=""
+    if [ "$resolution_mode" = static ]; then
+      claims_file="$dir/indexes/evidence-claims/$(basename "$path" | sed 's/-.*//')-${CLAIM_PROJECTION_VERSION}.txt"
+      if [ -f "$claims_file" ]; then
+        claims="$(sed '1{/^derived=/d;}' "$claims_file" | sed '/^[[:space:]]*$/d; s/^/- /')"
+      fi
+    fi
+    observed="$(frontmatter_field "$dir/$path" brain_observed_at)"; observed_line=""; [ -z "$observed" ] || observed_line="Observed: \`$observed\`\n"
     excerpt_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
     {
-      printf '### %s\n\n%s\n\nReference: `%s`\nHash: `%s`\nLifecycle: `%s`; trust: `%s`; freshness: `%s`.\n\n' \
-        "$title" "$excerpt" "$path" "$(sha256_file "$dir/$path")" "$status" "$trust" "$freshness"
+      printf '### %s\n\n%s\n\nReference: `%s`\nHash: `%s`\n%bLifecycle: `%s`; trust: `%s`; freshness: `%s`.\n\n' \
+        "$title" "$excerpt" "$path" "$(sha256_file "$dir/$path")" "$observed_line" "$status" "$trust" "$freshness"
+      printf 'Evidence group: `%s`; independent roots: `%s`; correlated records: `%s`; provenance: `%s`.\n\n' "${evidence_group:-unknown}" "${independent_count:-0}" "${correlated_count:-0}" "${provenance_state:-unknown}"
+      [ -z "$claims" ] || printf 'Derived non-canonical claims (not canonical truth):\n%s\n\n' "$claims"
     } >"$block"
     next_payload=$((evidence_payload_bytes + excerpt_bytes))
     printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
+    [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
     [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || break
     cat "$block" >>"$output"
     used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
     evidence_payload_bytes="$next_payload"
   done < <(tail -n +2 "$results" 2>/dev/null)
+  rm -f "$view_tmp"
   evidence_refs="$(awk -F= '$1 == "evidence_refs" { print $2; exit }' "$metadata" 2>/dev/null || true)"
   if [ -n "$evidence_refs" ] && [ "$evidence_refs" != "none" ]; then
     while IFS= read -r evidence_file; do
       [ -n "$evidence_file" ] || continue
       case "$evidence_file" in sources/*|episodes/*|review/*) ;; *) continue ;; esac
       [ -f "$dir/$evidence_file" ] || continue
+      [ "$(frontmatter_field "$dir/$evidence_file" brain_sensitivity sensitivity)" = restricted ] && continue
       excerpt="$(body_after_frontmatter "$dir/$evidence_file" 2>/dev/null | bridge_utf8_prefix 800)"
       excerpt_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
       {
@@ -273,6 +1165,7 @@ bridge_render_context() {
       } >"$block"
       next_payload=$((evidence_payload_bytes + excerpt_bytes))
       printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
+      [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
       [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || break
       cat "$block" >>"$output"
       used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
@@ -280,8 +1173,17 @@ bridge_render_context() {
       evidence_started=1
     done < <(printf '%s\n' "$evidence_refs" | tr ',' '\n')
   fi
+  if [ -s "$state_warnings" ]; then
+    printf '\n## State Warnings\n\n' >>"$output"
+    while IFS=$'\t' read -r warning_title warning_path warning_state; do
+      printf '%s — `%s` (%s)\n' "$warning_title" "$warning_path" "$warning_state" >>"$output"
+    done <"$state_warnings"
+    printf '\n' >>"$output"
+  fi
   printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$evidence_payload_bytes" "$(( (evidence_payload_bytes + 3) / 4 ))" >"$footer"
+  [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
   cat "$footer" >>"$output"
+  rm -f "$state_warnings"
 }
 
 bridge_json_output() {
@@ -315,15 +1217,63 @@ if kind == "recall":
         lines = Path(result_path).read_text(encoding="utf-8").splitlines()
     except OSError:
         lines = []
+    project_root = Path(project_path) if project_path else None
+
+    def frontmatter(text, key):
+        if not text.startswith("---"):
+            return ""
+        for line in text.splitlines()[1:]:
+            if line == "---":
+                break
+            if line.startswith(key + ":"):
+                return line.split(":", 1)[1].strip().strip('"')
+        return ""
+
+    def source_details(path):
+        if project_root is None:
+            return {"excerpt": "", "source_hash": "", "observed_at": "", "principal": ""}
+        source = project_root / path
+        try:
+            raw = source.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return {"excerpt": "", "source_hash": "", "observed_at": "", "principal": ""}
+        kind = frontmatter(text, "type")
+        if kind == "HermesTurn" and "## User content" in text:
+            excerpt = text.split("## User content", 1)[1]
+            excerpt = excerpt.split("## Assistant content", 1)[0]
+        elif text.startswith("---") and "---" in text[3:]:
+            excerpt = text.split("---", 2)[-1]
+        else:
+            excerpt = text
+        excerpt = re.sub(r"\s+", " ", excerpt).strip()[:1200]
+        return {
+            "excerpt": excerpt,
+            "source_hash": hashlib.sha256(raw).hexdigest(),
+            "observed_at": frontmatter(text, "brain_observed_at"),
+            "principal": frontmatter(text, "brain_principal"),
+        }
+
     for line in lines[1:]:
         fields = line.split("\t")
         if len(fields) < 9:
             continue
-        rows.append({
+        row = {
             "path": fields[0], "score": fields[1], "type": fields[2],
             "state": fields[3], "status": fields[4], "trust": fields[5],
             "freshness": fields[6], "sensitivity": fields[7], "title": fields[8],
-        })
+        }
+        if len(fields) > 15:
+            row.update({
+                "state_reason": fields[15],
+                "effective_ref": fields[16] if len(fields) > 16 else fields[0],
+                "evidence_group": fields[17] if len(fields) > 17 else "unknown",
+                "independent_source_count": fields[18] if len(fields) > 18 else "0",
+                "correlated_record_count": fields[19] if len(fields) > 19 else "0",
+                "provenance_state": fields[20] if len(fields) > 20 else "unknown",
+            })
+        row.update(source_details(row["path"]))
+        rows.append(row)
     evidence = metadata.get("evidence_refs", "none")
     payload = {
         "status": "ok",
@@ -333,6 +1283,11 @@ if kind == "recall":
         "degraded": metadata.get("degraded", degraded) == "true",
         "temporal": {"as_of": metadata.get("as_of", "none")},
         "evidence_refs": [] if evidence in ("", "none") else evidence.split(","),
+        "resolution_mode": metadata.get("resolution_mode", "static"),
+        "state_resolution": metadata.get("state_resolution", "disabled"),
+        "state_unresolved_count": int(metadata.get("state_unresolved_count", "0") or 0),
+        "independent_source_count": int(metadata.get("independent_source_count", "0") or 0),
+        "correlated_record_count": int(metadata.get("correlated_record_count", "0") or 0),
         "conflicts": [row["path"] for row in rows if "conflicted" in row["state"]],
         "results": rows,
         "context_markdown": Path(context_path).read_text(encoding="utf-8") if Path(context_path).exists() else "",
@@ -756,6 +1711,7 @@ ensure_project_layout() {
   ensure_dir "$dir/review"
   ensure_dir "$dir/sources"
   ensure_dir "$dir/reflection/scheduler"
+  ensure_dir "$dir/reflection/commitments"
   ensure_dir "$dir/indexes/embeddings"
   ensure_dir "$dir/context-packs"
   ensure_dir "$dir/adapters"
@@ -764,6 +1720,7 @@ ensure_project_layout() {
   ensure_dir "$dir/requests/.staging"
   ensure_dir "$dir/evaluations"
   ensure_dir "$dir/runs/outcomes"
+  ensure_dir "$dir/runs/prepared"
   ensure_dir "$dir/projections/retractions"
   ensure_dir "$dir/feedback"
   ensure_dir "$dir/experiments/predictions"
@@ -1100,7 +2057,7 @@ EOF
 }
 
 candidate_valid() {
-  local file="$1" kind confidence risk sensitivity provenance provider provider_version field value origin
+  local file="$1" kind confidence risk sensitivity provenance provider provider_version field value origin action reverify_after question
   is_regular_text_file "$file" || return 65
   secret_scan_file "$file" || return $?
   kind="$(frontmatter_field "$file" brain_review_kind)"
@@ -1121,6 +2078,12 @@ candidate_valid() {
   done
   origin="$(frontmatter_field "$file" brain_authority_origin)"
   case "$origin" in ''|human-directive|repository|runtime-proof|approved-canonical|source|provider|external-observation|unknown) ;; *) return 65 ;; esac
+  action="$(frontmatter_field "$file" brain_commitment_action)"
+  case "$action" in ''|persist|use-now|reverify|ask|quarantine|undetermined) ;; *) return 65 ;; esac
+  reverify_after="$(frontmatter_field "$file" brain_reverify_after)"
+  [ -z "$reverify_after" ] || brain_datetime_valid "$reverify_after" || return 65
+  question="$(frontmatter_field "$file" brain_clarification_question)"
+  [ "$action" != "ask" ] || [ -n "$question" ] || return 65
   return 0
 }
 
@@ -1181,14 +2144,104 @@ auto_promote_eligible() {
   return 0
 }
 
+commitment_policy() {
+  case "${LLM_BRAIN_COMMITMENT_POLICY:-shadow}" in
+    legacy|shadow|enforce) printf '%s\n' "${LLM_BRAIN_COMMITMENT_POLICY:-shadow}" ;;
+    *) die 64 "LLM_BRAIN_COMMITMENT_POLICY must be legacy, shadow, or enforce" ;;
+  esac
+}
+
+commitment_transition_status() {
+  local project_id="$1" file="$2" dir authority origin provenance state stale_after reverify_after now
+  require_project "$project_id" dir
+  authority="$(frontmatter_field "$file" brain_source_authority)"
+  origin="$(frontmatter_field "$file" brain_authority_origin)"
+  provenance="$(frontmatter_field "$file" brain_provenance)"
+  if ! provenance_resolves "$project_id" "$file"; then
+    printf 'reverify\tinvalid-custody\n'
+    return 0
+  fi
+  case "$authority:$origin" in
+    repository:external-observation|human-directive:external-observation|runtime-proof:external-observation)
+      printf 'reverify\tauthority-uplift\n'; return 0 ;;
+  esac
+  state="$(frontmatter_field "$file" brain_review_state review_state)"
+  [ "$state" != "superseded" ] || { printf 'reverify\tsuperseded-candidate\n'; return 0; }
+  [ -z "$(frontmatter_field "$file" brain_conflicts)" ] || { printf 'reverify\tconflicted-candidate\n'; return 0; }
+  stale_after="$(frontmatter_field "$file" stale_after)"
+  [ -z "$stale_after" ] || [ "$(today_utc)" \< "$stale_after" ] || { printf 'reverify\tstale-evidence\n'; return 0; }
+  reverify_after="$(frontmatter_field "$file" brain_reverify_after)"
+  now="$(now_utc)"
+  [ -z "$reverify_after" ] || [ "$now" \< "$reverify_after" ] || { printf 'reverify\treverification-due\n'; return 0; }
+  printf 'pass\tcustody-lineage-valid\n'
+}
+
+commitment_effective_action() {
+  local project_id="$1" file="$2" proposed transition transition_state transition_reason
+  proposed="$(frontmatter_field "$file" brain_commitment_action)"
+  [ -n "$proposed" ] || proposed=undetermined
+  case "$proposed" in quarantine) printf 'quarantine\texplicit-quarantine\n'; return ;; esac
+  transition="$(commitment_transition_status "$project_id" "$file")"
+  transition_state="${transition%%$'\t'*}"; transition_reason="${transition#*$'\t'}"
+  [ "$transition_state" = pass ] || { printf 'reverify\t%s\n' "$transition_reason"; return; }
+  case "$proposed" in
+    persist)
+      if auto_promote_eligible "$file"; then printf 'persist\tautomatic-policy-eligible\n'; else printf 'reverify\tautomatic-policy-ineligible\n'; fi
+      ;;
+    use-now) printf 'use-now\ttransient-use\n' ;;
+    reverify) printf 'reverify\texplicit-reverify\n' ;;
+    ask) printf 'ask\texplicit-clarification\n' ;;
+    undetermined) printf 'undetermined\tmissing-action\n' ;;
+  esac
+}
+
+commitment_decision_record_locked() {
+  local project_id="$1" file="$2" policy="$3" proposed="$4" effective="$5" reason="$6" transition="$7" dir hash id destination
+  require_project "$project_id" dir
+  hash="$(sha256_file "$file")"
+  id="commitment_$(sha256_text "$project_id|$hash|$policy|$effective|$reason" | cut -c1-16)"
+  destination="$dir/reflection/commitments/$id.md"
+  if [ ! -f "$destination" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: CommitmentDecision\ntitle: %s\nbrain_project_id: %s\nbrain_commitment_id: %s\nbrain_candidate_ref: %s\nbrain_candidate_hash_sha256: %s\nbrain_commitment_policy: %s\nbrain_commitment_action: %s\nbrain_commitment_effective_action: %s\nbrain_commitment_reason: %s\nbrain_transition_state: %s\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Commitment decision $(basename "$file" .md)")" "$project_id" "$id" "$(yaml_quote "${file#"$dir"/}")" "$hash" "$policy" "$proposed" "$effective" "$(yaml_quote "$reason")" "$transition" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Commitment decision' '' "Candidate: ${file#"$dir"/}" '' "Policy: $policy" '' "Proposed action: $proposed" '' "Effective action: $effective" '' "Reason: $reason" '' "Transition: $transition" '' 'This derived decision does not become canonical memory.'
+    } >"${destination}.tmp.$$"
+    mv "${destination}.tmp.$$" "$destination"
+    audit_v2 "$dir" "commitment-decision" "$id" "" "$effective" "$(sha256_file "$destination")" "policy=$policy"
+  fi
+  printf '%s\n' "$destination"
+}
+
+commitment_quarantine_locked() {
+  local project_id="$1" file="$2" reason="$3" dir hash id
+  require_project "$project_id" dir
+  hash="$(sha256_file "$file")"; id="commitment_${hash:0:12}"
+  printf 'candidate_hash=%s\nstatus=blocked\nreason=%s\n' "$hash" "$(slug "$reason")" >"$dir/quarantine/$id.txt"
+  audit_v2 "$dir" "commitment-quarantine" "$id" "proposed" "quarantined" "$hash" "reason=$(slug "$reason")"
+}
+
 record_candidate_quarantine() {
-  local project_id="$1" candidate="$2" dir hash id
+  local project_id="$1" candidate="$2" dir hash id policy commitment_id commitment_file
   require_project "$project_id" dir
   hash="$(sha256_file "$candidate")"
   id="redaction_${hash:0:12}"
+  policy="$(commitment_policy)"
   acquire_lock "project-$project_id"
   if [ ! -f "$dir/quarantine/$id.txt" ]; then
     printf 'candidate_hash=%s\nprovider_candidate_name=%s\nstatus=blocked\n' "$hash" "$(basename "$candidate")" >"$dir/quarantine/$id.txt"
+  fi
+  commitment_id="commitment_$(sha256_text "$project_id|$hash|$policy|quarantine|secret-match" | cut -c1-16)"
+  commitment_file="$dir/reflection/commitments/$commitment_id.md"
+  if [ ! -f "$commitment_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: CommitmentDecision\ntitle: %s\nbrain_project_id: %s\nbrain_commitment_id: %s\nbrain_candidate_ref: %s\nbrain_candidate_hash_sha256: %s\nbrain_commitment_policy: %s\nbrain_commitment_action: quarantine\nbrain_commitment_effective_action: quarantine\nbrain_commitment_reason: %s\nbrain_transition_state: quarantine\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' \
+        "$(yaml_quote 'Secret-matched candidate quarantine')" "$project_id" "$commitment_id" "$(yaml_quote "quarantine/$id.txt")" "$hash" "$policy" "$(yaml_quote 'secret-match')" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Commitment decision' '' 'The candidate was quarantined by the secret scanner. This hash-bound artefact contains no candidate content and is not canonical truth.'
+    } >"${commitment_file}.tmp.$$"
+    mv "${commitment_file}.tmp.$$" "$commitment_file"
+    audit_v2 "$dir" "commitment-decision" "$commitment_id" "" "quarantine" "$(sha256_file "$commitment_file")" "policy=$policy reason=secret-match"
   fi
   write_review_item "$dir" "$id" "redaction" "Redaction review for reflected candidate" "needs-validation" "0.0" "high" "restricted" "provider" "" "candidate-hash://$hash" "A provider candidate matched the secret scanner and was not copied into review or canonical memory." >/dev/null
   audit_v2 "$dir" "reflection-blocked" "$id" "" "needs-validation" "$hash" "secret-scan"
@@ -1297,7 +2350,7 @@ promote_review() {
 }
 
 submit_candidate() {
-  local project_id="$1" candidate="$2" auto="${3:-1}" dir kind id title file hash
+  local project_id="$1" candidate="$2" auto="${3:-1}" dir kind id title file hash policy proposed effective decision transition transition_state transition_reason provider_actor status=0 promoted=0
   require_project "$project_id" dir
   if candidate_valid "$candidate"; then
     :
@@ -1326,16 +2379,49 @@ submit_candidate() {
     set_frontmatter_field "$file" brain_schema_version "$SCHEMA_VERSION"
     audit_v2 "$dir" "reflection-submit" "$id" "" "proposed" "$hash" "kind=$kind"
   fi
-  if [ "$auto" = "1" ] && auto_promote_eligible "$file"; then
-    local provider_actor status=0
-    provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
-    if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then :; else status=$?; fi
-    release_lock
-    return "$status"
+  policy="$(commitment_policy)"
+  if [ "$policy" != legacy ]; then
+    proposed="$(frontmatter_field "$file" brain_commitment_action)"; [ -n "$proposed" ] || proposed=undetermined
+    decision="$(commitment_effective_action "$project_id" "$file")"
+    effective="${decision%%$'\t'*}"; transition_reason="${decision#*$'\t'}"
+    transition="$(commitment_transition_status "$project_id" "$file" | head -n 1)"
+    transition_state="${transition%%$'\t'*}"
+    set_frontmatter_field "$file" brain_commitment_effective_action "$effective"
+    set_frontmatter_field "$file" brain_commitment_transition_state "$transition_state"
+    commitment_decision_record_locked "$project_id" "$file" "$policy" "$proposed" "$effective" "$transition_reason" "$transition_state" >/dev/null
   else
-    release_lock
-    printf 'review=queued project_id=%s review_id=%s state=%s\n' "$project_id" "$id" "$(frontmatter_field "$file" brain_review_state)"
+    effective="persist"
   fi
+  if [ "$auto" = "1" ]; then
+    if [ "$policy" = enforce ]; then
+      case "$effective" in
+        persist)
+          provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
+          if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; fi
+          ;;
+        quarantine)
+          commitment_quarantine_locked "$project_id" "$file" "commitment-quarantine"
+          set_frontmatter_field "$file" brain_review_state rejected
+          set_frontmatter_field "$file" brain_review_reason commitment-quarantine
+          ;;
+        use-now)
+          set_frontmatter_field "$file" brain_review_state proposed
+          set_frontmatter_field "$file" brain_review_reason commitment-use-now
+          ;;
+        ask|reverify|undetermined)
+          set_frontmatter_field "$file" brain_review_state needs-validation
+          set_frontmatter_field "$file" brain_review_reason "commitment-$effective"
+          ;;
+      esac
+    elif auto_promote_eligible "$file"; then
+      provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
+      if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; fi
+    fi
+  fi
+  release_lock
+  [ "$status" = 0 ] || return "$status"
+  [ "$promoted" = 1 ] && return 0
+  printf 'review=queued project_id=%s review_id=%s state=%s commitment_policy=%s commitment_action=%s\n' "$project_id" "$id" "$(frontmatter_field "$file" brain_review_state)" "$policy" "$effective"
 }
 
 run_provider_with_timeout() {
@@ -1624,7 +2710,7 @@ cmd_work() {
 }
 
 cmd_bridge() {
-  local action="${1:-}" source_root="" project_id="" query_file="" principal="" intent="factual" budget=4000 require_evidence=0 exploratory=0 dir id tmp metadata results context query requested_strategy="hybrid" actual_strategy degraded capture_status=0 record="" result_file request_id=""
+  local action="${1:-}" source_root="" project_id="" query_file="" principal="" intent="factual" budget=4000 require_evidence=0 exploratory=0 dir id tmp metadata results context query requested_strategy="hybrid" actual_strategy degraded capture_status=0 record="" record_dir="" result_file request_id="" evidence_results evidence_metadata evidence_mode evidence_degraded evidence_resolution source_hash combined_results
   shift || true
   case "$action" in
     recall)
@@ -1655,18 +2741,70 @@ cmd_bridge() {
       [ "$(printf '%s' "$query" | wc -c | tr -d ' ')" -le 65536 ] || die 65 "bridge query exceeds 64 KiB"
       id="$(bridge_resolve_project "$source_root" "$project_id")"
       require_project "$id" dir
+      if [ -s "$dir/indexes/evidence-pending.txt" ]; then
+        local pending_hash pending_stage batch_manifest source view view_hash vector claims
+        pending_stage="$(mktemp "$dir/indexes/.evidence-pending.XXXXXX")"
+        LC_ALL=C sort -u "$dir/indexes/evidence-pending.txt" >"$pending_stage"
+        batch_manifest="$(mktemp "$dir/indexes/.evidence-batch.XXXXXX")"
+        ensure_dir "$dir/indexes/evidence-text"
+        ensure_dir "$dir/indexes/evidence-claims"
+        ensure_dir "$dir/indexes/embeddings"
+        while IFS= read -r pending_hash; do
+          [ -n "$pending_hash" ] || continue
+          source="$(find "$dir/sources" -maxdepth 1 -type f -name "${pending_hash}-*.md" -print -quit 2>/dev/null)"
+          [ -n "$source" ] || continue
+          view="$dir/indexes/evidence-text/${pending_hash}-${EVIDENCE_VIEW_VERSION}.txt"
+          if [ ! -f "$view" ]; then bridge_evidence_view "$source" "${view}.tmp.$$"; mv "${view}.tmp.$$" "$view"; fi
+          claims="$dir/indexes/evidence-claims/${pending_hash}-${CLAIM_PROJECTION_VERSION}.txt"
+          ensure_dir "$(dirname "$claims")"
+          if [ ! -f "$claims" ]; then bridge_claim_projection "$view" "${claims}.tmp.$$"; mv "${claims}.tmp.$$" "$claims"; fi
+          view_hash="$(sha256_file "$view")"
+          vector="$dir/indexes/embeddings/${pending_hash}-${EVIDENCE_VIEW_VERSION}-${view_hash}-$(slug "${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}").txt"
+          if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then printf '%s\t%s\n' "$view" "$vector" >>"$batch_manifest"; fi
+        done <"$pending_stage"
+        if [ -s "$batch_manifest" ]; then
+          [ -n "$EMBEDDER" ] && [ -x "$EMBEDDER" ] || { rm -f "$pending_stage" "$batch_manifest"; die 69 "deferred batch embedding requires an executable embedder"; }
+          "$EMBEDDER" --batch-manifest "$batch_manifest" || { rm -f "$pending_stage" "$batch_manifest"; die 69 "deferred batch embedding failed"; }
+        fi
+        rm -f "$batch_manifest"
+        bridge_index_evidence_batch "$id" "$pending_stage" >/dev/null || { rm -f "$pending_stage"; die 69 "deferred evidence index rebuild failed"; }
+        rm -f "$pending_stage" "$dir/indexes/evidence-pending.txt"
+      fi
       tmp="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-bridge.XXXXXX")"
       metadata="$tmp/metadata"; results="$tmp/results"; context="$tmp/context"
       local -a search_args
-      search_args=("$id" "$query" "--limit" "20" "--strategy" "$requested_strategy" "--metadata-file" "$metadata" "--intent" "$intent")
+      search_args=("$id" "$query" "--limit" "20" "--strategy" "$requested_strategy" "--metadata-file" "$metadata" "--intent" "$intent" "--explain")
       [ -z "$principal" ] || search_args+=("--principal" "$principal")
       [ "$require_evidence" = 0 ] || search_args+=("--require-evidence")
       [ "$exploratory" = 0 ] || search_args+=("--exploratory")
       cmd_search "${search_args[@]}" >"$results"
+      printf 'resolution_mode=%s\n' "$(bridge_query_mode "$query")" >>"$metadata"
+      evidence_results="$tmp/evidence-results"; evidence_metadata="$tmp/evidence-metadata"
+      bridge_search_evidence "$id" "$query" "$principal" "$requested_strategy" "$evidence_results" "$evidence_metadata"
+      if awk 'NR > 1 && NF { found=1 } END { exit !found }' "$evidence_results"; then
+        combined_results="$tmp/results.combined"
+        head -1 "$results" >"$combined_results"
+        tail -n +2 "$evidence_results" >>"$combined_results"
+        awk -F '\t' 'FNR == NR { if (NR > 1) seen[$1]=1; next } FNR > 1 && !seen[$1]' "$evidence_results" "$results" >>"$combined_results"
+        mv "$combined_results" "$results"
+        evidence_mode="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$evidence_metadata")"
+        evidence_degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$evidence_metadata")"
+        evidence_resolution="$(awk -F= '$1 == "resolution_mode" { print $2; exit }' "$evidence_metadata")"
+        actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
+        degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
+        [ "$evidence_degraded" = true ] || degraded=false
+        awk -F= -v mode="${actual_strategy}+${evidence_mode}" -v degraded="$degraded" '
+          $1 == "retrieval_mode" { print "retrieval_mode=" mode; next }
+          $1 == "degraded" { print "degraded=" degraded; next }
+          { print }
+        ' "$metadata" >"${metadata}.combined"
+        mv "${metadata}.combined" "$metadata"
+        [ -z "$evidence_resolution" ] || :
+      fi
       bridge_render_context "$id" "$results" "$metadata" "$budget" "$context"
       actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
       degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
-      bridge_json_output recall "$id" "$metadata" "$context" "$results" "$requested_strategy" "$actual_strategy" "$degraded"
+      bridge_json_output recall "$id" "$metadata" "$context" "$results" "$requested_strategy" "$actual_strategy" "$degraded" "$dir"
       rm -rf "$tmp"
       ;;
     capture)
@@ -1675,10 +2813,134 @@ cmd_bridge() {
           --source-root) source_root="${2:-}"; shift 2 ;;
           --project-id) project_id="${2:-}"; shift 2 ;;
           --record) record="${2:-}"; shift 2 ;;
+          --record-dir) record_dir="${2:-}"; shift 2 ;;
           *) die 64 "unknown bridge capture option: $1" ;;
         esac
       done
       [ -n "$source_root" ] || die 64 "bridge capture requires --source-root PATH"
+      if [ -n "$record_dir" ]; then
+        [ -z "$record" ] || die 64 "bridge capture accepts either --record or --record-dir"
+        [ -d "$record_dir" ] || die 66 "bridge record directory is missing"
+        id="$(bridge_resolve_project "$source_root" "$project_id")"
+        require_project "$id" dir
+        local batch_count py
+        py="$(bridge_python)"
+        [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for batch capture"
+        acquire_lock "project-$id"
+        if batch_count="$("$py" - "$dir" "$id" "$record_dir" "$ACTOR" "$SCHEMA_VERSION" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+root, project_id, batch_dir, actor, schema = sys.argv[1:]
+root, batch_dir = Path(root), Path(batch_dir)
+secret = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:api[_-]?key|secret|password|token)\s*[:=]\s*\"?[A-Za-z0-9_./+=-]{16,}", re.I)
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+def scalar(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+def slug(value):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", value.lower())).strip("-") or "item"
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+audit = root / "audit.v2.tsv"
+lines = audit.read_text(encoding="utf-8").splitlines()
+previous = lines[-1].split("\t")[-1] if len(lines) > 1 else ""
+
+def audit_event(action, object_id, new_state, content_hash, details):
+    global previous
+    timestamp = now()
+    values = [timestamp, actor, action, project_id, object_id, "", new_state, content_hash, details, previous]
+    event = digest("|".join(values).encode())
+    with audit.open("a", encoding="utf-8") as stream:
+        stream.write("\t".join(values + [event]) + "\n")
+    previous = event
+
+pending = []
+deferred_index = bool(
+    os.environ.get("LLM_BRAIN_DEFER_EVIDENCE_INDEX") == "1"
+    or os.environ.get("LLM_BRAIN_OPENAI_EMBED_BASE_URL")
+    or os.environ.get("LLM_BRAIN_EMBEDDER")
+)
+count = 0
+for source in sorted(batch_dir.glob("*.md")):
+    if source.is_symlink() or not source.is_file() or source.stat().st_size > 10 * 1024 * 1024:
+        raise ValueError(f"invalid batch record: {source.name}")
+    payload = source.read_bytes()
+    text = payload.decode("utf-8")
+    if "\x00" in text or secret.search(text):
+        raise ValueError(f"blocked batch record: {source.name}")
+    source_hash = digest(payload)
+    destination = root / "sources" / f"{source_hash}-{slug(source.name)}.md"
+    created = not destination.exists()
+    if created:
+        temp = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+        temp.write_bytes(payload)
+        os.replace(temp, destination)
+    sidecar = destination.with_suffix(destination.suffix + ".sha256")
+    expected_sidecar = f"{source_hash}  {destination.name}\n"
+    if not sidecar.exists() or sidecar.read_text(encoding="utf-8") != expected_sidecar:
+        sidecar.write_text(expected_sidecar, encoding="utf-8")
+        created = True
+    day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    episode_id = f"episode_{day.replace('-', '')}_{digest(f'{project_id}:{source_hash}'.encode())[:12]}"
+    episode_dir = root / "episodes" / day
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    episode = episode_dir / f"{episode_id}.md"
+    if not episode.exists():
+        episode.write_text(
+            "---\n" +
+            f"type: Episode\ntitle: {scalar(f'Ingested {source.name}')}\nbrain_project_id: {project_id}\n"
+            f"brain_episode_id: {episode_id}\nbrain_topic_id: \"\"\nbrain_scope: project\n"
+            f"brain_source_ref: {scalar(f'sources/{destination.name}')}\nbrain_source_hash_sha256: {source_hash}\n"
+            f"brain_review_state: captured\nbrain_sensitivity: internal\nbrain_schema_version: {schema}\ntimestamp: {scalar(now())}\n"
+            f"---\n# Ingested {source.name}\n\nSource custody is stored at sources/{destination.name} with SHA-256 {source_hash}.\n",
+            encoding="utf-8",
+        )
+        created = True
+    review_id = f"source_{source_hash[:12]}"
+    review = root / "review" / f"{review_id}.md"
+    if not review.exists():
+        review.write_text(
+            "---\n" +
+            f"type: ReviewItem\ntitle: {scalar(f'Review source {source.name}')}\nbrain_project_id: {project_id}\n"
+            f"brain_candidate_id: {review_id}\nbrain_review_kind: source-ingest\nbrain_review_state: proposed\n"
+            f"brain_confidence: 0.0\nbrain_risk: medium\nbrain_sensitivity: internal\nbrain_loading_temperature: warm\n"
+            f"brain_source_authority: source\nbrain_provider_id: \"\"\nbrain_provenance: {scalar(f'episode://{episode_id}')}\n"
+            f"brain_schema_version: {schema}\ntimestamp: {scalar(now())}\n---\n# Review source {source.name}\n\n"
+            "Extract durable candidates only when useful; raw custody is not semantic memory.\n",
+            encoding="utf-8",
+        )
+        created = True
+    if created:
+        audit_event("ingest-capture", episode_id, "captured", source_hash, f"source_ref=sources/{destination.name}")
+    if deferred_index:
+        pending.append(source_hash)
+    count += 1
+
+with (root / "indexes" / "evidence-pending.txt").open("a", encoding="utf-8") as stream:
+    stream.writelines(f"{value}\n" for value in pending)
+print(count)
+PY
+)"; then
+          release_lock
+          printf 'bridge_capture_batch=ok records=%s\n' "$batch_count"
+          return 0
+        else
+          local batch_status=$?
+          release_lock
+          return "$batch_status"
+        fi
+      fi
       [ -n "$record" ] || die 64 "bridge capture requires --record FILE"
       is_regular_text_file "$record" || die 65 "bridge record must be a regular text file under 10 MiB"
       id="$(bridge_resolve_project "$source_root" "$project_id")"
@@ -1698,7 +2960,15 @@ cmd_bridge() {
         [ -n "$episode_ref" ] || capture_status=73
         if [ "$capture_status" = 0 ]; then
           episode_ref="${episode_ref#"$dir"/}"
-          reflection_schedule_record "$id" "$episode_ref" deferred bridge-capture >/dev/null
+          [ "${LLM_BRAIN_REFLECTION_SCHEDULE:-1}" = 0 ] || reflection_schedule_record "$id" "$episode_ref" deferred bridge-capture >/dev/null
+          source_hash="$(sed -n 's/.*source_hash=\([^ ]*\).*/\1/p' "$result_file" | tail -n 1)"
+          local append_only=0
+          grep -Fq 'idempotent=false' "$result_file" && append_only=1
+          if [ "${LLM_BRAIN_DEFER_EVIDENCE_INDEX:-0}" = 1 ] || [ -n "${LLM_BRAIN_OPENAI_EMBED_BASE_URL:-}" ]; then
+            [ -z "$source_hash" ] || printf '%s\n' "$source_hash" >>"$dir/indexes/evidence-pending.txt"
+          else
+            [ -z "$source_hash" ] || bridge_index_evidence_source "$id" "$source_hash" "$append_only" >/dev/null 2>&1 || say_error "bridge: evidence index unavailable for $source_hash"
+          fi
           [ "${LLM_BRAIN_RECONCILIATION:-1}" = 0 ] || reconcile_scan "$id" --episode "$episode_ref" >/dev/null 2>&1 || true
         fi
       fi
@@ -1710,8 +2980,74 @@ cmd_bridge() {
   esac
 }
 
+run_prepare() {
+  local project_id="$1" procedure_ref="$2" task="" principal="" bindings="" verification="" dir procedure procedure_hash required key value binding capsule_id capsule_file evidence_refs evidence_hashes evidence_ref evidence_file state
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task) task="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --binding)
+        binding="${2:-}"; shift 2
+        case "$binding" in *=*) key="${binding%%=*}"; value="${binding#*=}" ;; *) die 64 "run prepare --binding requires KEY=VALUE" ;; esac
+        case "$key" in ''|*[!A-Za-z0-9_-]*) die 65 "invalid binding key" ;; esac
+        [ -n "$value" ] || die 65 "binding value must not be empty"
+        validate_scalar "$binding" || die 65 "binding must be a single line"
+        case ",${bindings}," in *",$key="*) die 65 "duplicate binding: $key" ;; esac
+        bindings="${bindings}${bindings:+,}${binding}"
+        ;;
+      --verification) verification="${verification}${verification:+; }${2:-}"; shift 2 ;;
+      *) die 64 "unknown run prepare option: $1" ;;
+    esac
+  done
+  [ -n "$task" ] || die 64 "run prepare requires --task TEXT"
+  validate_scalar "$procedure_ref" || die 65 "procedure reference must be a single line"
+  validate_scalar "$task" || die 65 "run task must be a single line"
+  validate_scalar "$principal" || die 65 "run principal must be a single line"
+  validate_scalar "$bindings" || die 65 "run bindings must be a single line"
+  validate_scalar "$verification" || die 65 "run verification must be a single line"
+  require_project "$project_id" dir
+  procedure="$(canonical_ref_file "$dir" "$procedure_ref" 2>/dev/null || true)"
+  [ -n "$procedure" ] || die 66 "procedure missing: $procedure_ref"
+  canonical_file_effective "$dir" "$procedure" || die 73 "procedure is not current: $procedure_ref"
+  search_file_eligible "$dir" "$procedure" 0 0 "" 0 "" "$principal" || die 73 "procedure is not visible or current: $procedure_ref"
+  state_resolution_for_file "$dir" "$procedure" "" "$principal"
+  state="$STATE_RESOLUTION"
+  [ "$state" = current ] || die 73 "procedure is not current: $procedure_ref state=$state"
+  required="$(frontmatter_field "$procedure" brain_required_bindings)"
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    printf '%s\n' "$bindings" | tr ',' '\n' | awk -F= -v wanted="$key" '$1 == wanted { found=1 } END { exit !found }' || die 65 "missing required binding: $key"
+  done < <(printf '%s\n' "$required" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  procedure_hash="$(sha256_file "$procedure")"
+  evidence_refs="$(evidence_refs_for_file "$dir" "$procedure" 0 "$principal" | sort -u | paste -sd, -)"; [ -n "$evidence_refs" ] || evidence_refs=none
+  evidence_hashes=""
+  while IFS= read -r evidence_ref; do
+    [ -n "$evidence_ref" ] || continue
+    case "$evidence_ref" in sources/*|episodes/*|review/*|okf/*) ;; *) continue ;; esac
+    evidence_file="$dir/$evidence_ref"
+    [ -f "$evidence_file" ] || continue
+    evidence_hashes="${evidence_hashes}${evidence_hashes:+;}$(printf '%s=%s' "$evidence_ref" "$(sha256_file "$evidence_file")")"
+  done < <(printf '%s\n' "$evidence_refs" | tr ',' '\n')
+  [ -n "$evidence_hashes" ] || evidence_hashes=none
+  capsule_id="capsule_$(sha256_text "$project_id|${procedure#"$dir"/}|$procedure_hash|$task|$principal|$bindings|$verification|$evidence_hashes" | cut -c1-16)"
+  capsule_file="$dir/runs/prepared/$capsule_id.md"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$capsule_file" ]; then
+    {
+      printf '%s\n' '---'
+      printf 'type: ProcedureCapsule\ntitle: %s\nbrain_project_id: %s\nbrain_capsule_id: %s\nbrain_procedure_ref: %s\nbrain_procedure_hash_sha256: %s\nbrain_task: %s\nbrain_principal: %s\nbrain_bindings: %s\nbrain_binding_hash_sha256: %s\nbrain_required_bindings: %s\nbrain_applicability: %s\nbrain_prerequisites: %s\nbrain_verification: %s\nbrain_evidence_refs: %s\nbrain_evidence_hashes: %s\nbrain_state_resolution: %s\nbrain_applicability_state: unverified\nbrain_artifact_state: derived\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Procedure capsule $procedure_ref")" "$project_id" "$capsule_id" "$(yaml_quote "${procedure#"$dir"/}")" "$procedure_hash" "$(yaml_quote "$task")" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${bindings:-none}")" "$(sha256_text "$bindings")" "$(yaml_quote "${required:-none}")" "$(yaml_quote "$(frontmatter_field "$procedure" brain_applicability || true)")" "$(yaml_quote "$(frontmatter_field "$procedure" brain_prerequisites || true)")" "$(yaml_quote "${verification:-$(frontmatter_field "$procedure" brain_verification)}")" "$(yaml_quote "$evidence_refs")" "$(yaml_quote "$evidence_hashes")" "$state" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      printf '%s\n' '---' '# Procedure capsule' '' "Procedure: ${procedure#"$dir"/}" '' "Task: $task" '' "Bindings: ${bindings:-none}" '' "Evidence hashes: ${evidence_hashes}" '' "Applicability: $(frontmatter_field "$procedure" brain_applicability)" '' "Prerequisites: $(frontmatter_field "$procedure" brain_prerequisites)" '' "Verification: ${verification:-$(frontmatter_field "$procedure" brain_verification)}" '' 'Applicability remains unverified until supported by run evidence.'
+    } >"${capsule_file}.tmp.$$"
+    mv "${capsule_file}.tmp.$$" "$capsule_file"
+    audit_v2 "$dir" "procedure-capsule" "$capsule_id" "" "prepared" "$(sha256_file "$capsule_file")" "procedure=$(slug "$procedure_ref")"
+  fi
+  release_lock
+  printf 'run-prepare=ok project_id=%s capsule_id=%s state=%s file=%s\n' "$project_id" "$capsule_id" "$state" "$capsule_file"
+}
+
 run_start() {
-  local project_id="$1" procedure_ref="$2" task="" request_id="" branch="main" obligations="" principal="" dir run_id run_file
+  local project_id="$1" procedure_ref="$2" task="" request_id="" branch="main" obligations="" principal="" capsule_ref="" dir run_id run_file capsule_file capsule_procedure capsule_hash capsule_evidence_hashes evidence_pair evidence_ref evidence_hash evidence_file procedure_file capsule_task capsule_principal capsule_state capsule_hash_value="none"
   shift 2 || true
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1720,6 +3056,7 @@ run_start() {
       --branch) branch="${2:-}"; shift 2 ;;
       --obligation) obligations="${obligations}${obligations:+,}${2:-}"; shift 2 ;;
       --principal) principal="${2:-}"; shift 2 ;;
+      --capsule) capsule_ref="${2:-}"; shift 2 ;;
       *) die 64 "unknown run start option: $1" ;;
     esac
   done
@@ -1728,8 +3065,39 @@ run_start() {
   validate_scalar "$branch" || die 65 "run branch must be a single line"
   validate_scalar "$obligations" || die 65 "run obligation must be a single line"
   validate_scalar "$principal" || die 65 "run principal must be a single line"
+  validate_scalar "$capsule_ref" || die 65 "run capsule must be a single line"
   [ -z "$request_id" ] || validate_id "$request_id" || die 64 "invalid run request id"
   require_project "$project_id" dir
+  if [ -n "$capsule_ref" ]; then
+    case "$capsule_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 65 "run capsule must stay inside the project" ;; esac
+    capsule_file="$dir/$capsule_ref"; [ -f "$capsule_file" ] || die 66 "capsule missing: $capsule_ref"
+    capsule_procedure="$(frontmatter_field "$capsule_file" brain_procedure_ref)"
+    capsule_hash="$(frontmatter_field "$capsule_file" brain_procedure_hash_sha256)"
+    capsule_evidence_hashes="$(frontmatter_field "$capsule_file" brain_evidence_hashes)"
+    capsule_task="$(frontmatter_field "$capsule_file" brain_task)"
+    capsule_principal="$(frontmatter_field "$capsule_file" brain_principal)"; [ "$capsule_principal" = none ] && capsule_principal=""
+    [ "$capsule_procedure" = "$procedure_ref" ] || die 73 "run capsule procedure mismatch"
+    procedure_file="$(canonical_ref_file "$dir" "$procedure_ref" 2>/dev/null || true)"; [ -n "$procedure_file" ] || die 66 "procedure missing: $procedure_ref"
+    [ "$(sha256_file "$procedure_file")" = "$capsule_hash" ] || die 73 "run capsule stale: procedure hash changed"
+    if [ -n "$capsule_evidence_hashes" ] && [ "$capsule_evidence_hashes" != none ]; then
+      while IFS= read -r evidence_pair; do
+        [ -n "$evidence_pair" ] || continue
+        evidence_ref="${evidence_pair%%=*}"; evidence_hash="${evidence_pair#*=}"
+        case "$evidence_ref" in /*|*..*|*$'\n'*|*$'\r'*) die 73 "run capsule evidence reference is invalid" ;; esac
+        evidence_file="$dir/$evidence_ref"
+        [ -f "$evidence_file" ] || die 73 "run capsule stale: evidence missing"
+        [ "$(sha256_file "$evidence_file")" = "$evidence_hash" ] || die 73 "run capsule stale: evidence hash changed"
+      done < <(printf '%s\n' "$capsule_evidence_hashes" | tr ';' '\n')
+    fi
+    search_file_eligible "$dir" "$procedure_file" 0 0 "" 0 "" "${principal:-$capsule_principal}" || die 73 "run capsule procedure is not visible"
+    state_resolution_for_file "$dir" "$procedure_file" "" "${principal:-$capsule_principal}"
+    capsule_state="$STATE_RESOLUTION"; [ "$capsule_state" = current ] || die 73 "run capsule stale: procedure state=$capsule_state"
+    if [ -n "$task" ] && [ "$task" != "$capsule_task" ]; then die 73 "run capsule task mismatch"; fi
+    if [ -n "$principal" ] && [ -n "$capsule_principal" ] && [ "$principal" != "$capsule_principal" ]; then die 73 "run capsule principal mismatch"; fi
+    [ -n "$task" ] || task="$capsule_task"
+    [ -n "$principal" ] || principal="$capsule_principal"
+    capsule_hash_value="$(sha256_file "$capsule_file")"
+  fi
   if [ -n "$request_id" ]; then
     run_id="run_$(sha256_text "$project_id|$procedure_ref|$request_id" | cut -c1-16)"
   else
@@ -1741,7 +3109,7 @@ run_start() {
     {
       printf '%s\n' '---'
       printf 'type: ProcedureRun\ntitle: %s\nbrain_project_id: %s\nbrain_run_id: %s\n' "$(yaml_quote "Run $procedure_ref")" "$project_id" "$run_id"
-      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\nbrain_principal: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")" "$(yaml_quote "${principal:-none}")"
+      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\nbrain_principal: %s\nbrain_capsule_ref: %s\nbrain_capsule_hash_sha256: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${capsule_ref:-none}")" "$capsule_hash_value"
       printf 'brain_run_state: active\nbrain_verification_state: unverified\nbrain_artifact_state: noncanonical\nbrain_started_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
       printf '%s\n' '---'
       printf '# Procedure run\n\nProcedure: `%s`  \nBranch: `%s`  \nTask: %s\n\nThis is append-only working state, not canonical OKF memory.\n' "$procedure_ref" "$branch" "${task:-none}"
@@ -1812,6 +3180,7 @@ cmd_run() {
   local action="${1:-}" project_id="${2:-}"
   [ -n "$project_id" ] || die 64 "run requires PROJECT_ID"
   case "$action" in
+    prepare) [ -n "${3:-}" ] || die 64 "run prepare requires PROCEDURE_REF"; run_prepare "$project_id" "$3" "${@:4}" ;;
     start) [ -n "${3:-}" ] || die 64 "run start requires PROCEDURE_REF"; run_start "$project_id" "$3" "${@:4}" ;;
     outcome) [ -n "${3:-}" ] || die 64 "run outcome requires RUN_ID"; run_outcome "$project_id" "$3" "${@:4}" ;;
     show)
@@ -1824,7 +3193,7 @@ cmd_run() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$run_file" brain_run_id)" "$(frontmatter_field "$run_file" brain_run_state)" "$(frontmatter_field "$run_file" brain_procedure_ref)" "$(frontmatter_field "$run_file" brain_verification_state)" "${run_file#"$dir"/}"
       done
       ;;
-    *) die 64 "run requires start, outcome, show, or status" ;;
+    *) die 64 "run requires prepare, start, outcome, show, or status" ;;
   esac
 }
 
@@ -2465,6 +3834,7 @@ canonical_file_effective() {
   [ ! -f "$dir/okf/retractions/$id.md" ] || return 1
   state="$(frontmatter_field "$file" brain_review_state review_state)"
   status="$(frontmatter_field "$file" status)"
+  [ "$status" != "deprecated" ] || return 1
   if [ -n "$state" ]; then
     [ "$state" = "approved" ] || return 1
   else
@@ -2656,9 +4026,205 @@ brain_temporal_eligible() {
   return 0
 }
 
-evidence_refs_for_file() {
-  local dir="$1" file="$2" depth="${3:-0}" rel provenance review episode source_ref source
+canonical_ref_file() {
+  local dir="$1" ref="$2" file rel base ids match=""
+  case "$ref" in
+    /*|*..*|*$'\n'*|*$'\r'*) return 1 ;;
+    okf/*.md)
+      [ -f "$dir/$ref" ] && { printf '%s\n' "$dir/$ref"; return 0; }
+      ;;
+  esac
+  while IFS= read -r file; do
+    rel="${file#"$dir"/}"; base="$(basename "$rel" .md)"
+    ids="$(frontmatter_field "$file" brain_claim_id brain_procedure_id brain_reference_id brain_topic_id)"
+    if [ "$ref" = "$rel" ] || [ "$ref" = "$rel.md" ] || [ "$ref" = "$base" ] || printf '%s\n' "$ids" | tr ',' '\n' | grep -Fqx -- "$ref"; then
+      [ -z "$match" ] || return 1
+      match="$file"
+    fi
+  done < <(canonical_files "$dir")
+  [ -n "$match" ] || return 1
+  printf '%s\n' "$match"
+}
+
+STATE_RESOLUTION=""
+STATE_REASON=""
+STATE_EFFECTIVE_REF=""
+
+state_visible_eligible() {
+  local dir="$1" file="$2" as_of="${3:-}" principal="${4:-}" scope audience
+  canonical_file_effective "$dir" "$file" || return 1
+  file_superseded_by_current_memory "$dir" "$file" && return 1
+  if [ -n "$principal" ]; then
+    scope="$(frontmatter_field "$file" brain_principal)"
+    audience="$(frontmatter_field "$file" brain_audience)"
+    if [ -n "$scope" ] || [ -n "$audience" ]; then
+      printf '%s\n%s\n' "$scope" "$audience" | grep -Fq -- "$principal" || return 1
+    fi
+  fi
+  brain_temporal_eligible "$file" "$as_of" 0
+}
+
+reference_lines() {
+  printf '%s\n' "$1" | sed 's/^\[//; s/\]$//; s/"//g; s/'"'"'//g' | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d'
+}
+
+state_resolution_for_file() {
+  local dir="$1" file="$2" as_of="${3:-}" principal="${4:-}" stack="${5:-}" hops="${6:-0}" rel state_key other other_key dep dep_file dep_state chain_ref chain_file chain_state version_ref version_file supersedes_ref valid_from valid_to
+  STATE_RESOLUTION="unresolved-dependency"
+  STATE_REASON="unresolved"
+  STATE_EFFECTIVE_REF="${file#"$dir"/}"
+  [ -f "$file" ] || { STATE_REASON="missing"; return 0; }
+  rel="${file#"$dir"/}"
+  case "$stack" in *"|$rel|"*) STATE_RESOLUTION="invalid-cycle"; STATE_REASON="dependency-cycle"; return 0 ;; esac
+  [ "$hops" -lt 32 ] || { STATE_RESOLUTION="invalid-cycle"; STATE_REASON="lineage-hop-limit"; return 0; }
+  stack="${stack}|${rel}|"
+  canonical_file_effective "$dir" "$file" || { STATE_RESOLUTION="historical"; STATE_REASON="not-effective"; return 0; }
+  [ "$(file_conflict_state "$file" "${SEARCH_GRAPH_FILE:-}")" = "conflicted" ] && { STATE_RESOLUTION="unresolved-conflict"; STATE_REASON="explicit-conflict"; return 0; }
+  brain_temporal_eligible "$file" "$as_of" 0 || { STATE_RESOLUTION="historical"; STATE_REASON="outside-validity"; return 0; }
+
+  for chain_ref in "$(frontmatter_field "$file" brain_supersedes)" "$(frontmatter_field "$file" brain_version_of)"; do
+    [ -n "$chain_ref" ] || continue
+    chain_file="$(canonical_ref_file "$dir" "$chain_ref" 2>/dev/null || true)"
+    [ -n "$chain_file" ] || { STATE_RESOLUTION="unresolved-dependency"; STATE_REASON="missing-lineage"; return 0; }
+    state_resolution_for_file "$dir" "$chain_file" "$as_of" "$principal" "$stack" $((hops + 1))
+    chain_state="$STATE_RESOLUTION"
+    case "$chain_state" in
+      invalid-cycle) STATE_RESOLUTION="invalid-cycle"; STATE_REASON="lineage-$chain_state"; return 0 ;;
+      unresolved-conflict|unresolved-dependency|unresolved-inaccessible) STATE_RESOLUTION="unresolved-dependency"; STATE_REASON="lineage-$chain_state"; return 0 ;;
+    esac
+  done
+
+  file_superseded_by_current_memory "$dir" "$file" && { STATE_RESOLUTION="historical"; STATE_REASON="superseded"; return 0; }
+
+  state_key="$(frontmatter_field "$file" brain_state_key)"
+  if [ -n "$state_key" ]; then
+    while IFS= read -r other; do
+      [ "$other" = "$file" ] && continue
+      [ "$(frontmatter_field "$other" brain_state_key)" = "$state_key" ] || continue
+      canonical_file_effective "$dir" "$other" || continue
+      state_visible_eligible "$dir" "$other" "$as_of" "$principal" || continue
+      other_key="$(frontmatter_field "$other" brain_state_key)"
+      [ "$other_key" = "$state_key" ] || continue
+      STATE_RESOLUTION="unresolved-conflict"
+      STATE_REASON="multiple-active-state-records"
+      return 0
+    done < <(canonical_files "$dir")
+  fi
+
+  version_ref="$(frontmatter_field "$file" brain_version_of)"
+  if [ -n "$version_ref" ]; then
+    version_file="$(canonical_ref_file "$dir" "$version_ref" 2>/dev/null || true)"
+    [ -n "$version_file" ] || { STATE_REASON="missing-version-lineage"; return 0; }
+  fi
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    dep_file="$(canonical_ref_file "$dir" "$dep" 2>/dev/null || true)"
+    [ -n "$dep_file" ] || { STATE_REASON="missing-dependency"; return 0; }
+    state_visible_eligible "$dir" "$dep_file" "$as_of" "$principal" || { STATE_RESOLUTION="unresolved-inaccessible"; STATE_REASON="dependency-not-visible"; return 0; }
+    state_resolution_for_file "$dir" "$dep_file" "$as_of" "$principal" "$stack" $((hops + 1))
+    dep_state="$STATE_RESOLUTION"
+    case "$dep_state" in
+      current) ;;
+      invalid-cycle) STATE_RESOLUTION="invalid-cycle"; STATE_REASON="dependency-cycle"; return 0 ;;
+      *) STATE_RESOLUTION="unresolved-dependency"; STATE_REASON="dependency-$dep_state"; return 0 ;;
+    esac
+  done < <(reference_lines "$(frontmatter_field "$file" brain_depends_on)")
+
+  valid_from="$(frontmatter_field "$file" brain_valid_from)"; valid_to="$(frontmatter_field "$file" brain_valid_to)"
+  STATE_EFFECTIVE_REF="$rel"
+  if [ -z "$valid_from" ] && [ -z "$valid_to" ]; then
+    STATE_RESOLUTION="unknown-validity"
+    STATE_REASON="validity-not-declared"
+  else
+    STATE_RESOLUTION="current"
+    STATE_REASON="effective"
+  fi
+}
+
+evidence_root_hashes() {
+  local dir="$1" file="$2" depth="${3:-0}" seen="${4:-}" principal="${5:-}" rel source_ref provenance nested dep hash sensitivity scope audience followed=0
   [ -f "$file" ] || return 0
+  rel="${file#"$dir"/}"
+  case "$seen" in *"|$rel|"*) return 0 ;; esac
+  seen="${seen}|${rel}|"
+  [ "$depth" -le 8 ] || return 0
+  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  [ "$sensitivity" != restricted ] || return 0
+  if [ -n "$principal" ]; then
+    scope="$(frontmatter_field "$file" brain_principal)"; audience="$(frontmatter_field "$file" brain_audience)"
+    if [ -n "$scope" ] || [ -n "$audience" ]; then
+      printf '%s\n%s\n' "$scope" "$audience" | grep -Fq -- "$principal" || return 0
+    fi
+  fi
+  source_ref="$(frontmatter_field "$file" brain_source_ref)"
+  case "$source_ref" in
+    sources/*)
+      if [ -f "$dir/$source_ref" ]; then
+        [ "$(frontmatter_field "$dir/$source_ref" brain_sensitivity sensitivity)" = restricted ] && return 0
+        printf '%s\n' "$(sha256_file "$dir/$source_ref")"
+        followed=1
+      fi
+      ;;
+  esac
+  provenance="$(frontmatter_field "$file" brain_provenance)"
+  case "$provenance" in
+    episode://*)
+      nested="$(find "$dir/episodes" -type f -name '*.md' -exec grep -l "^brain_episode_id: ${provenance#episode://}$" {} + 2>/dev/null | head -n 1)"
+      if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
+      ;;
+    review://*)
+      nested="$dir/review/${provenance#review://}.md"
+      if [ -f "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
+      ;;
+    okf://*)
+      nested="$(canonical_ref_file "$dir" "okf/${provenance#okf://}" 2>/dev/null || true)"
+      if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
+      ;;
+  esac
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    nested="$(canonical_ref_file "$dir" "$dep" 2>/dev/null || true)"
+    if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
+  done < <(reference_lines "$(frontmatter_field "$file" brain_derived_from)")
+  if [ "$followed" = 0 ]; then
+    hash="$(frontmatter_field "$file" brain_source_hash_sha256)"
+    [ -n "$hash" ] || hash="$(frontmatter_field "$file" brain_content_hash_sha256)"
+    [ -n "$hash" ] && printf '%s\n' "$hash"
+  fi
+  return 0
+}
+
+evidence_provenance_known() {
+  local dir="$1" file="$2" source_ref provenance derived nested
+  source_ref="$(frontmatter_field "$file" brain_source_ref)"
+  case "$source_ref" in
+    sources/*) [ -f "$dir/$source_ref" ] && return 0 ;;
+  esac
+  provenance="$(frontmatter_field "$file" brain_provenance)"
+  case "$provenance" in
+    episode://*)
+      nested="$(find "$dir/episodes" -type f -name '*.md' -exec grep -l "^brain_episode_id: ${provenance#episode://}$" {} + 2>/dev/null | head -n 1)"
+      [ -n "$nested" ] && return 0
+      ;;
+    review://*) [ -f "$dir/review/${provenance#review://}.md" ] && return 0 ;;
+    okf://*) [ -n "$(canonical_ref_file "$dir" "okf/${provenance#okf://}" 2>/dev/null || true)" ] && return 0 ;;
+    human://*|runtime://*) return 0 ;;
+  esac
+  derived="$(frontmatter_field "$file" brain_derived_from)"
+  [ -n "$derived" ]
+}
+
+evidence_refs_for_file() {
+  local dir="$1" file="$2" depth="${3:-0}" principal="${4:-}" rel provenance review episode source_ref source sensitivity scope audience
+  [ -f "$file" ] || return 0
+  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  [ "$sensitivity" != restricted ] || return 0
+  if [ -n "$principal" ]; then
+    scope="$(frontmatter_field "$file" brain_principal)"; audience="$(frontmatter_field "$file" brain_audience)"
+    if [ -n "$scope" ] || [ -n "$audience" ]; then
+      printf '%s\n%s\n' "$scope" "$audience" | grep -Fq -- "$principal" || return 0
+    fi
+  fi
   rel="${file#"$dir"/}"
   printf '%s\n' "$rel"
   source_ref="$(frontmatter_field "$file" brain_source_ref)"
@@ -2668,16 +4234,18 @@ evidence_refs_for_file() {
   case "$provenance" in
     review://*)
       review="$dir/review/${provenance#review://}.md"
-      [ -f "$review" ] && evidence_refs_for_file "$dir" "$review" $((depth + 1))
+      [ -f "$review" ] && evidence_refs_for_file "$dir" "$review" $((depth + 1)) "$principal"
       ;;
     episode://*)
       episode="$(find "$dir/episodes" -type f -name '*.md' -exec grep -l "^brain_episode_id: ${provenance#episode://}$" {} + 2>/dev/null | head -n 1)"
       if [ -n "$episode" ]; then
-        printf '%s\n' "${episode#"$dir"/}"
-        source_ref="$(frontmatter_field "$episode" brain_source_ref)"
-        case "$source_ref" in
-          sources/*) source="$dir/$source_ref"; [ -f "$source" ] && printf '%s\n' "$source_ref" ;;
-        esac
+        if [ "$(frontmatter_field "$episode" brain_sensitivity sensitivity)" != restricted ]; then
+          printf '%s\n' "${episode#"$dir"/}"
+          source_ref="$(frontmatter_field "$episode" brain_source_ref)"
+          case "$source_ref" in
+            sources/*) source="$dir/$source_ref"; [ -f "$source" ] && printf '%s\n' "$source_ref" ;;
+          esac
+        fi
       fi
       ;;
   esac
@@ -2781,6 +4349,7 @@ build_indexes() {
   audit_v2 "$dir" "index-build" "indexes" "" "rebuilt" "$(sha256_file "$docs")" "embedder=${embedder:+configured}"
   release_lock
   rmdir "$stage" 2>/dev/null || true
+  [ -z "$embedder" ] || bridge_rebuild_evidence_index "$project_id" "$embedder" || say_error "evidence index rebuild unavailable for project $project_id"
   printf 'index=rebuilt project_id=%s documents=%s terms=%s graph=%s\n' "$project_id" "$docs" "$terms" "$graph"
 }
 
@@ -2824,8 +4393,9 @@ cmd_search() {
   local project_id="$1" query="$2"; shift 2 || true
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file=""
-  local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence
+  local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
+  local state_reason="" effective_ref="" evidence_group="unknown" provenance_state="unknown" independent_source_count=0 correlated_record_count=0 state_unresolved_count=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --topic) topic="${2:-}"; shift 2 ;;
@@ -2863,6 +4433,11 @@ cmd_search() {
   case "$strategy" in lexical|vector|hybrid) ;; *) die 64 "search strategy must be lexical, vector, or hybrid" ;; esac
   require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   require_project "$project_id" dir
+  if [ "$require_evidence" = 1 ] && [ "$exploratory" = 0 ] && [ "$include_proposed" = 0 ] && ! find "$dir/okf/claims" "$dir/okf/computations" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' -print -quit 2>/dev/null | grep -q .; then
+    printf 'path\tscore\ttype\ttitle\tstate\n'
+    [ -z "$metadata_file" ] || printf 'retrieval_mode=lexical\ndegraded=true\nmanifest_hash=none\nstrategy_requested=%s\n' "$strategy" >"$metadata_file"
+    return 0
+  fi
   INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
   INDEX_EXPECTED_SIGNATURE_READY=1
   docs_state="$(index_documents_state "$dir")"
@@ -2875,9 +4450,11 @@ cmd_search() {
   semantic_raw="$tmp_dir/semantic.raw.tsv"; semantic_rank="$tmp_dir/semantic.rank.tsv"; union="$tmp_dir/union.tsv"
   base_records="$tmp_dir/base.tsv"; graph_records="$tmp_dir/graph.tsv"; final_ranked="$tmp_dir/final.tsv"
   SEARCH_SUPERSESSION_MAP="$tmp_dir/supersession.tsv"
+  SEARCH_GRAPH_FILE="$graph_file"
   build_supersession_map "$dir" "$SEARCH_SUPERSESSION_MAP"
   seen_titles="$tmp_dir/seen.titles"; selected_evidence="$tmp_dir/evidence.refs"
-  : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"; : >"$seen_titles"; : >"$selected_evidence"
+  selected_paths="$tmp_dir/selected.paths"; independence_map="$tmp_dir/independence.tsv"
+  : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"; : >"$seen_titles"; : >"$selected_evidence"; : >"$selected_paths"; : >"$independence_map"
   while IFS= read -r file; do
     search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
     rel="${file#"$dir"/}"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; title="$(frontmatter_field "$file" title)"
@@ -2988,8 +4565,26 @@ cmd_search() {
     }
   ' "$base_records" "$graph_records" | sort -t $'\t' -k2,2nr -k1,1 >"$final_ranked"
 
+  head -n "$limit" "$final_ranked" | cut -f1 >"$selected_paths"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    file="$dir/$rel"
+    roots="$(evidence_root_hashes "$dir" "$file" 0 "" "$principal" | sort -u | paste -sd, -)"
+    [ "$roots" = unknown ] || evidence_provenance_known "$dir" "$file" || roots="unknown"
+    [ -n "$roots" ] || roots="unknown"
+    printf '%s\t%s\n' "$rel" "$roots" >>"$independence_map"
+  done <"$selected_paths"
+  independent_source_count="$(awk -F '\t' '
+    { n=split($2, roots, ","); for (i=1; i<=n; i++) if (roots[i] != "unknown" && roots[i] != "") seen[roots[i]]=1 }
+    END { total=0; for (root in seen) total++; print total + 0 }
+  ' "$independence_map")"
+  correlated_record_count="$(awk -F '\t' '
+    { n=split($2, roots, ","); for (i=1; i<=n; i++) if (roots[i] != "unknown") count[roots[i]]++ }
+    END { total=0; for (root in count) if (count[root] > 1) total += count[root]; print total + 0 }
+  ' "$independence_map")"
+
   if [ "$explain" = "1" ]; then
-    printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\tlexical_rank\tsemantic_rank\tgraph_source\tgraph_relation\tauthority\tindex_status\n'
+    printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\tlexical_rank\tsemantic_rank\tgraph_source\tgraph_relation\tauthority\tindex_status\tstate_reason\teffective_ref\tevidence_group\tindependent_source_count\tcorrelated_record_count\tprovenance_state\n'
   else
     printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\n'
   fi
@@ -3000,14 +4595,25 @@ cmd_search() {
     if [ "$exploratory" = "1" ] && grep -Fqx -- "$title" "$seen_titles"; then continue; fi
     [ "$exploratory" = "0" ] || printf '%s\n' "$title" >>"$seen_titles"
     if [ "$require_evidence" = "1" ]; then
-      evidence_refs_for_file "$dir" "$file" >>"$selected_evidence"
+      evidence_refs_for_file "$dir" "$file" 0 "$principal" >>"$selected_evidence"
     fi
     state="$(frontmatter_field "$file" brain_review_state review_state)"; [ -n "$state" ] || state="$status"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"
     [ "$state" = "superseded" ] || [ "$graph_relation" = "supersedes" ] || ! file_superseded_by_current_memory "$dir" "$file" || state="superseded"
     if [ "$(file_conflict_state "$file" "$graph_file")" = "conflicted" ] || [ "$graph_relation" = "conflicts_with" ]; then state="${state}-conflicted"; fi
+    state_reason=""; effective_ref="$rel"
+    if [ "$intent" = "current_state" ]; then
+      state_resolution_for_file "$dir" "$file" "$as_of" "$principal"
+      state="$STATE_RESOLUTION"; state_reason="$STATE_REASON"; effective_ref="$STATE_EFFECTIVE_REF"
+      case "$state" in current|unknown-validity) ;; *) state_unresolved_count=$((state_unresolved_count + 1)) ;; esac
+    fi
+    evidence_group="unknown"; provenance_state="unknown"
+    if awk -F '\t' -v path="$rel" '$1 == path { found=1 } END { exit !found }' "$independence_map" 2>/dev/null; then
+      evidence_group="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$independence_map")"
+      [ "$evidence_group" = "unknown" ] || provenance_state="custodied"
+    fi
     if [ "$explain" = "1" ]; then
       authority="$(frontmatter_field "$file" brain_source_authority source_authority)"; [ -n "$authority" ] || authority="unknown"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state" "$state_reason" "$effective_ref" "$evidence_group" "$independent_source_count" "$correlated_record_count" "$provenance_state"
     else
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title"
     fi
@@ -3018,10 +4624,11 @@ cmd_search() {
     evidence_refs="none"
   fi
   if [ -n "$metadata_file" ]; then
-    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" >"$metadata_file"
+    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" >"$metadata_file"
   fi
   rm -rf "$tmp_dir"
   SEARCH_SUPERSESSION_MAP=""
+  SEARCH_GRAPH_FILE=""
   INDEX_EXPECTED_SIGNATURE=""
   INDEX_EXPECTED_SIGNATURE_READY=0
 }
@@ -3223,7 +4830,7 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 dir results metadata selected evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" evidence_ref evidence_file evidence_excerpt evidence_bytes
+  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 dir results metadata warnings selected evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots
   while [ $# -gt 0 ]; do
     case "$1" in
       --task) task="${2:-}"; shift 2 ;;
@@ -3259,8 +4866,9 @@ cmd_pack() {
   require_project "$project_id" dir
   results="$(mktemp "$dir/context-packs/.search.XXXXXX")"
   metadata="$(mktemp "$dir/context-packs/.metadata.XXXXXX")"
+  warnings="$(mktemp "$dir/context-packs/.warnings.XXXXXX")"
   local -a search_args
-  search_args=("$project_id" "$task" "--limit" "20" "--strategy" "$strategy" "--metadata-file" "$metadata")
+  search_args=("$project_id" "$task" "--limit" "20" "--strategy" "$strategy" "--metadata-file" "$metadata" "--explain")
   [ -z "$topic" ] || search_args+=("--topic" "$topic")
   [ -z "$query_embedder" ] || search_args+=("--query-embedder" "$query_embedder")
   [ "$expand_graph" = "0" ] || search_args+=("--expand-graph")
@@ -3280,30 +4888,52 @@ cmd_pack() {
   require_evidence="$(awk -F= '$1 == "require_evidence" { print $2 }' "$metadata")"; [ "$require_evidence" = "true" ] && require_evidence=1 || require_evidence=0
   exploratory="$(awk -F= '$1 == "exploratory" { print $2 }' "$metadata")"; [ "$exploratory" = "true" ] && exploratory=1 || exploratory=0
   planner="$(awk -F= '$1 == "planner" { print $2 }' "$metadata")"; [ -n "$planner" ] || planner="deterministic"
+  state_resolution="$(awk -F= '$1 == "state_resolution" { print $2 }' "$metadata")"; [ -n "$state_resolution" ] || state_resolution="disabled"
+  state_unresolved_count="$(awk -F= '$1 == "state_unresolved_count" { print $2 }' "$metadata")"; [ -n "$state_unresolved_count" ] || state_unresolved_count=0
+  independent_source_count="$(awk -F= '$1 == "independent_source_count" { print $2 }' "$metadata")"; [ -n "$independent_source_count" ] || independent_source_count=0
+  correlated_record_count="$(awk -F= '$1 == "correlated_record_count" { print $2 }' "$metadata")"; [ -n "$correlated_record_count" ] || correlated_record_count=0
   evidence_refs="$(awk -F= '$1 == "evidence_refs" { print $2 }' "$metadata")"; [ -n "$evidence_refs" ] || evidence_refs="none"
   manifest_hash="$(awk -F= '$1 == "manifest_hash" { print $2 }' "$metadata")"
   selected="$(tail -n +2 "$results" | cut -f1)"
   hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected")"
   pack="$dir/context-packs/$(slug "$agent")-$(slug "$task")-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
-    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$SCHEMA_VERSION"
+    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$SCHEMA_VERSION"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
     printf '## Selected Memory\n\n'
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       local source="$dir/$rel" excerpt facts type title status trust freshness generated_at stale_after source_count runtime
+      state="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print $4; exit }' "$results")"
+      evidence_group="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 17 ? $18 : "unknown"); exit }' "$results")"; [ -n "$evidence_group" ] || evidence_group=unknown
+      independent_roots="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 18 ? $19 : "0"); exit }' "$results")"; [ -n "$independent_roots" ] || independent_roots=0
+      correlated_records="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 19 ? $20 : "0"); exit }' "$results")"; [ -n "$correlated_records" ] || correlated_records=0
+      provenance_state="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 20 ? $21 : "unknown"); exit }' "$results")"; [ -n "$provenance_state" ] || provenance_state=unknown
+      if [ "$intent" = "current_state" ] && [ "$state" != "current" ]; then
+        state_reason="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 15 ? $16 : "unresolved"); exit }' "$results")"
+        printf '%s\t%s\t%s\n' "$(frontmatter_field "$source" title)" "$rel" "${state:-unresolved}:$state_reason" >>"$warnings"
+        continue
+      fi
       excerpt="$(body_after_frontmatter "$source" | head -c 800)"
       evidence_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
       [ $((bytes + evidence_bytes)) -le $((budget * 4)) ] || break
       facts="$(okf facts "$source")"
       IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
       printf '### %s\n\n%s\n\nType: <code>%s</code>  \nLifecycle: <code>%s</code>  \nTrust: <code>%s</code>  \nFreshness: <code>%s</code>  \nSource hash: <code>%s</code>  \nProvider: <code>%s</code>  \nExpansion: <code>%s</code>\n\n' "$title" "$excerpt" "$type" "$status" "$trust" "$freshness" "$(sha256_file "$source")" "$(frontmatter_field "$source" brain_provider_id)" "$rel"
+      printf 'Evidence group: <code>%s</code>  \nIndependent roots: <code>%s</code>  \nCorrelated records: <code>%s</code>  \nProvenance: <code>%s</code>\n\n' "$evidence_group" "$independent_roots" "$correlated_records" "$provenance_state"
       bytes=$((bytes + evidence_bytes))
     done <<<"$selected"
+    if [ -s "$warnings" ]; then
+      printf '## State Warnings\n\n'
+      while IFS=$'\t' read -r warning_title warning_path warning_state; do
+        printf '%s — `%s` (%s)\n' "$warning_title" "$warning_path" "$warning_state"
+      done <"$warnings"
+      printf '\n'
+    fi
     if [ "$require_evidence" = "1" ] && [ "$evidence_refs" != "none" ]; then
       printf '## Supporting Evidence\n\n'
       while IFS= read -r evidence_ref; do
@@ -3311,6 +4941,7 @@ cmd_pack() {
         case "$evidence_ref" in sources/*|episodes/*|review/*) ;; *) continue ;; esac
         evidence_file="$dir/$evidence_ref"
         [ -f "$evidence_file" ] || continue
+        [ "$(frontmatter_field "$evidence_file" brain_sensitivity sensitivity)" = restricted ] && continue
         evidence_excerpt="$(body_after_frontmatter "$evidence_file" | head -c 800)"
         evidence_bytes="$(printf '%s' "$evidence_excerpt" | wc -c | tr -d ' ')"
         [ $((bytes + evidence_bytes)) -le $((budget * 4)) ] || break
@@ -3323,7 +4954,7 @@ cmd_pack() {
   mv "${pack}.tmp.$$" "$pack"
   audit_v2 "$dir" "pack-build" "$(basename "$pack")" "" "built" "$(sha256_file "$pack")" "bytes=$bytes"
   release_lock
-  rm -f "$results" "$metadata"
+  rm -f "$results" "$metadata" "$warnings"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

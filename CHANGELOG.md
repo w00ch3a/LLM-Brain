@@ -1,5 +1,23 @@
 # Changelog
 
+# 0.6.1 - 2026-08-25
+
+- Packaged the state-safe memory, commitment-policy and target-bound procedure work with the complete release-readiness gate.
+- Preserved schema 3, factual Hermes defaults, native compressor behaviour, legacy bridge fields and migration-free upgrades.
+- Added deterministic compatibility, upgrade, packaging and presentation checks for local and Hermes installations.
+
+# 0.6.0 - 2026-08-25
+
+- Added opt-in state resolution, independent-source accounting, commitment policies and target-bound procedure capsules.
+- Preserved schema 3, factual Hermes defaults, native compressor behaviour and legacy bridge fields; no migration or new dependency.
+- Added release gate and compatibility documentation for the Hermes memory selector.
+
+## 0.5.3 - 2026-08-13
+
+- Improved Hermes conflict retrieval by indexing user content separately from assistant text, preserving temporal alternatives and principal boundaries, and rebuilding stale derived evidence indexes from source custody.
+- Added dynamic, static and conditional answer guidance plus bridge provenance fields for observed time, source hash, principal and user-only excerpts.
+- Extended Hermes regression coverage for employer, employment, marital, children and sibling conflicts, repeated evidence caps, lexical fallback and deterministic index rebuilds.
+
 ## 0.4.0 - 2026-07-31
 
 See the [v0.4.0 release review](docs/releases/v0.4.0.md) for defect classification, root causes, verification and lessons learned.
