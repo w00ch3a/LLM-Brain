@@ -223,6 +223,13 @@ module.LLMBrainMemoryProvider().save_config({
 }, str(hermes_home))
 saved_config = __import__("json").loads((hermes_home / "llm-brain.json").read_text(encoding="utf-8"))
 assert set(saved_config) == module.CONFIG_KEYS
+default_config = module._load_config(None)
+assert set(default_config) == module.CONFIG_KEYS
+assert default_config["strategy"] == "hybrid"
+config_path = hermes_home / "llm-brain.json"
+config_before = config_path.read_bytes()
+assert module._load_config(hermes_home) == saved_config
+assert config_path.read_bytes() == config_before
 assert module._workspace(hermes_home, "hermes") == (hermes_home / "workspace/hermes").resolve()
 
 restricted = module._tool_evidence([{
@@ -265,6 +272,19 @@ assert time.monotonic() - started < 2.0
 
 provider = module.LLMBrainMemoryProvider()
 provider.initialize("session-1", hermes_home=str(hermes_home), agent_workspace=str(workspace), platform="cli", agent_identity="self-check", user_id="self-check-user", agent_context="primary")
+schema = provider.get_tool_schemas()[0]
+assert schema["name"] == "llm_brain_search"
+assert "intent" in schema["parameters"]["properties"] and "current_state" in schema["parameters"]["properties"]["intent"]["enum"]
+captured_bridge_args = []
+real_bridge_call = module._bridge_call
+module._bridge_call = lambda config, source, args: captured_bridge_args.append(list(args)) or {"status": "ok", "context_markdown": "state context", "results": []}
+tool_result = provider.handle_tool_call("llm_brain_search", {"query": "state query", "intent": "current_state"})
+assert "state context" in tool_result
+assert "--intent" in captured_bridge_args[0] and captured_bridge_args[0][captured_bridge_args[0].index("--intent") + 1] == "current_state"
+captured_bridge_args.clear()
+provider.handle_tool_call("llm_brain_search", {"query": "factual query"})
+assert "--intent" in captured_bridge_args[0] and captured_bridge_args[0][captured_bridge_args[0].index("--intent") + 1] == "factual"
+module._bridge_call = real_bridge_call
 # Selecting the context engine makes it the sole recall injector; durable
 # capture remains owned by the provider.
 config_pkg = types.ModuleType("hermes_cli")

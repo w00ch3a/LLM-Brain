@@ -5,19 +5,13 @@
 ## Local release gate
 
 ```bash
-codex_skills="${CODEX_SKILLS_ROOT:-${CODEX_HOME:-$HOME/.codex}/skills}"
-bash -n bin/llm-brain
-bash tests/self-check.sh
-bash tests/okf-self-check.sh
-bash tests/v3-self-check.sh
-python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/llm-brain
-python3 "$codex_skills/.system/skill-creator/scripts/quick_validate.py" skills/llm-brain-upgrade
-python3 "$codex_skills/.system/plugin-creator/scripts/validate_plugin.py" .
-bash scripts/package-ai-skill.sh
-bash tests/upgrade-self-check.sh
-bash tests/automatic-use-self-check.sh
-git diff --check
+bash tests/release-readiness-self-check.sh
+bash tests/release-readiness-self-check.sh --release
 ```
+
+The aggregate gate includes the v3, work-queue, reflection-scheduler, temporal, retrieval-planner, procedure, reconsolidation, scope-feedback, experimental, evaluation, compatibility, Hermes, upgrade, packaging and presentation checks. `--release` additionally requires real Hermes source, skill/plugin validators and the packaged Hermes plugin. The v3 gate is authoritative; the deleted legacy gate must not be called.
+
+The Hermes checks verify `hermes memory setup llm-brain`, `load_memory_provider("llm-brain")`, both registrations, the unchanged six configuration keys and any saved configuration. Optional `llm_brain_search` intent is additive, while provider capture, ContextEngine sole-injector behaviour, native compressor inheritance and fail-open recall remain compatibility checks.
 
 Verify both archives are byte-reproducible, their checksums match, every Codex/Claude/Gemini manifest equals `VERSION`, and each packaged CLI prints exactly `VERSION`.
 

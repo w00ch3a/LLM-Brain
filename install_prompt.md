@@ -46,6 +46,7 @@ Apply this setup without making the user choose each item:
 - Enable automatic recall, authorised end-of-task capture and selective reflection.
 - Use an existing local vector provider when available; otherwise use built-in lexical search. Include evidence and use the standard 4,000-token budget.
 - Enable privacy protections. Keep experiments and migrations off. For Hermes, enable the MemoryProvider and retain the built-in context compressor.
+- Keep `LLM_BRAIN_COMMITMENT_POLICY=shadow`: record derived transition decisions without changing existing promotion behaviour. Current-state resolution and procedure capsules remain explicit opt-in workflows.
 
 Configure only the agent host receiving this prompt. Mention other detected hosts after installation as optional additions; do not modify them automatically.
 

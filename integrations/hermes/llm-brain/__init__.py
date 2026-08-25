@@ -54,6 +54,7 @@ CONFIG_KEYS = {
     "vault_root", "cli_path", "project_id", "strategy",
     "recall_budget_tokens", "timeout_seconds",
 }
+SEARCH_INTENTS = {"factual", "current_state", "historical", "procedure", "evidence", "exploratory"}
 SENSITIVE_RE = re.compile(
     r"(?i)(?:api[_ -]?key|secret|password|token|authorization|bearer|private key)\s*[:=]\s*\S+"
     r"|\bbearer\s+\S+"
@@ -343,12 +344,16 @@ def _bridge_call(config: Dict[str, Any], source_root: Path, args: List[str]) -> 
     return payload
 
 
-def _recall(config: Dict[str, Any], hermes_home: Path, source_root: Path, principal: str, query: str, exploratory: bool = False) -> Optional[Dict[str, Any]]:
+def _recall(
+    config: Dict[str, Any], hermes_home: Path, source_root: Path, principal: str,
+    query: str, exploratory: bool = False, intent: str = "factual",
+) -> Optional[Dict[str, Any]]:
     del hermes_home  # The bridge is profile-independent; its input is temporary.
     if not query.strip():
         return None
     if len(query.encode("utf-8", "replace")) > MAX_QUERY_BYTES:
         query = query.encode("utf-8", "replace")[:MAX_QUERY_BYTES].decode("utf-8", "ignore")
+    intent = intent if intent in SEARCH_INTENTS else "factual"
     query_file = None
     try:
         query_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="llm-brain-query-", suffix=".txt", delete=False)
@@ -356,7 +361,7 @@ def _recall(config: Dict[str, Any], hermes_home: Path, source_root: Path, princi
         query_file.close()
         args = [
             "recall", "--source-root", str(source_root), "--query-file", query_file.name,
-            "--principal", principal, "--intent", "factual", "--strategy", str(config.get("strategy", "hybrid")),
+                    "--principal", principal, "--intent", intent, "--strategy", str(config.get("strategy", "hybrid")),
             "--budget-tokens", str(config.get("recall_budget_tokens", DEFAULT_BUDGET)),
             "--require-evidence",
         ]
@@ -495,6 +500,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
                 "properties": {
                     "query": {"type": "string", "description": "The current question or task."},
                     "exploratory": {"type": "boolean", "description": "Allow duplicate-suppressed exploratory retrieval."},
+                    "intent": {"type": "string", "enum": sorted(SEARCH_INTENTS), "description": "Optional retrieval intent; current_state is opt-in."},
                 },
                 "required": ["query"],
             },
@@ -505,7 +511,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
             return json.dumps({"status": "error", "error": "unknown tool"})
         payload = _recall(
             self._config, self._hermes_home, self._source_root, self._principal,
-            str(args.get("query") or ""), bool(args.get("exploratory", False)),
+            str(args.get("query") or ""), bool(args.get("exploratory", False)), str(args.get("intent") or "factual"),
         )
         return json.dumps(payload, ensure_ascii=False) if payload is not None else json.dumps({"status": "unavailable", "results": []})
 

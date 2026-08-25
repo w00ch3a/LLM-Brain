@@ -33,7 +33,7 @@ authoritative files
                             lexical · vector · graph
                                           │
                                           ▼
-                              bounded context packs
+                              state-safe context packs
                                           │
                                           ▼
                                         agent
@@ -209,12 +209,33 @@ LLM-Brain supports:
 - conflict-aware Hermes evidence retrieval that ranks user content separately from assistant suggestions, preserves competing dates, and exposes resolution mode and provenance in bridge JSON;
 - exact identifier, factual, current-state, historical, procedure, evidence and exploratory intents;
 - current and as-of temporal views with unknown-validity handling;
+- opt-in state resolution that follows validity, retraction, visibility, supersession/version chains and dependencies. Conflicts are reported as warnings, never selected as current truth;
+- independent-source accounting over selected evidence, so repeated records derived from one root cannot masquerade as independent support;
 - principal and audience visibility;
 - cross-episode consolidation, contradiction reviews and reversible projections;
 - governed procedure runs, outcome evidence and usefulness feedback;
 - evaluation across raw sources, episodes and canonical retrieval under the same budget.
 
 Experimental prediction-error reflection and procedure replay remain disabled until you enable their separate flags. Learned routing, latent memory and adaptive KV integration stay behind negative evidence gates until an implementation earns them.
+
+### State, commitment and procedure controls
+
+Current-state retrieval is opt-in: use `search ... --intent current_state` or `pack build ... --intent current_state`. Normal factual and historical retrieval retain their existing behaviour. A current-state result can be `current`, `unknown-validity`, `unresolved-conflict`, `unresolved-dependency`, `unresolved-inaccessible`, `invalid-cycle` or `historical`; unresolved material appears in a warning section.
+
+Reflection candidates may declare `brain_commitment_action: persist|use-now|reverify|ask|quarantine` plus a reason and optional re-verification or clarification fields. `LLM_BRAIN_COMMITMENT_POLICY=shadow` is the default and records hash-bound derived decisions without changing legacy promotion. `enforce` routes persist through the existing promotion policy and keeps transient, validation and quarantine outcomes non-canonical. `legacy` disables the additional gate.
+
+Reusable procedures can be prepared for an exact target:
+
+```bash
+./bin/llm-brain run prepare PROJECT_ID okf/procedures/release.md \
+  --task "release checks" --principal hermes:default \
+  --binding environment=staging --binding branch=main \
+  --verification "record the test report"
+./bin/llm-brain run start PROJECT_ID okf/procedures/release.md \
+  --capsule runs/prepared/CAPSULE.md --request-id release-1
+```
+
+Capsules bind the procedure hash, task, principal, bindings, evidence and verification requirements. They are idempotent, non-canonical and never automatically executed or injected by Hermes. Changed, hidden or unresolved procedures make a capsule stale.
 
 ## Safety boundaries
 
@@ -234,8 +255,8 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.5.3
-./bin/llm-brain upgrade apply --all --host auto --target 0.5.3 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.6.1
+./bin/llm-brain upgrade apply --all --host auto --target 0.6.1 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -244,14 +265,8 @@ Installation and ordinary memory use do not migrate a live vault. Keep the exist
 ## Development
 
 ```bash
-bash -n bin/llm-brain
-bash tests/self-check.sh
-bash tests/okf-self-check.sh
-bash tests/v3-self-check.sh
-bash tests/hermes-integration-self-check.sh
-bash scripts/package-ai-skill.sh
-bash scripts/package-hermes-plugin.sh /tmp/llm-brain-hermes-package
-git diff --check
+bash tests/release-readiness-self-check.sh
+bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and [the v0.5.3 release notes](docs/releases/v0.5.3.md) for this release.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.6.1 release notes](docs/releases/v0.6.1.md) for this migration-free release.

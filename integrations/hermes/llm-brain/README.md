@@ -6,7 +6,7 @@ This standalone plugin connects Hermes Agent to a local LLM-Brain vault. Hermes 
 
 ### `LLMBrainMemoryProvider`
 
-Hermes activates the provider through `memory.provider: llm-brain`. It supports:
+Hermes activates the provider through `hermes memory setup llm-brain` and `memory.provider: llm-brain`. It supports:
 
 - local availability checks and profile-scoped configuration;
 - pre-request recall through `llm-brain bridge recall`;
@@ -20,6 +20,8 @@ Hermes activates the provider through `memory.provider: llm-brain`. It supports:
 Primary-agent turns store full user and assistant text plus session, principal, platform and delegation lineage. Tool evidence stores names, call IDs, outcomes and result hashes. Each safe excerpt is capped at 8 KiB, with a 64 KiB total cap per turn. Sensitive results keep the hash and call lineage without content-derived paths, status text or excerpts.
 
 The provider captures evidence into `sources/`, `episodes/` and `review/`. It cannot write `okf/` directly.
+
+The existing selector contract is unchanged: the provider name is `llm-brain`, the six configuration keys are `vault_root`, `cli_path`, `project_id`, `strategy`, `recall_budget_tokens` and `timeout_seconds`, and saved configuration is loaded without rewriting. Automatic provider prefetch and ContextEngine recall always use factual intent in this release. The `llm_brain_search` tool accepts an optional `intent` of `factual`, `current_state`, `historical`, `procedure`, `evidence` or `exploratory`; `current_state` is never selected implicitly. New state and independent-source fields in bridge JSON are additive and older Hermes installations may ignore them.
 
 ### `LLMBrainContextEngine`
 
@@ -83,6 +85,8 @@ llm-brain bridge capture --source-root PATH --record FILE
 ```
 
 JSON is transport only. Source custody, episodes, reviews and canonical OKF remain Markdown in the vault.
+
+Current-state context keeps unresolved records in the bounded `context_markdown` warning section. Malformed JSON, unsupported fields and bridge timeouts remain fail-open. The MemoryProvider continues durable capture while the ContextEngine is selected, and remains suppressed as an injector in that mode. Native Hermes compression, token accounting, model switching, message ordering and tool-call/result pairing are untouched. Procedure capsules are prepared and started explicitly through the CLI; Hermes does not execute or inject them.
 
 ## Runtime footprint
 
