@@ -21,7 +21,7 @@ Primary-agent turns store full user and assistant text plus session, principal, 
 
 The provider captures evidence into `sources/`, `episodes/` and `review/`. It cannot write `okf/` directly.
 
-The existing selector contract is unchanged: the provider name is `llm-brain`, the six configuration keys are `vault_root`, `cli_path`, `project_id`, `strategy`, `recall_budget_tokens` and `timeout_seconds`, and saved configuration is loaded without rewriting. Automatic provider prefetch and ContextEngine recall always use factual intent in this release. The `llm_brain_search` tool accepts an optional `intent` of `factual`, `current_state`, `historical`, `procedure`, `evidence` or `exploratory`; `current_state` is never selected implicitly. New state and independent-source fields in bridge JSON are additive and older Hermes installations may ignore them.
+The existing selector contract is unchanged: the provider name is `llm-brain`, the six configuration keys are `vault_root`, `cli_path`, `project_id`, `strategy`, `recall_budget_tokens` and `timeout_seconds`, and saved configuration is loaded without rewriting. Automatic provider prefetch and ContextEngine recall always use factual intent in this release. The `llm_brain_search` tool accepts an optional `intent` of `factual`, `current_state`, `historical`, `procedure`, `evidence` or `exploratory`; `current_state` and lifecycle evidence bundles are never selected implicitly. Explicit evidence intent adds structured `evidence_bundles` entries with role, state, excerpt, source hash, warnings and incomplete markers. New state, relation and independent-source fields in bridge JSON are additive and older Hermes installations may ignore them.
 
 ### `LLMBrainContextEngine`
 
@@ -87,6 +87,8 @@ llm-brain bridge capture --source-root PATH --record FILE
 JSON is transport only. Source custody, episodes, reviews and canonical OKF remain Markdown in the vault.
 
 Current-state context keeps unresolved records in the bounded `context_markdown` warning section. Malformed JSON, unsupported fields and bridge timeouts remain fail-open. The MemoryProvider continues durable capture while the ContextEngine is selected, and remains suppressed as an injector in that mode. Native Hermes compression, token accounting, model switching, message ordering and tool-call/result pairing are untouched. Procedure capsules are prepared and started explicitly through the CLI; Hermes does not execute or inject them.
+
+When a caller requests `intent: evidence`, the bridge includes bounded lifecycle `evidence_bundles` around selected records. Supporting, conflicting, historical, superseded and unresolved evidence remains labelled and source-bound; each entry carries its role/state, bounded excerpt and source hash, while `warnings` and `incomplete` report unresolved, hidden, truncated or budget-limited relationships. Hidden records are filtered before context or counts are rendered. The bundle is derived context, not canonical memory, and it cannot grant authority to external or derived text. Capsule dependency validation is likewise a CLI guard: Hermes does not prepare, validate, approve or execute capsules. These additions leave factual prefetch, the six configuration keys and the provider/ContextEngine single-injector contract unchanged.
 
 ## Runtime footprint
 

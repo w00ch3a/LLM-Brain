@@ -12,8 +12,12 @@ output_dir="${1:-$repo_root/dist/hermes/llm-brain}"
 [ -f "$source_dir/plugin.yaml" ] || { printf 'missing Hermes plugin manifest\n' >&2; exit 66; }
 mkdir -p "$(dirname "$output_dir")"
 stage="${output_dir}.tmp.$$"
-mkdir -p "$stage"
+mkdir -p "$stage/docs/releases" "$stage/docs/research"
 cp "$source_dir/__init__.py" "$source_dir/README.md" "$stage/"
+cp "$repo_root/docs/evaluation.md" "$stage/docs/evaluation.md"
+cp "$repo_root/docs/releases/v0.6.2.md" "$stage/docs/releases/v0.6.2.md"
+cp "$repo_root/docs/releases/unreleased.md" "$stage/docs/releases/unreleased.md"
+cp "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$stage/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 sed "s/^version: .*/version: $version/" "$source_dir/plugin.yaml" >"$stage/plugin.yaml"
 python3 - "$stage/__init__.py" <<'PY'
 from pathlib import Path

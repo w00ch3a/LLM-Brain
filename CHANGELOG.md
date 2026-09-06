@@ -1,5 +1,25 @@
 # Changelog
 
+# 0.6.2 - 2026-09-06
+
+## Research-driven lifecycle safety
+
+- Added deterministic current-state resolution with bounded dependency,
+  supersession, validity, visibility and conflict handling.
+- Added hash-bound commitment decisions, independent-source accounting and
+  target-bound procedure capsules with read-only validation.
+- Added explicit lifecycle evidence bundles, warning-first incomplete results,
+  poisoning/repair regressions and the repository-only longitudinal evaluator.
+- Preserved schema 3, factual retrieval defaults, Hermes provider/context-engine
+  contracts, fail-open behaviour and migration-free upgrades.
+
+## Release verification
+
+- Added release-readiness checks for compatibility, safe upgrades, package
+  reproducibility, documentation, supported Hermes source and version parity.
+- No live-vault migration, daemon, database, model training or new runtime
+  dependency is introduced.
+
 # 0.6.1 - 2026-08-25
 
 - Packaged the state-safe memory, commitment-policy and target-bound procedure work with the complete release-readiness gate.

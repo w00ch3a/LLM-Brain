@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:
@@ -255,6 +255,18 @@ def concept_issues(metadata: dict[str, Any], body: str) -> list[str]:
         values = depends_on if isinstance(depends_on, list) else [depends_on]
         if not values or not all(isinstance(value, str) and value.strip() for value in values):
             issues.append("brain_depends_on must contain non-empty references")
+    for field in (
+        "brain_supersedes",
+        "brain_conflicts",
+        "brain_supports",
+    ):
+        value = metadata.get(field)
+        if value is not None:
+            values = value if isinstance(value, list) else [value]
+            if not values or not all(
+                isinstance(item, str) and item.strip() for item in values
+            ):
+                issues.append(f"{field} must contain non-empty references")
     required_bindings = metadata.get("brain_required_bindings")
     if required_bindings is not None and (
         not isinstance(required_bindings, str) or not required_bindings.strip()
@@ -710,6 +722,915 @@ def command_field(args: argparse.Namespace) -> int:
     return 0
 
 
+class LifecycleResolver:
+    """Small, read-only resolver shared by capsule and retrieval metadata.
+
+    The CLI remains responsible for locks and writes.  This helper owns the
+    YAML-aware parts of relation traversal so commas, aliases and restricted
+    metadata cannot be confused with delimiters in shell strings.
+    """
+
+    relation_fields = (
+        ("brain_supports", "supports", "supported_by"),
+        ("brain_conflicts", "conflicts", "conflicted_by"),
+        ("brain_supersedes", "supersedes", "superseded_by"),
+        ("brain_version_of", "version_of", "versioned_by"),
+        ("brain_depends_on", "depends_on", "depended_on_by"),
+        ("brain_derived_from", "derived_from", "derived_by"),
+    )
+
+    def __init__(self, root: Path, principal: str = "", as_of: str = "") -> None:
+        self.root = root.expanduser().resolve()
+        self.principal = principal.strip() if isinstance(principal, str) else ""
+        self.as_of_error = ""
+        if as_of:
+            try:
+                parsed = dt.datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("timezone required")
+                self.as_of = parsed
+            except (TypeError, ValueError):
+                self.as_of = dt.datetime.now(dt.timezone.utc)
+                self.as_of_error = "invalid-as-of"
+        else:
+            self.as_of = dt.datetime.now(dt.timezone.utc)
+        self.metadata: dict[Path, dict[str, Any]] = {}
+        self.bodies: dict[Path, str] = {}
+        self.errors: dict[Path, str] = {}
+        self.ref_cache: dict[str, Path | None] = {}
+        self.ref_errors: dict[str, str] = {}
+        self.relation_errors: set[tuple[Path, str, str]] = set()
+        files: list[Path] = []
+        okf = self.root / "okf"
+        if okf.is_dir():
+            for candidate in okf.rglob("*.md"):
+                if candidate.name in RESERVED or "retractions" in candidate.parts:
+                    continue
+                try:
+                    resolved = candidate.resolve()
+                    resolved.relative_to(self.root)
+                except (OSError, ValueError):
+                    continue
+                if resolved.is_file():
+                    files.append(resolved)
+        self.files = sorted(set(files))
+        self.file_set = set(self.files)
+        # Parse once per request so reverse expansion and state resolution see
+        # one stable view and malformed records fail closed consistently.
+        for path in self.files:
+            self.load(path)
+
+    def load(self, path: Path) -> dict[str, Any]:
+        try:
+            path = path.resolve()
+        except OSError:
+            return {}
+        if path not in self.metadata:
+            try:
+                metadata, body = split_frontmatter(path)
+            except (OSError, OkfError):
+                metadata, body = {}, ""
+                self.errors[path] = "malformed-record"
+            self.metadata[path] = metadata
+            self.bodies[path] = body
+        return self.metadata[path]
+
+    @staticmethod
+    def _split_refs(value: Any) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, list) else [value]
+        result: list[str] = []
+        for item in values:
+            if not isinstance(item, str):
+                raise ValueError("reference must be a string")
+            comma_parts = item.split(",")
+            for comma_part in comma_parts:
+                lines = comma_part.splitlines() or [comma_part]
+                found = False
+                for line in lines:
+                    text = line.strip()
+                    if text:
+                        result.append(text)
+                        found = True
+                if not found and len(comma_parts) > 1:
+                    raise ValueError("empty reference")
+        return list(dict.fromkeys(result))
+
+    @staticmethod
+    def refs(value: Any) -> list[str]:
+        """Compatibility accessor used by older callers; invalid refs fail closed."""
+
+        try:
+            return LifecycleResolver._split_refs(value)
+        except ValueError:
+            return []
+
+    @staticmethod
+    def _safe_ref(ref: Any) -> tuple[str, str | None]:
+        if not isinstance(ref, str):
+            return "", "invalid-reference"
+        text = ref.strip()
+        if not text:
+            return "", "empty-reference"
+        if "\x00" in text or "\n" in text or "\r" in text or "\\" in text:
+            return "", "invalid-reference"
+        if text.startswith("/"):
+            return "", "path-escape"
+        if ".." in PurePosixPath(text).parts:
+            return "", "path-escape"
+        while text.startswith("./"):
+            text = text[2:]
+        return text, None
+
+    def _parse_relation_refs(self, path: Path, field: str) -> list[str]:
+        raw = self.load(path).get(field)
+        if raw is not None:
+            values = raw if isinstance(raw, list) else [raw]
+            if not values or any(
+                not isinstance(item, str) or not item.strip() for item in values
+            ):
+                self.relation_errors.add((path, field, "malformed-relation"))
+                raise OkfError("malformed relation")
+        try:
+            return self._split_refs(raw)
+        except ValueError as exc:
+            self.relation_errors.add((path, field, "malformed-relation"))
+            raise OkfError("malformed relation") from exc
+
+    def _identity_refs(self, path: Path, field: str) -> list[str] | None:
+        try:
+            return self._split_refs(self.load(path).get(field))
+        except ValueError:
+            self.relation_errors.add((path, field, "malformed-visibility"))
+            return None
+
+    def relative(self, path: Path) -> str:
+        return path.resolve().relative_to(self.root).as_posix()
+
+    def _record_sensitivity(self, path: Path) -> str:
+        metadata = self.load(path)
+        value = metadata.get("brain_sensitivity", metadata.get("sensitivity", "internal"))
+        if value is None:
+            return "internal"
+        return value if isinstance(value, str) else "invalid"
+
+    def visible(self, path: Path, *, strict_principal: bool = True) -> bool:
+        try:
+            path = path.resolve()
+        except OSError:
+            return False
+        if path not in self.file_set or path in self.errors:
+            return False
+        # Only the explicitly approved internal class is traversable.  Unknown
+        # or malformed classifications fail closed instead of being emitted.
+        if self._record_sensitivity(path) != "internal":
+            return False
+        scoped = self._identity_refs(path, "brain_principal")
+        audience = self._identity_refs(path, "brain_audience")
+        if scoped is None or audience is None:
+            return False
+        identities = scoped + audience
+        if not identities:
+            return True
+        if not self.principal:
+            return not strict_principal
+        return self.principal in identities
+
+    def effective(self, path: Path) -> bool:
+        try:
+            path = path.resolve()
+        except OSError:
+            return False
+        if path not in self.file_set or path in self.errors:
+            return False
+        metadata = self.load(path)
+        if (self.root / "okf" / "retractions" / f"{path.stem}.md").is_file():
+            return False
+        status_value = metadata.get("status", "stable")
+        review_value = metadata.get("brain_review_state", metadata.get("review_state", ""))
+        if not isinstance(status_value, str) or not isinstance(review_value, str):
+            return False
+        status = status_value.strip().lower()
+        review_state = review_value.strip().lower()
+        if status == "deprecated":
+            return False
+        if review_state:
+            return review_state == "approved"
+        return status == "stable"
+
+    def canonical_ref(self, ref: str) -> Path | None:
+        text, error = self._safe_ref(ref)
+        if error:
+            if isinstance(ref, str):
+                self.ref_errors[ref.strip()] = error
+            return None
+        if text in self.ref_cache:
+            return self.ref_cache[text]
+        try:
+            candidate_path = (self.root / text).resolve()
+            candidate_path.relative_to(self.root)
+        except (OSError, ValueError):
+            candidate_path = None
+        if candidate_path is not None and candidate_path in self.file_set:
+            self.ref_cache[text] = candidate_path
+            return candidate_path
+        wanted = text.removesuffix(".md")
+        matches: list[Path] = []
+        for path in self.files:
+            rel = self.relative(path)
+            ids = []
+            metadata = self.load(path)
+            for key in (
+                "brain_claim_id",
+                "brain_procedure_id",
+                "brain_reference_id",
+                "brain_topic_id",
+            ):
+                identity_refs = self._identity_refs(path, key)
+                if identity_refs is not None:
+                    ids.extend(identity_refs)
+            if text in (rel, f"{rel}.md", path.stem) or wanted == path.stem or text in ids:
+                matches.append(path)
+        result = matches[0] if len(matches) == 1 else None
+        self.ref_cache[text] = result
+        if result is None:
+            self.ref_errors[text] = "ambiguous-reference" if len(matches) > 1 else "missing-reference"
+        return result
+
+    def _targets(self, path: Path, field: str) -> list[Path]:
+        targets: list[Path] = []
+        for reference in self._parse_relation_refs(path, field):
+            target = self.canonical_ref(reference)
+            if target is None:
+                raise OkfError("unresolved relation target")
+            if target not in targets:
+                targets.append(target)
+        return sorted(targets, key=self.relative)
+
+    def _temporal_detail(self, path: Path) -> tuple[str, str]:
+        metadata = self.load(path)
+        start_value = metadata.get("brain_valid_from")
+        end_value = metadata.get("brain_valid_to")
+        if not isinstance(start_value, str) or not isinstance(end_value, str):
+            return "unknown-validity", "validity-not-declared"
+        try:
+            start = dt.datetime.fromisoformat(start_value.strip().replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(end_value.strip().replace("Z", "+00:00"))
+            if start.tzinfo is None or end.tzinfo is None:
+                raise ValueError("timezone required")
+        except ValueError:
+            return "unknown-validity", "invalid-validity"
+        if start >= end:
+            return "unknown-validity", "invalid-validity"
+        if start <= self.as_of < end:
+            return "current", "within-validity"
+        return "historical", "outside-validity"
+
+    def temporal(self, path: Path) -> str:
+        return self._temporal_detail(path)[0]
+
+    def _current_successors(self, path: Path) -> tuple[list[Path], str | None]:
+        successors: list[Path] = []
+        for candidate in self.files:
+            if candidate == path or not self.effective(candidate) or not self.visible(candidate):
+                continue
+            try:
+                relation_targets = self._targets(candidate, "brain_supersedes")
+                relation_targets += self._targets(candidate, "brain_version_of")
+            except OkfError:
+                continue
+            if path not in relation_targets:
+                continue
+            candidate_temporal, _ = self._temporal_detail(candidate)
+            if candidate_temporal == "current":
+                successors.append(candidate)
+        successors = sorted(set(successors), key=self.relative)
+        return successors, None
+
+    def resolve(
+        self, path: Path, stack: tuple[str, ...] = (), depth: int = 0
+    ) -> dict[str, Any]:
+        try:
+            path = path.resolve()
+        except OSError:
+            return {"state": "unresolved-dependency", "reason": "missing", "effective_ref": ""}
+        rel = self.relative(path) if path in self.file_set else ""
+        if depth >= 32:
+            return {"state": "invalid-cycle", "reason": "lineage-hop-limit", "effective_ref": rel}
+        if rel in stack:
+            return {"state": "invalid-cycle", "reason": "dependency-cycle", "effective_ref": rel}
+        if path not in self.file_set:
+            return {"state": "unresolved-dependency", "reason": "missing", "effective_ref": rel}
+        if path in self.errors:
+            return {
+                "state": "unresolved-dependency",
+                "reason": "malformed-record",
+                "effective_ref": rel,
+            }
+        if not self.visible(path):
+            return {
+                "state": "unresolved-inaccessible",
+                "reason": "not-visible",
+                "effective_ref": rel,
+            }
+        if not self.effective(path):
+            return {"state": "historical", "reason": "not-effective", "effective_ref": rel}
+        temporal, temporal_reason = self._temporal_detail(path)
+        if temporal == "historical":
+            return {"state": "historical", "reason": temporal_reason, "effective_ref": rel}
+        metadata = self.load(path)
+        next_stack = stack + (rel,)
+
+        # A conflict is active only when its target is also current.  Future or
+        # expired conflict records must not poison an as-of resolution.
+        try:
+            conflict_targets = self._targets(path, "brain_conflicts")
+        except OkfError:
+            return {"state": "unresolved-conflict", "reason": "malformed-conflict", "effective_ref": rel}
+        for target in conflict_targets:
+            if not self.visible(target):
+                return {
+                    "state": "unresolved-inaccessible",
+                    "reason": "conflict-not-visible",
+                    "effective_ref": rel,
+                }
+            if not self.effective(target):
+                continue
+            target_temporal, _ = self._temporal_detail(target)
+            if target_temporal == "current":
+                return {
+                    "state": "unresolved-conflict",
+                    "reason": "explicit-conflict",
+                    "effective_ref": rel,
+                }
+            if target_temporal == "unknown-validity":
+                return {
+                    "state": "unresolved-conflict",
+                    "reason": "unknown-validity-conflict",
+                    "effective_ref": rel,
+                }
+
+        # Lineage declarations are required to resolve to an accessible record,
+        # but the predecessor may naturally be historical after a replacement.
+        for field in ("brain_supersedes", "brain_version_of"):
+            try:
+                lineage_targets = self._targets(path, field)
+            except OkfError:
+                return {
+                    "state": "unresolved-dependency",
+                    "reason": "malformed-lineage",
+                    "effective_ref": rel,
+                }
+            for target in lineage_targets:
+                if not self.visible(target):
+                    return {
+                        "state": "unresolved-inaccessible",
+                        "reason": "lineage-not-visible",
+                        "effective_ref": rel,
+                    }
+                if not self.effective(target):
+                    return {
+                        "state": "unresolved-dependency",
+                        "reason": "lineage-not-effective",
+                        "effective_ref": rel,
+                    }
+
+        successors, _ = self._current_successors(path)
+        if len(successors) > 1:
+            return {
+                "state": "unresolved-conflict",
+                "reason": "ambiguous-successor",
+                "effective_ref": rel,
+            }
+        if successors:
+            successor = self.resolve(successors[0], next_stack, depth + 1)
+            if successor["state"] == "invalid-cycle":
+                return {
+                    "state": "invalid-cycle",
+                    "reason": (
+                        successor.get("reason", "successor-cycle")
+                        if successor.get("reason") == "lineage-hop-limit"
+                        else "successor-cycle"
+                    ),
+                    "effective_ref": rel,
+                }
+            if successor["state"] in {
+                "unresolved-conflict",
+                "unresolved-dependency",
+                "unresolved-inaccessible",
+            }:
+                return {
+                    "state": successor["state"],
+                    "reason": f"successor-{successor['reason']}",
+                    "effective_ref": rel,
+                }
+            return {
+                "state": "historical",
+                "reason": "superseded",
+                "effective_ref": successor.get("effective_ref", self.relative(successors[0])),
+            }
+
+        state_key_value = metadata.get("brain_state_key", "")
+        if state_key_value is not None and not isinstance(state_key_value, str):
+            return {
+                "state": "unresolved-conflict",
+                "reason": "invalid-state-key",
+                "effective_ref": rel,
+            }
+        state_key = state_key_value.strip() if isinstance(state_key_value, str) else ""
+        if state_key:
+            for other in self.files:
+                if other == path or not self.visible(other) or not self.effective(other):
+                    continue
+                other_metadata = self.load(other)
+                other_key = other_metadata.get("brain_state_key", "")
+                if not isinstance(other_key, str) or other_key.strip() != state_key:
+                    continue
+                other_temporal, _ = self._temporal_detail(other)
+                if other_temporal == "unknown-validity":
+                    return {
+                        "state": "unresolved-conflict",
+                        "reason": "unknown-validity-state-record",
+                        "effective_ref": rel,
+                    }
+                if other_temporal != "current":
+                    continue
+                other_successors, _ = self._current_successors(other)
+                if len(other_successors) > 1:
+                    return {
+                        "state": "unresolved-conflict",
+                        "reason": "ambiguous-successor",
+                        "effective_ref": rel,
+                    }
+                if not other_successors:
+                    return {
+                        "state": "unresolved-conflict",
+                        "reason": "multiple-active-state-records",
+                        "effective_ref": rel,
+                    }
+
+        try:
+            dependencies = self._targets(path, "brain_depends_on")
+        except OkfError:
+            return {
+                "state": "unresolved-dependency",
+                "reason": "malformed-dependency",
+                "effective_ref": rel,
+            }
+        for target in dependencies:
+            if not self.visible(target):
+                return {
+                    "state": "unresolved-inaccessible",
+                    "reason": "dependency-not-visible",
+                    "effective_ref": rel,
+                }
+            if not self.effective(target):
+                return {
+                    "state": "unresolved-dependency",
+                    "reason": "dependency-not-effective",
+                    "effective_ref": rel,
+                }
+            dependency = self.resolve(target, next_stack, depth + 1)
+            if dependency["state"] != "current":
+                if dependency["state"] == "invalid-cycle":
+                    return {
+                        "state": "invalid-cycle",
+                        "reason": f"dependency-{dependency['reason']}",
+                        "effective_ref": rel,
+                    }
+                return {
+                    "state": "unresolved-dependency",
+                    "reason": f"dependency-{dependency['state']}",
+                    "effective_ref": rel,
+                }
+        if temporal == "unknown-validity":
+            return {"state": temporal, "reason": temporal_reason, "effective_ref": rel}
+        return {"state": "current", "reason": "effective", "effective_ref": rel}
+
+    def dependency_snapshot(self, references: list[str]) -> dict[str, Any]:
+        if self.as_of_error:
+            return self._snapshot_failure("unresolved-dependency", self.as_of_error)
+        try:
+            references = self._split_refs(references)
+        except ValueError:
+            return self._snapshot_failure("unresolved-dependency", "malformed-reference")
+        roots: list[Path] = []
+        seen_roots: set[Path] = set()
+        for reference in references:
+            target = self.canonical_ref(reference)
+            if target is None:
+                return self._snapshot_failure(
+                    "unresolved-inaccessible"
+                    if self.ref_errors.get(reference) == "path-escape"
+                    else "unresolved-dependency",
+                    self.ref_errors.get(reference, "dependency-missing"),
+                )
+            if target not in seen_roots:
+                roots.append(target)
+                seen_roots.add(target)
+        if not roots:
+            refs_wire = "none"
+            hashes_wire = "none"
+            return {
+                "state": "none",
+                "reason": "no-dependencies",
+                "refs": [],
+                "hashes": [],
+                "refs_wire": refs_wire,
+                "hashes_wire": hashes_wire,
+                "snapshot_hash": hashlib.sha256(
+                    f"{refs_wire}|{hashes_wire}".encode()
+                ).hexdigest(),
+                "node_count": 0,
+            }
+        records: dict[str, dict[str, str]] = {}
+        visited: set[Path] = set()
+
+        def walk(path: Path, stack: tuple[str, ...], depth: int) -> dict[str, Any] | None:
+            if depth >= 32:
+                return self._snapshot_failure("invalid-cycle", "dependency-lineage-hop-limit")
+            if len(visited) >= 128 and path not in visited:
+                return self._snapshot_failure("unresolved-dependency", "dependency-node-limit")
+            if path not in self.file_set:
+                return self._snapshot_failure("unresolved-dependency", "dependency-missing")
+            rel = self.relative(path)
+            if rel in stack:
+                return self._snapshot_failure("invalid-cycle", "dependency-cycle")
+            if path in visited:
+                return None
+            resolution = self.resolve(path, stack, depth)
+            if resolution["state"] != "current":
+                return self._snapshot_failure(
+                    resolution["state"], f"dependency-{resolution['reason']}"
+                )
+            visited.add(path)
+            metadata = self.load(path)
+            state_key_value = metadata.get("brain_state_key", "")
+            if state_key_value is not None and not isinstance(state_key_value, str):
+                return self._snapshot_failure("unresolved-conflict", "invalid-state-key")
+            record = {
+                "ref": rel,
+                "hash": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "state": resolution["state"],
+                "effective_ref": resolution.get("effective_ref", rel),
+                "state_key": "",
+            }
+            state_key = state_key_value.strip() if isinstance(state_key_value, str) else ""
+            record["state_key"] = state_key
+            records[rel] = record
+            next_stack = stack + (rel,)
+            try:
+                dependencies = self._targets(path, "brain_depends_on")
+            except OkfError:
+                return self._snapshot_failure("unresolved-dependency", "malformed-dependency")
+            for target in dependencies:
+                failure = walk(target, next_stack, depth + 1)
+                if failure is not None:
+                    return failure
+            # A current path cannot have a current successor (resolve would have
+            # marked it historical), but checking this reverse edge keeps the
+            # closure complete if a future resolver policy returns an effective
+            # successor instead of rejecting the stale reference.
+            successors, _ = self._current_successors(path)
+            for target in successors:
+                failure = walk(target, next_stack, depth + 1)
+                if failure is not None:
+                    return failure
+            return None
+
+        for root in roots:
+            failure = walk(root, (), 0)
+            if failure is not None:
+                return failure
+        ordered = [records[key] for key in sorted(records)]
+        refs = [record["ref"] for record in ordered]
+        wire: list[str] = []
+        for record in ordered:
+            value = (
+                f"{record['ref']}={record['hash']}|state={record['state']}"
+                f"|effective={record['effective_ref']}|state_key={record['state_key']}"
+            )
+            wire.append(value)
+        refs_wire = ",".join(refs) or "none"
+        hashes_wire = ";".join(wire) or "none"
+        return {
+            "state": "current",
+            "reason": "effective",
+            "refs": refs,
+            "hashes": ordered,
+            "refs_wire": refs_wire,
+            "hashes_wire": hashes_wire,
+            "snapshot_hash": hashlib.sha256(
+                f"{refs_wire}|{hashes_wire}".encode()
+            ).hexdigest(),
+            "node_count": len(ordered),
+        }
+
+    @staticmethod
+    def _snapshot_failure(state: str, reason: str) -> dict[str, Any]:
+        hidden = state in {"unresolved-inaccessible"}
+        return {
+            "state": state,
+            "reason": reason,
+            "refs": [] if hidden else [],
+            "hashes": [],
+            "refs_wire": "none",
+            "hashes_wire": "none",
+            "snapshot_hash": "none",
+            "node_count": 0,
+        }
+
+    def lifecycle_bundle(
+        self,
+        root_file: Path,
+        *,
+        root_files: list[Path] | None = None,
+        max_records: int = 20,
+    ) -> dict[str, Any]:
+        try:
+            record_limit = max(0, min(int(max_records), 20))
+        except (TypeError, ValueError):
+            record_limit = 20
+        requested_roots = [root_file]
+        if root_files:
+            requested_roots.extend(root_files)
+        roots: list[Path] = []
+        for candidate in requested_roots:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            # Root selection is itself visibility-filtered so restricted or
+            # principal-scoped roots cannot consume a visible root slot or
+            # alter an emitted count.
+            if (
+                resolved in self.file_set
+                and resolved not in roots
+                and self.visible(resolved)
+            ):
+                roots.append(resolved)
+        root_limit_hit = len(roots) > 20
+        if root_limit_hit:
+            roots = roots[:20]
+        bounds = {
+            "max_depth": 8,
+            "max_records": record_limit,
+            "max_visited": 128,
+            "max_roots": 20,
+        }
+        result: dict[str, Any] = {
+            "schema": "llm-brain.lifecycle-bundle.v1",
+            "records": [],
+            "warnings": [],
+            "incomplete": False,
+            "visited_count": 0,
+            "max_depth": 8,
+            "max_records": record_limit,
+            "max_visited": 128,
+            "bounds": bounds,
+            "resolution": "complete",
+        }
+        if roots:
+            result["root_refs"] = [self.relative(root) for root in roots]
+        if self.as_of_error:
+            result["warnings"] = [self.as_of_error]
+            result["incomplete"] = True
+            result["resolution"] = "incomplete"
+            return result
+        if not roots:
+            result["resolution"] = "hidden"
+            return result
+
+        warnings: set[str] = set()
+        if root_limit_hit:
+            warnings.add("root-bound")
+            result["incomplete"] = True
+        visited_global: set[Path] = set()
+        record_map: dict[str, dict[str, Any]] = {}
+        budget = {"records": 0}
+        reverse: dict[Path, list[tuple[str, Path]]] = {}
+        hidden_reverse: set[Path] = set()
+        active_bundle_keys: set[str] | None = None
+
+        def warn(code: str, *, incomplete: bool = True) -> None:
+            warnings.add(code)
+            if incomplete:
+                result["incomplete"] = True
+
+        # All frontmatter was parsed in __init__.  Building this once per
+        # request avoids a per-root reparse and makes the multi-root budget
+        # deterministic.
+        for candidate in self.files:
+            candidate_visible = self.visible(candidate)
+            for field, _forward_name, reverse_name in self.relation_fields:
+                try:
+                    targets = self._targets(candidate, field)
+                except OkfError:
+                    # The malformed candidate is not itself reachable yet;
+                    # report the relationship only if the selected traversal
+                    # reaches that candidate through another edge.
+                    continue
+                for target in targets:
+                    if candidate_visible and self.visible(target):
+                        reverse.setdefault(target, []).append((reverse_name, candidate))
+                    elif self.visible(target):
+                        hidden_reverse.add(target)
+        for target in reverse:
+            reverse[target] = sorted(
+                set(reverse[target]), key=lambda item: (item[0], self.relative(item[1]))
+            )
+
+        def add_record(path: Path, roles: set[str], relation_names: set[str]) -> None:
+            rel = self.relative(path)
+            if active_bundle_keys is not None:
+                active_bundle_keys.add(rel)
+            if rel in record_map:
+                record_map[rel]["roles"] = sorted(
+                    set(record_map[rel].get("roles", [])) | roles
+                )
+                record_map[rel]["relations"] = sorted(
+                    set(record_map[rel].get("relations", [])) | relation_names
+                )
+                record_map[rel]["role"] = record_map[rel]["roles"][0]
+                record_map[rel]["relation"] = record_map[rel]["relations"][0]
+                return
+            if budget["records"] >= record_limit:
+                warn("record-bound")
+                return
+            try:
+                content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                warn("unresolved-record")
+                return
+            metadata = self.load(path)
+            title_value = metadata.get("title", "")
+            title = title_value.strip() if isinstance(title_value, str) else ""
+            excerpt = re.sub(r"\s+", " ", self.bodies.get(path, "")).strip()[:320]
+            state = self.resolve(path)
+            if state.get("state") == "unknown-validity":
+                warn("unknown-validity", incomplete=False)
+            ordered_roles = sorted(roles)
+            ordered_relations = sorted(relation_names)
+            record_map[rel] = {
+                "role": ordered_roles[0],
+                "relation": ordered_relations[0],
+                "roles": ordered_roles,
+                "relations": ordered_relations,
+                "ref": rel,
+                "effective_ref": state.get("effective_ref", rel),
+                "state": state.get("state", "unknown-validity"),
+                "state_reason": state.get("reason", "unknown"),
+                "hash": content_hash,
+                "title": title,
+                "excerpt": excerpt,
+            }
+            budget["records"] += 1
+
+        def walk(
+            path: Path,
+            depth: int,
+            roles: set[str],
+            relation_names: set[str],
+            stack: tuple[Path, ...],
+            is_root: bool = False,
+        ) -> None:
+            try:
+                path = path.resolve()
+            except OSError:
+                warn("unresolved-relation")
+                return
+            if depth > 8:
+                warn("depth-bound")
+                return
+            if path not in self.file_set or path in self.errors:
+                warn("unresolved-relation")
+                return
+            if not self.visible(path):
+                warn("hidden-relation")
+                return
+            already_visited = path in visited_global
+            if already_visited:
+                if not is_root:
+                    add_record(path, roles, relation_names)
+                return
+            if path in stack:
+                warn("cycle")
+                return
+            if not already_visited:
+                if len(visited_global) >= 128:
+                    warn("visited-bound")
+                    return
+                visited_global.add(path)
+                result["visited_count"] = len(visited_global)
+            metadata = self.load(path)
+            if not is_root:
+                add_record(path, roles, relation_names)
+                if budget["records"] >= record_limit:
+                    # The record itself is allowed; only further expansion is
+                    # truncated and reported as incomplete.
+                    if any(
+                        metadata.get(field) not in (None, "", [])
+                        for field, _forward_name, _reverse_name in self.relation_fields
+                    ):
+                        warn("record-bound")
+                    return
+            next_stack = stack + (path,)
+            for field, forward_name, _reverse_name in self.relation_fields:
+                try:
+                    targets = self._targets(path, field)
+                except OkfError:
+                    warn("unresolved-relation")
+                    continue
+                for target in targets:
+                    if not self.visible(target):
+                        warn("hidden-relation")
+                        continue
+                    if depth >= 8:
+                        warn("depth-bound")
+                        continue
+                    walk(
+                        target,
+                        depth + 1,
+                        {forward_name},
+                        {forward_name},
+                        next_stack,
+                    )
+            for reverse_name, candidate in reverse.get(path, []):
+                if depth >= 8:
+                    warn("depth-bound")
+                    continue
+                walk(
+                    candidate,
+                    depth + 1,
+                    {reverse_name},
+                    {reverse_name},
+                    next_stack,
+                )
+            if path in hidden_reverse:
+                warn("hidden-relation")
+
+        bundles: list[dict[str, Any]] = []
+        for root in roots:
+            before_visited = set(visited_global)
+            active_bundle_keys = set()
+            if not self.visible(root):
+                continue
+            walk(root, 0, set(), set(), (), is_root=True)
+            bundle_records = [record_map[key] for key in sorted(active_bundle_keys)]
+            bundle = {
+                "schema": "llm-brain.lifecycle-bundle.v1",
+                "root_ref": self.relative(root),
+                "records": bundle_records,
+                "warnings": sorted(warnings),
+                "incomplete": bool(result["incomplete"]),
+                "visited_count": len(visited_global - before_visited),
+                "max_depth": 8,
+                "max_records": record_limit,
+                "max_visited": 128,
+                "bounds": bounds,
+                "resolution": "incomplete" if result["incomplete"] else "complete",
+            }
+            bundles.append(bundle)
+
+        result["records"] = [record_map[key] for key in sorted(record_map)]
+        result["warnings"] = sorted(warnings)
+        result["resolution"] = "incomplete" if result["incomplete"] else "complete"
+        if len(roots) > 1:
+            result["evidence_bundles"] = bundles
+        return result
+
+
+def command_dependency_snapshot(args: argparse.Namespace) -> int:
+    resolver = LifecycleResolver(Path(args.root), args.principal or "", args.as_of or "")
+    payload = resolver.dependency_snapshot(args.refs or "")
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+def command_lifecycle_bundle(args: argparse.Namespace) -> int:
+    resolver = LifecycleResolver(Path(args.root), args.principal or "", args.as_of or "")
+    path = resolver.canonical_ref(args.file)
+    if path is None:
+        raise OkfError("lifecycle file is unavailable")
+    try:
+        extra_refs = LifecycleResolver._split_refs(args.roots or "")
+    except ValueError as exc:
+        raise OkfError("lifecycle roots are malformed") from exc
+    extra_roots: list[Path] = []
+    for reference in extra_refs:
+        target = resolver.canonical_ref(reference)
+        if target is None:
+            raise OkfError("lifecycle root is unavailable")
+        if target != path and target not in extra_roots:
+            extra_roots.append(target)
+    payload = resolver.lifecycle_bundle(
+        path, root_files=extra_roots, max_records=args.max_records
+    )
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
 def command_migrate_concept(args: argparse.Namespace) -> int:
     path = Path(args.file)
     metadata, body = split_frontmatter(path)
@@ -849,6 +1770,22 @@ def parser() -> argparse.ArgumentParser:
     field.add_argument("file")
     field.add_argument("key")
     field.set_defaults(func=command_field)
+
+    dependency_snapshot = commands.add_parser("dependency-snapshot")
+    dependency_snapshot.add_argument("root")
+    dependency_snapshot.add_argument("--refs", default="")
+    dependency_snapshot.add_argument("--principal", default="")
+    dependency_snapshot.add_argument("--as-of", default="")
+    dependency_snapshot.set_defaults(func=command_dependency_snapshot)
+
+    lifecycle_bundle = commands.add_parser("lifecycle-bundle")
+    lifecycle_bundle.add_argument("root")
+    lifecycle_bundle.add_argument("file")
+    lifecycle_bundle.add_argument("--principal", default="")
+    lifecycle_bundle.add_argument("--as-of", default="")
+    lifecycle_bundle.add_argument("--roots", default="")
+    lifecycle_bundle.add_argument("--max-records", type=int, default=20)
+    lifecycle_bundle.set_defaults(func=command_lifecycle_bundle)
 
     migrate = commands.add_parser("migrate-concept")
     migrate.add_argument("file")

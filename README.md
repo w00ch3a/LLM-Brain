@@ -214,6 +214,7 @@ LLM-Brain supports:
 - principal and audience visibility;
 - cross-episode consolidation, contradiction reviews and reversible projections;
 - governed procedure runs, outcome evidence and usefulness feedback;
+- dependency-scoped capsule validation, bounded lifecycle evidence bundles and disposable memory-integrity evaluations;
 - evaluation across raw sources, episodes and canonical retrieval under the same budget.
 
 Experimental prediction-error reflection and procedure replay remain disabled until you enable their separate flags. Learned routing, latent memory and adaptive KV integration stay behind negative evidence gates until an implementation earns them.
@@ -230,18 +231,25 @@ Reusable procedures can be prepared for an exact target:
 ./bin/llm-brain run prepare PROJECT_ID okf/procedures/release.md \
   --task "release checks" --principal hermes:default \
   --binding environment=staging --binding branch=main \
+  --depends-on okf/claims/release-state.md \
   --verification "record the test report"
+./bin/llm-brain run validate PROJECT_ID runs/prepared/CAPSULE.md --json
 ./bin/llm-brain run start PROJECT_ID okf/procedures/release.md \
   --capsule runs/prepared/CAPSULE.md --request-id release-1
 ```
 
-Capsules bind the procedure hash, task, principal, bindings, evidence and verification requirements. They are idempotent, non-canonical and never automatically executed or injected by Hermes. Changed, hidden or unresolved procedures make a capsule stale.
+Capsules bind the procedure hash, task, principal, bindings, declared dependencies, resolved evidence and verification requirements. Procedures can declare `brain_required_bindings`, `brain_applicability`, `brain_prerequisites` and `brain_verification` metadata. `run validate` is read-only and recomputes the recorded dependency closure; `run start --capsule` performs the same check immediately before creating the run. A changed, hidden, expired or unresolved dependency makes the capsule stale or blocked and requires a fresh preparation. Unrelated project changes do not invalidate it. Capsules are idempotent, non-canonical and never automatically executed or injected by Hermes.
+
+Evidence retrieval is also explicit. `search` and `pack build` with `--intent evidence` can return bounded JSON `evidence_bundles` around selected records: current or historical versions, supporting evidence, conflicts, derivation and unresolved relationships. Each entry keeps its role/state, bounded excerpt and source hash; warnings and `incomplete` report hidden, unresolved or budget-limited links. The bundle follows only declared relationships; it does not merge records, infer agreement or change canonical memory. Hidden material is filtered before rendering.
+
+The repository-only lifecycle evaluator runs twelve ground-truth scenario families at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](docs/evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
 
 ## Safety boundaries
 
 - Current source and explicit user instructions outrank stored memory.
 - Capture never waits for reflection.
 - Derived memory cannot outrank its strongest legitimate evidence.
+- External, derived or poisoned text cannot gain authority through consolidation; high-risk procedure validation requires visible, current and custody-backed dependencies.
 - Protected or ambiguous material stays in review.
 - Canonical changes use promotion, supersession or retraction.
 - Read-only search does not mutate memory.
@@ -255,8 +263,8 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.6.1
-./bin/llm-brain upgrade apply --all --host auto --target 0.6.1 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.6.2
+./bin/llm-brain upgrade apply --all --host auto --target 0.6.2 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -269,4 +277,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.6.1 release notes](docs/releases/v0.6.1.md) for this migration-free release.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.6.2 release notes](docs/releases/v0.6.2.md) for this migration-free release, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.

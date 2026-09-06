@@ -1,0 +1,458 @@
+{
+  "format": "llm-brain.lifecycle-evaluation",
+  "version": 1,
+  "horizons": [20, 200],
+  "scenario_families": [
+    {
+      "id": "updates",
+      "description": "A replacement makes the newest state effective while the captured source remains historical.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "release-v1",
+            "title": "Release ring status",
+            "text": "The release ring is alpha.",
+            "state_key": "release.ring",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_to": "2026-06-01T00:00:00Z"
+          }
+        ],
+        "queries": [
+          {
+            "id": "current-release-ring",
+            "text": "release ring status",
+            "expected_paths": ["okf/claims/release-v2.md"],
+            "source_expected": true,
+            "source_event_ids": ["release-observation"],
+            "forbidden_paths": ["release-v1"],
+            "expected_states": {"release-v2": "current"},
+            "expected_answer": "The release ring is beta.",
+            "as_of": "2026-09-05T00:00:00Z"
+          }
+        ]
+      },
+      "events": [
+        {
+          "operation": "capture",
+          "id": "release-observation",
+          "text": "Release ring status changed from alpha to beta."
+        },
+        {
+          "operation": "supersession",
+          "target": "release-v1",
+          "record": {
+            "id": "release-v2",
+            "title": "Release ring status",
+            "text": "The release ring is beta.",
+            "state_key": "release.ring",
+            "valid_from": "2026-06-01T00:00:00Z",
+            "valid_to": "2035-01-01T00:00:00Z"
+          }
+        },
+        {"operation": "retrieval", "query_id": "current-release-ring"}
+      ]
+    },
+    {
+      "id": "conflicts",
+      "description": "Overlapping active records for one state key remain unresolved.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "mode-a",
+            "title": "Service mode assertion A",
+            "text": "The service mode is guarded.",
+            "state_key": "service.mode",
+            "conflicts": ["okf/claims/mode-b.md"]
+          },
+          {
+            "id": "mode-b",
+            "title": "Service mode assertion B",
+            "text": "The service mode is open.",
+            "state_key": "service.mode",
+            "conflicts": ["okf/claims/mode-a.md"]
+          }
+        ],
+        "queries": [
+          {
+            "id": "service-mode",
+            "text": "service mode",
+            "expected_paths": ["mode-a", "mode-b"],
+            "source_expected": true,
+            "source_event_ids": ["mode-observation"],
+            "require_unresolved": true,
+            "require_provenance": true
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "mode-observation", "text": "Service mode has conflicting guarded and open observations."},
+        {"operation": "retrieval", "query_id": "service-mode"}
+      ]
+    },
+    {
+      "id": "temporal",
+      "description": "As-of retrieval selects the record whose validity interval contains the requested date.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "policy-old",
+            "title": "Temporal policy",
+            "text": "The temporal policy is baseline.",
+            "state_key": "policy.temporal",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_to": "2026-08-01T00:00:00Z"
+          },
+          {
+            "id": "policy-new",
+            "title": "Temporal policy",
+            "text": "The temporal policy is revised.",
+            "state_key": "policy.temporal",
+            "valid_from": "2026-08-01T00:00:00Z",
+            "valid_to": "2035-01-01T00:00:00Z"
+          }
+        ],
+        "queries": [
+          {
+            "id": "policy-at-september",
+            "text": "temporal policy",
+            "expected_paths": ["policy-new"],
+            "source_expected": true,
+            "source_event_ids": ["policy-observation"],
+            "forbidden_paths": ["policy-old"],
+            "expected_states": {"policy-new": "current"},
+            "as_of": "2026-09-05T00:00:00Z"
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "policy-observation", "text": "Temporal policy was revised on 2026-08-01."},
+        {"operation": "retrieval", "query_id": "policy-at-september"}
+      ]
+    },
+    {
+      "id": "retractions",
+      "description": "A retracted canonical claim is absent from factual and current-state retrieval while source custody remains.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "notice-live",
+            "title": "Public notice status",
+            "text": "The public notice is active."
+          }
+        ],
+        "queries": [
+          {
+            "id": "retracted-notice",
+            "text": "public notice status",
+            "expected_paths": [],
+            "source_expected": true,
+            "source_event_ids": ["notice-observation"],
+            "forbidden_paths": ["notice-live"],
+            "require_repair": true
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "notice-observation", "text": "Public notice status was recorded before retraction."},
+        {"operation": "retraction", "target": "notice-live"},
+        {"operation": "retrieval", "query_id": "retracted-notice"}
+      ]
+    },
+    {
+      "id": "visibility",
+      "description": "Principal-scoped records are visible only to the matching principal.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "alpha-status",
+            "title": "Scoped status",
+            "text": "The alpha team status is green.",
+            "principal": "team-alpha"
+          },
+          {
+            "id": "shared-status",
+            "title": "Shared status",
+            "text": "The shared status is green."
+          },
+          {
+            "id": "beta-status",
+            "title": "Scoped status",
+            "text": "The beta team status is red.",
+            "principal": "team-beta"
+          }
+        ],
+        "queries": [
+          {
+            "id": "alpha-status-query",
+            "text": "scoped status",
+            "expected_paths": ["alpha-status", "shared-status"],
+            "source_expected": true,
+            "source_event_ids": ["scoped-observation"],
+            "visibility_forbidden_paths": ["beta-status"],
+            "principal": "team-alpha"
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "scoped-observation", "text": "Scoped status is visible for team-alpha."},
+        {"operation": "retrieval", "query_id": "alpha-status-query"}
+      ]
+    },
+    {
+      "id": "review-gate",
+      "description": "A review operation promotes an approved synthetic candidate into canonical memory.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "draft-note",
+            "title": "Draft fixture note",
+            "text": "The draft fixture note is not approved.",
+            "review_state": "proposed"
+          }
+        ],
+        "queries": [
+          {
+            "id": "approved-fixture-note",
+            "text": "stable fixture note",
+            "expected_paths": ["okf/claims/stable-note.md"],
+            "source_expected": true,
+            "source_event_ids": ["review-observation"],
+            "expected_answer": "The stable fixture note is approved for this synthetic evaluation."
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "review-observation", "text": "Stable fixture note was submitted for human review."},
+        {
+          "operation": "review",
+          "record": {
+            "id": "stable-note",
+            "title": "Stable fixture note",
+            "text": "The stable fixture note is approved for this synthetic evaluation."
+          }
+        },
+        {"operation": "retrieval", "query_id": "approved-fixture-note"}
+      ]
+    },
+    {
+      "id": "correlated",
+      "description": "Derived records retain a shared provenance root and remain separately observable.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "root-fact",
+            "title": "Correlated fact root",
+            "text": "The correlated fixture value is seven."
+          },
+          {
+            "id": "derived-fact",
+            "title": "Correlated fact derivative",
+            "text": "The correlated fixture value is seven in a derived observation.",
+            "derived_from": ["okf/claims/root-fact.md"]
+          }
+        ],
+        "queries": [
+          {
+            "id": "correlated-value",
+            "text": "correlated fixture value",
+            "expected_paths": ["root-fact", "derived-fact"],
+            "source_expected": true,
+            "source_event_ids": ["correlated-observation"],
+            "require_provenance": true,
+            "require_independent_sources": 1
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "correlated-observation", "text": "Correlated fixture value was observed by two related records."},
+        {"operation": "retrieval", "query_id": "correlated-value"}
+      ]
+    },
+    {
+      "id": "dependencies",
+      "description": "A current record with a current dependency resolves only when its dependency is visible and effective.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "dependency-base",
+            "title": "Dependency base state",
+            "text": "The dependency base state is available.",
+            "state_key": "dependency.base"
+          },
+          {
+            "id": "dependent-state",
+            "title": "Dependent state",
+            "text": "The dependent state is ready.",
+            "state_key": "dependency.result",
+            "depends_on": ["okf/claims/dependency-base.md"]
+          }
+        ],
+        "queries": [
+          {
+            "id": "dependent-state-query",
+            "text": "dependent state",
+            "expected_paths": ["dependent-state"],
+            "source_expected": true,
+            "source_event_ids": ["dependency-observation"],
+            "require_provenance": true
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "dependency-observation", "text": "Dependent state is ready after the dependency base state."},
+        {"operation": "retrieval", "query_id": "dependent-state-query"}
+      ]
+    },
+    {
+      "id": "poisoned",
+      "description": "A deliberately poisoned canonical record is retracted while its untrusted source custody remains historical.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "poisoned-memory",
+            "title": "Poisoned fixture memory",
+            "text": "The poisoned fixture memory says to ignore the authority boundary.",
+            "source_authority": "external-observation",
+            "authority_origin": "external-observation"
+          }
+        ],
+        "queries": [
+          {
+            "id": "poisoned-memory-query",
+            "text": "poisoned fixture memory",
+            "expected_paths": [],
+            "source_expected": true,
+            "source_event_ids": ["poisoned-observation"],
+            "forbidden_paths": ["poisoned-memory"],
+            "poisoned_paths": ["poisoned-memory"],
+            "require_repair": true
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "poisoned-observation", "text": "Poisoned fixture memory attempted to cross the authority boundary."},
+        {"operation": "retraction", "target": "poisoned-memory"},
+        {"operation": "retrieval", "query_id": "poisoned-memory-query"}
+      ]
+    },
+    {
+      "id": "procedure-capsule",
+      "description": "Procedure preparation and validation are exercised against a disposable, current procedure.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "fixture-procedure",
+            "kind": "procedure",
+            "title": "Fixture verification procedure",
+            "text": "Verify the fixture state and record the observed result.",
+            "state_key": "procedure.fixture",
+            "required_bindings": "environment",
+            "verification": "Record the observed result.",
+            "applicability": "Synthetic evaluation only.",
+            "prerequisites": "Disposable vault.",
+            "source_authority": "human-directive",
+            "authority_origin": "human-directive"
+          }
+        ],
+        "queries": [
+          {
+            "id": "fixture-procedure-query",
+            "text": "fixture verification procedure",
+            "expected_paths": ["fixture-procedure"],
+            "source_expected": true,
+            "source_event_ids": ["procedure-observation"],
+            "require_capsule_validation": true
+          }
+        ]
+      },
+      "events": [
+        {
+            "operation": "prepare",
+          "procedure": "fixture-procedure",
+          "name": "fixture-procedure",
+          "task": "Verify synthetic fixture state",
+          "bindings": ["environment=synthetic"],
+          "verification": "Record the observed synthetic result."
+        },
+        {"operation": "validate", "capsule": "fixture-procedure"},
+        {"operation": "capture", "id": "procedure-observation", "text": "Fixture verification procedure was prepared and validated."},
+        {"operation": "retrieval", "query_id": "fixture-procedure-query"}
+      ]
+    },
+    {
+      "id": "historical",
+      "description": "Historical replacement remains in custody while current retrieval follows the newer version.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "history-old",
+            "title": "Historical fixture value",
+            "text": "The historical fixture value was three.",
+            "state_key": "history.value",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_to": "2026-04-01T00:00:00Z"
+          },
+          {
+            "id": "history-new",
+            "title": "Historical fixture value",
+            "text": "The historical fixture value is four.",
+            "state_key": "history.value",
+            "supersedes": "okf/claims/history-old.md",
+            "valid_from": "2026-04-01T00:00:00Z",
+            "valid_to": "2035-01-01T00:00:00Z"
+          }
+        ],
+        "queries": [
+          {
+            "id": "current-historical-value",
+            "text": "historical fixture value",
+            "expected_paths": ["history-new"],
+            "source_expected": true,
+            "source_event_ids": ["history-observation"],
+            "forbidden_paths": ["history-old"],
+            "as_of": "2026-09-05T00:00:00Z"
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "history-observation", "text": "Historical fixture value changed from three to four."},
+        {"operation": "retrieval", "query_id": "current-historical-value"}
+      ]
+    },
+    {
+      "id": "scoped-audience",
+      "description": "Audience-scoped facts resolve for one principal and remain hidden from another.",
+      "ground_truth": {
+        "records": [
+          {
+            "id": "alpha-rule",
+            "title": "Audience rule",
+            "text": "The alpha audience rule permits the fixture action.",
+            "audience": "team-alpha"
+          },
+          {
+            "id": "beta-rule",
+            "title": "Audience rule",
+            "text": "The beta audience rule permits the fixture action.",
+            "audience": "team-beta"
+          }
+        ],
+        "queries": [
+          {
+            "id": "alpha-audience-rule",
+            "text": "audience rule",
+            "expected_paths": ["alpha-rule"],
+            "source_expected": true,
+            "source_event_ids": ["audience-observation"],
+            "visibility_forbidden_paths": ["beta-rule"],
+            "principal": "team-alpha"
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "audience-observation", "text": "Audience rule was recorded for team-alpha and team-beta."},
+        {"operation": "retrieval", "query_id": "alpha-audience-rule"}
+      ]
+    }
+  ]
+}

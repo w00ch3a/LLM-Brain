@@ -384,11 +384,18 @@ assert memory_collector.provider.name == "llm-brain"
 assert context_collector.engine.name == "llm-brain"
 assert isinstance(context_collector.engine, ContextEngine)
 
+functional_home = hermes_home.parent / "hermes-context-functional"
+module.LLMBrainMemoryProvider().save_config({**saved_config, "timeout_seconds": 20}, str(functional_home))
 engine = module.LLMBrainContextEngine(config={
     "vault_root": str(vault), "cli_path": cli, "project_id": "proj_hermes_self_check",
-    "strategy": "lexical", "recall_budget_tokens": 4000, "timeout_seconds": 6,
+    # The functional context assertion runs after the deliberately large
+    # evidence-index fixture.  Keep its bridge budget generous enough for a
+    # cold filesystem while the explicit one-second timeout check above still
+    # proves fail-open behaviour for slow providers.
+    "strategy": "lexical", "recall_budget_tokens": 4000, "timeout_seconds": 20,
 })
-engine.on_session_start("session-1", hermes_home=str(hermes_home))
+engine.on_session_start("session-1", hermes_home=str(functional_home))
+assert engine._config["timeout_seconds"] == 20
 original = [{"role": "system", "content": "rules"}, {"role": "user", "content": "Hermes bridge contract"}]
 selected = engine.select_context(original, conversation_messages=list(original), incoming_message=original[-1], budget_tokens=1000)
 assert original == [{"role": "system", "content": "rules"}, {"role": "user", "content": "Hermes bridge contract"}]

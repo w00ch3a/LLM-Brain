@@ -50,9 +50,13 @@ standalone="$stage_root/standalone/$name"
 mkdir -p \
   "$plugin/skills/llm-brain/scripts" \
   "$plugin/skills/llm-brain/references" \
+  "$plugin/docs/releases" \
+  "$plugin/docs/research" \
   "$standalone/bin" \
   "$standalone/lib" \
-  "$standalone/adapters"
+  "$standalone/adapters" \
+  "$standalone/docs/releases" \
+  "$standalone/docs/research"
 
 for item in LICENSE README.md install_prompt.md SKILL.md VERSION GEMINI.md gemini-extension.json requirements-okf.lock; do
   install -m 0644 "$repo_root/$item" "$plugin/$item"
@@ -65,11 +69,19 @@ install -m 0755 "$repo_root/bin/llm-brain" "$plugin/skills/llm-brain/scripts/llm
 install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py"
 install -m 0644 "$repo_root/references/architecture.md" "$plugin/skills/llm-brain/references/architecture.md"
 install -m 0644 "$repo_root/VERSION" "$plugin/skills/llm-brain/VERSION"
+install -m 0644 "$repo_root/docs/evaluation.md" "$plugin/docs/evaluation.md"
+install -m 0644 "$repo_root/docs/releases/v0.6.2.md" "$plugin/docs/releases/v0.6.2.md"
+install -m 0644 "$repo_root/docs/releases/unreleased.md" "$plugin/docs/releases/unreleased.md"
+install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$plugin/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 
 install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
+install -m 0644 "$repo_root/docs/evaluation.md" "$standalone/docs/evaluation.md"
+install -m 0644 "$repo_root/docs/releases/v0.6.2.md" "$standalone/docs/releases/v0.6.2.md"
+install -m 0644 "$repo_root/docs/releases/unreleased.md" "$standalone/docs/releases/unreleased.md"
+install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$standalone/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 
 if LC_ALL=C grep -R -nE '/Users/[^$[:space:]]+|/home/[^$[:space:]]+|(^|[^0-9])(10|127|169\.254|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]+\.[0-9]+' "$plugin" "$standalone"; then
   printf 'package: private machine identifier found in public archive input\n' >&2
@@ -146,6 +158,12 @@ def verify(path: Path, kind: str) -> None:
                 f"{name}/gemini-extension.json",
                 f"{name}/skills/llm-brain-upgrade/SKILL.md",
             }
+        required |= {
+        f"{name}/docs/evaluation.md",
+        f"{name}/docs/releases/v0.6.2.md",
+        f"{name}/docs/releases/unreleased.md",
+        f"{name}/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md",
+        }
         if not required.issubset(names):
             raise ValueError(f"{kind} archive is incomplete")
         with tempfile.TemporaryDirectory(prefix="llm-brain-verify-") as temporary:
