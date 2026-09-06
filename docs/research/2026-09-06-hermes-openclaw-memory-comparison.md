@@ -15,7 +15,7 @@ The practical goal is therefore: **add optional, rebuildable semantic and presen
 
 ## Evidence discipline and scope
 
-- **Candidate evidence** means behaviour documented in this workspace's [README](../../README.md), [architecture](../../references/architecture.md), [release notes](../releases/v0.6.2.md) and [Hermes integration guide](../../integrations/hermes/llm-brain/README.md). `VERSION` currently reads `0.6.2`; this is an uncommitted candidate, not a published release.
+- **Candidate evidence** means behaviour documented in this workspace's [README](../../README.md), [architecture](../../references/architecture.md), [release notes](../releases/v0.6.2.md) and [Hermes integration guide](../../integrations/hermes/llm-brain/README.md). This report was captured against the uncommitted `0.6.2` candidate; that candidate is now published as [LLM-Brain v0.6.2](https://github.com/w00ch3a/LLM-Brain/releases/tag/v0.6.2). The release tag and assets are the publication authority.
 - **Primary-source evidence** is linked inline to official Hermes, OpenClaw and project documentation. Pages were reviewed on 2026-09-06. Provider feature descriptions are capabilities documented by their maintainers, not independent measurements.
 - **Inference** is labelled as assessment. “Ahead” and “behind” below mean better or worse fit for the stated property, not overall model-answer quality.
 - There is no common, controlled LLM-Brain/Hermes/OpenClaw benchmark in this repository. The candidate's lifecycle evaluator measures state, provenance, repair, poisoning and capsule behaviour; without an answer runner, model-answer accuracy is explicitly unmeasured. No numerical vendor benchmark is treated as proof here.
