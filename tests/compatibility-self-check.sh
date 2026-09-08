@@ -63,6 +63,12 @@ required = {
 }
 missing = required.difference(payload)
 assert not missing, missing
+assert payload["state"] == "complete"
+assert payload["complete"] is True and payload["partial"] is False and payload["failed"] is False
+assert payload["warnings"] == [] and payload["actions"] == []
+assert payload["retrieval"]["state"] == "complete"
+assert payload["budget"]["requested_tokens"] == 4000
+assert payload["truncation"]["truncated"] is False
 assert payload["state_resolution"] == "disabled"
 assert payload["results"]
 result_required = {

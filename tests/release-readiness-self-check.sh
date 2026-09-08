@@ -51,7 +51,9 @@ run_steps() {
 static_checks() {
   run_steps \
     bash -n "$repo_root/bin/llm-brain" -- \
-    python3 -m py_compile "$repo_root/lib/okf.py"
+    python3 -m py_compile "$repo_root/lib/okf.py" -- \
+    python3 -m py_compile "$repo_root/lib/replication.py" -- \
+    python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
   while IFS= read -r -d '' test_file; do
     if ! bash -n "$test_file"; then
       return 1
@@ -77,7 +79,10 @@ core_checks() {
     bash "$repo_root/tests/experimental-gates-self-check.sh" -- \
     bash "$repo_root/tests/research-upgrades-self-check.sh" -- \
     bash "$repo_root/tests/lifecycle-eval-self-check.sh" -- \
-    bash "$repo_root/tests/eval-self-check.sh"
+    bash "$repo_root/tests/eval-self-check.sh" -- \
+    bash "$repo_root/tests/replication-self-check.sh" -- \
+    bash "$repo_root/tests/openclaw-adapter-self-check.sh" -- \
+    bash "$repo_root/tests/core-contract-self-check.sh"
 }
 
 compatibility_checks() {
@@ -156,7 +161,9 @@ verify_hermes_package() {
   local primary="$1" repeat="$2"
   [ -f "$primary/plugin.yaml" ] || { printf 'Hermes package manifest missing: %s\n' "$primary/plugin.yaml" >&2; return 1; }
   [ -f "$primary/README.md" ] || { printf 'Hermes package README missing: %s\n' "$primary/README.md" >&2; return 1; }
-  [ -f "$primary/docs/releases/v0.6.2.md" ] || { printf 'Hermes package release notes missing: %s\n' "$primary/docs/releases/v0.6.2.md" >&2; return 1; }
+  local version
+  version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
+  [ -f "$primary/docs/releases/v${version}.md" ] || { printf 'Hermes package release notes missing: %s\n' "$primary/docs/releases/v${version}.md" >&2; return 1; }
   [ -f "$primary/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" ] || { printf 'Hermes package comparison report missing: %s\n' "$primary/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" >&2; return 1; }
   if ! bash "$repo_root/scripts/package-hermes-plugin.sh" "$repeat" >/dev/null; then
     printf 'Hermes package reproducibility rebuild failed\n' >&2

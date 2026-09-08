@@ -52,6 +52,7 @@ MAX_RECORDS = 256
 MAX_QUERY_BYTES = 65536
 MAX_EVIDENCE_BYTES = 16000
 MAX_OUTPUT_BYTES = 1024 * 1024
+EVALUATION_BUDGET_TOKENS = MAX_EVIDENCE_BYTES // 4
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 PATH_RE = re.compile(r"^(?:okf|sources|episodes|review|runs)(?:/[A-Za-z0-9_.-]+)+\.md$")
 NON_MEMORY_PATHS = {"okf/project.md"}
@@ -132,6 +133,12 @@ def command(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EvaluationError(f"command failed to start or timed out: {argv[0]}: {exc}") from exc
+
+
+def repository_revision(repo_root: Path) -> str:
+    result = command(["git", "-C", str(repo_root), "rev-parse", "HEAD"], timeout=10)
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", revision) else "unresolved"
 
 
 @dataclass
@@ -1440,6 +1447,19 @@ def write_trace(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "run_id",
+        "repository_commit",
+        "provider",
+        "provider_version",
+        "provider_commit",
+        "model",
+        "dimension",
+        "dimensions",
+        "build_status",
+        "warm_cold",
+        "availability",
+        "degraded_path",
+        "budget_tokens",
+        "configuration",
         "family_id",
         "horizon",
         "repeat",
@@ -1475,6 +1495,7 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             output = dict(row)
             output["candidate_paths"] = ",".join(row["candidate_paths"])
+            output["configuration"] = json.dumps(row.get("configuration", {}), sort_keys=True, separators=(",", ":"))
             writer.writerow(output)
 
 
@@ -1497,6 +1518,12 @@ def write_report(
         f"- Repeats: {identity['repeats']}",
         f"- Answer runner: {'configured' if answer_runner else 'absent; model accuracy unmeasured'}",
         f"- Runner isolation: {identity['answer_runner_policy']}",
+        f"- Provider: `{identity['provider']}` ({identity['provider_version']}; commit `{identity['provider_commit']}`)",
+        f"- Model and dimensions: `{identity['model']}` / `{identity['dimensions']}`",
+        f"- Build status: `{identity['build_status']}`",
+        f"- Warm/cold state: `{identity['warm_cold']}`",
+        f"- Availability: `{identity['availability']}`; degraded path: `{identity['degraded_path']}`",
+        f"- Evaluation budget: `{identity['budget_tokens']}` tokens",
         f"- Run identity: `{identity['identity_hash']}`",
         "",
         "Expected paths remain fixture-only scoring data and are never included in answer-runner requests.",
@@ -1533,6 +1560,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--answer-runner", help="executable receiving request.json and output.json paths")
+    parser.add_argument("--provider", default="llm-brain")
+    parser.add_argument("--provider-version")
+    parser.add_argument("--provider-commit")
+    parser.add_argument("--model", default="unconfigured")
+    parser.add_argument("--dimension", "--dimensions", dest="dimensions", default="unconfigured")
+    parser.add_argument("--build-status", choices=("stable", "main", "build", "local", "unknown"), default="local")
+    parser.add_argument("--warm-cold", choices=("warm", "cold", "unknown"), default="unknown")
+    parser.add_argument("--availability", choices=("available", "unavailable", "degraded"), default="available")
+    parser.add_argument("--degraded-path", default="none")
     args = parser.parse_args(argv)
     if args.seed < 0 or args.repeats < 1 or args.repeats > 50:
         parser.error("--seed must be non-negative and --repeats must be between 1 and 50")
@@ -1546,21 +1582,47 @@ def main(argv: list[str] | None = None) -> int:
     if answer_runner and (not answer_runner.is_file() or answer_runner.is_symlink() or not os.access(answer_runner, os.X_OK)):
         parser.error(f"answer runner is not an executable regular file: {answer_runner}")
     try:
+        provider = single_line(args.provider, "--provider", 256)
+        package_version = (repo_root / "VERSION").read_text(encoding="utf-8").strip() if (repo_root / "VERSION").is_file() else "unresolved"
+        provider_version = single_line(args.provider_version or package_version, "--provider-version", 256)
+        provider_commit = single_line(args.provider_commit or repository_revision(repo_root), "--provider-commit", 256)
+        model = single_line(args.model, "--model", 256)
+        dimensions = single_line(args.dimensions, "--dimensions", 128)
+        degraded_path = single_line(args.degraded_path, "--degraded-path", 256)
         families, payload = parse_cases(read_json(cases_path))
         script_hash = digest_file(Path(__file__))
         cli_hash = digest_file(cli)
         cases_hash = digest_file(cases_path)
         answer_hash = digest_file(answer_runner) if answer_runner else "none"
+        repository_commit = repository_revision(repo_root)
         identity_material = {
             "format": FORMAT,
             "version": VERSION,
             "cases_sha256": cases_hash,
             "script_sha256": script_hash,
             "cli_sha256": cli_hash,
-        "answer_runner_sha256": answer_hash,
-        "answer_runner_policy": "trusted local executable; no OS sandbox",
+            "answer_runner_sha256": answer_hash,
+            "answer_runner_policy": "trusted local executable; no OS sandbox",
             "source_sha256": script_hash,
             "executable_sha256": cli_hash,
+            "repository_commit": repository_commit,
+            "provider": provider,
+            "provider_version": provider_version,
+            "provider_commit": provider_commit,
+            "model": model,
+            "dimension": dimensions,
+            "dimensions": dimensions,
+            "build_status": args.build_status,
+            "warm_cold": args.warm_cold,
+            "availability": args.availability,
+            "degraded_path": degraded_path,
+            "budget_tokens": EVALUATION_BUDGET_TOKENS,
+            "configuration": {
+                "seed": args.seed,
+                "repeats": args.repeats,
+                "budget_tokens": EVALUATION_BUDGET_TOKENS,
+                "answer_runner_sha256": answer_hash,
+            },
             "seed": args.seed,
             "repeats": args.repeats,
         }
@@ -1584,10 +1646,31 @@ def main(argv: list[str] | None = None) -> int:
         for family in families:
             for horizon in family.horizons:
                 rows.extend(run_scenario(cli, repo_root, family, horizon, args.repeats, run_id, identity_hash, answer_runner, output_dir, args.seed))
+        trace_metadata = {
+            "repository_commit": repository_commit,
+            "provider": provider,
+            "provider_version": provider_version,
+            "provider_commit": provider_commit,
+            "model": model,
+            "dimension": dimensions,
+            "dimensions": dimensions,
+            "build_status": args.build_status,
+            "warm_cold": args.warm_cold,
+            "availability": args.availability,
+            "degraded_path": degraded_path,
+            "budget_tokens": EVALUATION_BUDGET_TOKENS,
+            "configuration": {
+                "seed": args.seed,
+                "repeats": args.repeats,
+                "budget_tokens": EVALUATION_BUDGET_TOKENS,
+            },
+        }
+        for row in rows:
+            row.update(trace_metadata)
         metrics = summary(rows, args.repeats)
         write_trace(output_dir / "trace.jsonl", rows)
         write_tsv(output_dir / "trace.tsv", rows)
-        write_json(output_dir / "summary.json", {"run_id": run_id, **metrics})
+        write_json(output_dir / "summary.json", {"run_id": run_id, "evaluation_metadata": trace_metadata, **metrics})
         write_report(output_dir / "report.md", run_id, identity, families, rows, metrics, answer_runner)
         print(f"lifecycle_eval=ok run_id={run_id} output={output_dir} traces={len(rows)} families={len(families)}")
         return 0

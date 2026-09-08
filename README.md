@@ -263,8 +263,8 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.6.2
-./bin/llm-brain upgrade apply --all --host auto --target 0.6.2 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.6.3
+./bin/llm-brain upgrade apply --all --host auto --target 0.6.3 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -277,4 +277,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.6.2 release notes](docs/releases/v0.6.2.md) for this migration-free release, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.6.3 release notes](docs/releases/v0.6.3.md) for this migration-free candidate, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.

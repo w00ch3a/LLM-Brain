@@ -85,15 +85,17 @@ evidence_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root
 printf '%s\n' "$evidence_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert "hybrid-evidence-rrf" in p["actual_strategy"]; assert p["degraded"] is False; assert "relocated to Melbourne" in p["context_markdown"]; assert "2026-08-08T12:00:00Z" in p["context_markdown"]'
 printf '%s\n' "$evidence_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); rows=[r for r in p["results"] if r["type"] == "HermesTurn"]; assert rows and all(r["principal"] == "hermes:test" for r in rows); assert all(r["source_hash"] and r["excerpt"] and r["observed_at"] for r in rows)'
 project="$vault/projects/$project_id"
-evidence_index="$project/indexes/evidence-vectors.tsv"
-evidence_source="$project/$(sed -n '2s/\t.*//p' "$evidence_index")"
-for number in $(seq 1 220); do
-  rel="sources/evidence-load-$number.md"
-  cp "$evidence_source" "$project/$rel"
-  awk -F '\t' -v OFS='\t' -v rel="$rel" 'NR == 2 { $1=rel; print; exit }' "$evidence_index" >>"$evidence_index"
-done
-loaded_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/evidence-query.txt" --principal hermes:test --strategy hybrid)"
-printf '%s\n' "$loaded_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["results"]; assert p["status"] == "ok"'
+run_loaded_index_check() {
+  local evidence_index="$project/indexes/evidence-vectors.tsv"
+  local evidence_source="$project/$(sed -n '2s/\t.*//p' "$evidence_index")"
+  for number in $(seq 1 220); do
+    rel="sources/evidence-load-$number.md"
+    cp "$evidence_source" "$project/$rel"
+    awk -F '\t' -v OFS='\t' -v rel="$rel" 'NR == 2 { $1=rel; print; exit }' "$evidence_index" >>"$evidence_index"
+  done
+  loaded_recall="$(LLM_BRAIN_QUERY_EMBEDDER="$fixture/embedder.sh" "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/evidence-query.txt" --principal hermes:test --strategy hybrid)"
+  printf '%s\n' "$loaded_recall" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["results"]; assert p["status"] == "ok"'
+}
 
 make_evidence_fixture() {
   local file="$1" title="$2" request_id="$3" observed="$4" user_content="$5" assistant_content="$6"
@@ -169,6 +171,7 @@ claims_projection="$(find "$project/indexes/evidence-claims" -maxdepth 1 -type f
 [ -n "$claims_projection" ] && grep -Fqx -- 'derived=claim-projection-v2' "$claims_projection"
 
 if [ ! -d "$hermes_root" ]; then
+  run_loaded_index_check
   printf 'Hermes source unavailable; bridge checks passed, provider checks skipped\n'
   exit 0
 fi
@@ -176,6 +179,7 @@ fi
 PYTHONPATH="$hermes_root" TERMINAL_CWD="$workspace" HERMES_HOME="$hermes_home" python3 - "$repo_root" "$vault" "$workspace" "$hermes_home" <<'PY'
 import copy
 import importlib.util
+import json
 import sys
 import time
 import types
@@ -232,6 +236,21 @@ assert module._load_config(hermes_home) == saved_config
 assert config_path.read_bytes() == config_before
 assert module._workspace(hermes_home, "hermes") == (hermes_home / "workspace/hermes").resolve()
 
+# Partial writes must preserve the other five public configuration keys in the
+# selected Hermes profile rather than reintroducing process defaults.
+partial_home = hermes_home.parent / "hermes-partial-config"
+partial_provider = module.LLMBrainMemoryProvider()
+partial_provider.save_config({
+    "vault_root": str(vault / "partial-vault"), "cli_path": cli, "project_id": "proj_partial",
+    "strategy": "lexical", "recall_budget_tokens": 777, "timeout_seconds": 11,
+}, str(partial_home))
+partial_provider.save_config({"timeout_seconds": 19}, str(partial_home))
+partial_saved = json.loads((partial_home / "llm-brain.json").read_text(encoding="utf-8"))
+assert partial_saved == {
+    "vault_root": str(vault / "partial-vault"), "cli_path": cli, "project_id": "proj_partial",
+    "strategy": "lexical", "recall_budget_tokens": 777, "timeout_seconds": 19,
+}
+
 restricted = module._tool_evidence([{
     "role": "tool", "tool_call_id": "restricted",
     "status": "token=leaked-status",
@@ -263,6 +282,82 @@ malformed_cli = hermes_home / "malformed-bridge"
 malformed_cli.write_text("#!/usr/bin/env python3\nprint('not-json')\n", encoding="utf-8")
 malformed_cli.chmod(0o700)
 assert module._bridge_call({**saved_config, "cli_path": str(malformed_cli)}, workspace, ["recall"]) is None
+legacy_cli = hermes_home / "legacy-bridge"
+legacy_cli.write_text(
+    "#!/usr/bin/env python3\n"
+    "import json\n"
+    "print(json.dumps({'context_markdown': '😀' * 100, 'results': [], 'legacy_field': 'kept'}))\n",
+    encoding="utf-8",
+)
+legacy_cli.chmod(0o700)
+legacy_payload = module._bridge_call(
+    {**saved_config, "cli_path": str(legacy_cli)}, workspace,
+    ["recall", "--budget-tokens", "2"],
+)
+assert legacy_payload and legacy_payload["status"] == "ok"
+assert legacy_payload["legacy_field"] == "kept"
+assert len(legacy_payload["context_markdown"].encode("utf-8")) <= 8
+assert legacy_payload["context_markdown"].encode("utf-8").decode("utf-8") == legacy_payload["context_markdown"]
+failed_cli = hermes_home / "failed-bridge"
+failed_cli.write_text(
+    "#!/usr/bin/env python3\nprint('{\"status\": \"failed\", \"error\": \"fixture failure\"}')\n",
+    encoding="utf-8",
+)
+failed_cli.chmod(0o700)
+failed_config = {**saved_config, "cli_path": str(failed_cli)}
+failed_payload = module._bridge_call(failed_config, workspace, ["recall"])
+assert failed_payload and failed_payload["status"] == "failed"
+assert module._recall(failed_config, hermes_home, workspace, "self-check-user", "fixture") is None
+malformed_payload_cli = hermes_home / "malformed-payload-bridge"
+malformed_payload_cli.write_text(
+    "#!/usr/bin/env python3\nprint('{\"status\": \"ok\", \"context_markdown\": []}')\n",
+    encoding="utf-8",
+)
+malformed_payload_cli.chmod(0o700)
+assert module._bridge_call(
+    {**saved_config, "cli_path": str(malformed_payload_cli)}, workspace, ["recall"]
+) is None
+malformed_legacy_payload_cli = hermes_home / "malformed-legacy-payload-bridge"
+malformed_legacy_payload_cli.write_text(
+    "#!/usr/bin/env python3\nprint('{\"context\": [], \"results\": []}')\n",
+    encoding="utf-8",
+)
+malformed_legacy_payload_cli.chmod(0o700)
+assert module._bridge_call(
+    {**saved_config, "cli_path": str(malformed_legacy_payload_cli)}, workspace, ["recall"]
+) is None
+assert module._normalise_bridge_payload(
+    {"status": "ok", "context_markdown": "valid", "context": {"unexpected": "shape"}, "results": []},
+    kind="recall",
+) is None
+
+# Bridge additions remain available but are bounded independently of the
+# context Markdown budget, result/evidence list length, and tool response cap.
+oversized_bridge_payload = {
+    "status": "ok",
+    "context_markdown": "😀" * 100000,
+    "results": [{"title": "result", "excerpt": "r" * 100000} for _ in range(100)],
+    "evidence_bundles": [{"source_hash": "h" * 100000, "claims": ["c" * 10000]} for _ in range(100)],
+    "evidence_refs": ["ref-" + ("x" * 1000) for _ in range(100)],
+    "legacy_field": "legacy-" + ("l" * 100000),
+    "legacy_nested": {"items": ["n" * 100000 for _ in range(100)]},
+}
+bounded_bridge_payload = module._normalise_bridge_payload(
+    oversized_bridge_payload, kind="recall", budget_tokens=10**9,
+)
+assert bounded_bridge_payload and bounded_bridge_payload["status"] == "ok"
+assert len(json.dumps(bounded_bridge_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= module.MAX_TOOL_RESPONSE_BYTES
+assert len(bounded_bridge_payload["context_markdown"].encode("utf-8")) <= module.MAX_CONTEXT_BYTES
+assert len(bounded_bridge_payload["results"]) <= module.MAX_RESULT_ITEMS
+assert len(bounded_bridge_payload["evidence_bundles"]) <= module.MAX_EVIDENCE_BUNDLE_ITEMS
+assert len(bounded_bridge_payload["evidence_refs"]) <= module.MAX_EVIDENCE_REF_ITEMS
+assert len(bounded_bridge_payload["legacy_field"].encode("utf-8")) <= module.MAX_ADDITIVE_FIELD_BYTES
+assert bounded_bridge_payload["truncation"]["adapter_truncated"] is True
+assert "legacy_field" in bounded_bridge_payload
+assert module._normalise_bridge_payload(
+    {"status": "ok", "failed": True, "context_markdown": "must not inject", "results": []},
+    kind="recall",
+) is None
 slow_cli = hermes_home / "slow-bridge"
 slow_cli.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n", encoding="utf-8")
 slow_cli.chmod(0o700)
@@ -285,6 +380,17 @@ captured_bridge_args.clear()
 provider.handle_tool_call("llm_brain_search", {"query": "factual query"})
 assert "--intent" in captured_bridge_args[0] and captured_bridge_args[0][captured_bridge_args[0].index("--intent") + 1] == "factual"
 module._bridge_call = real_bridge_call
+
+# The tool surface applies the same cap even when a bridge implementation
+# returns an oversized additive payload directly.
+real_recall = module._recall
+module._recall = lambda *args, **kwargs: oversized_bridge_payload
+tool_payload = json.loads(provider.handle_tool_call("llm_brain_search", {"query": "bounded"}))
+module._recall = real_recall
+assert len(json.dumps(tool_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= module.MAX_TOOL_RESPONSE_BYTES
+assert tool_payload["status"] == "ok" and tool_payload["legacy_field"]
+assert len(tool_payload["results"]) <= module.MAX_RESULT_ITEMS
+assert len(tool_payload["evidence_bundles"]) <= module.MAX_EVIDENCE_BUNDLE_ITEMS
 # Selecting the context engine makes it the sole recall injector; durable
 # capture remains owned by the provider.
 config_pkg = types.ModuleType("hermes_cli")
@@ -371,27 +477,60 @@ assert list((profile_two_home / "llm-brain/outbox/committed").glob("*.md"))
 assert not any("isolated record" in path.read_text(encoding="utf-8") for path in (hermes_home / "llm-brain/outbox/committed").glob("*.md"))
 
 class MemoryCollector:
-    def __init__(self): self.provider = None
-    def register_memory_provider(self, provider): self.provider = provider
+    def __init__(self): self.provider = None; self.providers = []
+    def register_memory_provider(self, provider): self.provider = provider; self.providers.append(provider)
 class ContextCollector:
-    def __init__(self): self.engine = None
-    def register_context_engine(self, engine): self.engine = engine
+    def __init__(self): self.engine = None; self.engines = []
+    def register_context_engine(self, engine): self.engine = engine; self.engines.append(engine)
 memory_collector = MemoryCollector()
 context_collector = ContextCollector()
 module.register(memory_collector)
 module.register(context_collector)
+module.register(memory_collector)
+module.register(context_collector)
 assert memory_collector.provider.name == "llm-brain"
+assert len(memory_collector.providers) == 1
 assert context_collector.engine.name == "llm-brain"
+assert len(context_collector.engines) == 1
 assert isinstance(context_collector.engine, ContextEngine)
+
+# Fresh slot-based wrappers cannot carry adapter attributes.  Use only the
+# public profile/lifecycle surface to deduplicate them, and release claims on
+# unload so a later profile reload is not suppressed or cross-profile leaked.
+class SlotCollector:
+    __slots__ = ("profile_name", "providers", "engines", "callbacks")
+    def __init__(self, profile_name):
+        self.profile_name = profile_name
+        self.providers = []
+        self.engines = []
+        self.callbacks = []
+    def register_memory_provider(self, provider): self.providers.append(provider)
+    def register_context_engine(self, engine): self.engines.append(engine)
+    def on_unload(self, callback): self.callbacks.append(callback)
+
+slot_a = SlotCollector("hermes-profile-a")
+slot_a_fresh = SlotCollector("hermes-profile-a")
+slot_b = SlotCollector("hermes-profile-b")
+module.register(slot_a)
+module.register(slot_a_fresh)
+module.register(slot_b)
+assert len(slot_a.providers) == len(slot_a.engines) == 1
+assert not slot_a_fresh.providers and not slot_a_fresh.engines
+assert len(slot_b.providers) == len(slot_b.engines) == 1
+for callback in slot_a.callbacks:
+    callback()
+module.register(slot_a)
+assert len(slot_a.providers) == len(slot_a.engines) == 2
+slot_a_reloaded = SlotCollector("hermes-profile-a")
+module.register(slot_a_reloaded)
+assert not slot_a_reloaded.providers and not slot_a_reloaded.engines
 
 functional_home = hermes_home.parent / "hermes-context-functional"
 module.LLMBrainMemoryProvider().save_config({**saved_config, "timeout_seconds": 20}, str(functional_home))
 engine = module.LLMBrainContextEngine(config={
     "vault_root": str(vault), "cli_path": cli, "project_id": "proj_hermes_self_check",
-    # The functional context assertion runs after the deliberately large
-    # evidence-index fixture.  Keep its bridge budget generous enough for a
-    # cold filesystem while the explicit one-second timeout check above still
-    # proves fail-open behaviour for slow providers.
+    # Keep the provider/context path bounded; the deliberately large
+    # evidence-index fixture runs as the final bridge-only stress check below.
     "strategy": "lexical", "recall_budget_tokens": 4000, "timeout_seconds": 20,
 })
 engine.on_session_start("session-1", hermes_home=str(functional_home))
@@ -401,6 +540,13 @@ selected = engine.select_context(original, conversation_messages=list(original),
 assert original == [{"role": "system", "content": "rules"}, {"role": "user", "content": "Hermes bridge contract"}]
 assert selected and len(selected) == 3 and selected[1]["role"] == "system"
 assert "provenance" in selected[1]["content"].lower()
+selected_again = engine.select_context(
+    selected, conversation_messages=list(selected), incoming_message=original[-1], budget_tokens=1000,
+)
+assert selected_again and sum(
+    "<llm-brain-context>" in module._message_text(item.get("content"))
+    for item in selected_again if isinstance(item, dict)
+) == 1
 assert isinstance(copy.deepcopy(engine), ContextEngine)
 print("hermes_provider_context=ok")
 PY
@@ -492,4 +638,5 @@ assert manager._context_engine is not None and manager._context_engine.name == "
 print("hermes_discovery=ok")
 PY
 
+run_loaded_index_check
 printf '%s\n' 'llm-brain Hermes integration self-check passed'

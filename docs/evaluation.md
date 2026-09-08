@@ -106,6 +106,13 @@ An answer runner can add separately labelled outcomes and token counts. Runner
 results never replace fixture scoring, and no answer runner means model-answer
 accuracy is reported as unmeasured rather than inferred from retrieval hits.
 
+Each run identity and trace also records the provider, provider version and
+commit, model and embedding dimension, repository commit, build status,
+warm/cold state, availability, degraded path, declared evaluation budget and
+the bounded configuration. These fields identify the build and execution
+conditions; they do not turn an unavailable or degraded path into a model
+winner.
+
 ## Output and identity
 
 Successful runs write:

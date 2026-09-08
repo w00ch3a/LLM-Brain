@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 name="llm-brain"
 version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
+release_notes="$repo_root/docs/releases/v${version}.md"
 requested="${1:-$version}"
 declared_yaml="$(sed -n 's/^PYYAML_VERSION="\([^"]*\)"/\1/p' "$repo_root/bin/llm-brain")"
 locked_yaml="$(sed -n 's/^PyYAML==\([^[:space:]\\]*\).*/\1/p' "$repo_root/requirements-okf.lock")"
@@ -12,6 +13,7 @@ locked_yaml="$(sed -n 's/^PyYAML==\([^[:space:]\\]*\).*/\1/p' "$repo_root/requir
 [ -n "$declared_yaml" ] && [ "$declared_yaml" = "$locked_yaml" ] ||
   { printf 'package: PyYAML runtime and lock file disagree\n' >&2; exit 65; }
 case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) printf 'package: invalid SemVer in VERSION\n' >&2; exit 65 ;; esac
+[ -f "$release_notes" ] || { printf 'package: release notes missing: %s\n' "$release_notes" >&2; exit 66; }
 
 bash -n "$repo_root/bin/llm-brain"
 bash -n "$repo_root/tests/self-check.sh"
@@ -23,8 +25,13 @@ bash -n "$repo_root/tests/presentation-self-check.sh"
 bash -n "$repo_root/tests/release-readiness-self-check.sh"
 bash -n "$repo_root/tests/upgrade-self-check.sh"
 bash -n "$repo_root/tests/automatic-use-self-check.sh"
+bash -n "$repo_root/tests/replication-self-check.sh"
+bash -n "$repo_root/tests/openclaw-adapter-self-check.sh"
+bash -n "$repo_root/tests/core-contract-self-check.sh"
 bash -n "$repo_root/hooks/session-start.sh"
 python3 -m py_compile "$repo_root/lib/okf.py"
+python3 -m py_compile "$repo_root/lib/replication.py"
+python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
 
 python3 - "$repo_root" "$version" <<'PY'
 import json
@@ -67,19 +74,21 @@ done
 cp -R "$repo_root/skills/." "$plugin/skills/"
 install -m 0755 "$repo_root/bin/llm-brain" "$plugin/skills/llm-brain/scripts/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py"
+install -m 0755 "$repo_root/lib/replication.py" "$plugin/skills/llm-brain/scripts/replication.py"
 install -m 0644 "$repo_root/references/architecture.md" "$plugin/skills/llm-brain/references/architecture.md"
 install -m 0644 "$repo_root/VERSION" "$plugin/skills/llm-brain/VERSION"
 install -m 0644 "$repo_root/docs/evaluation.md" "$plugin/docs/evaluation.md"
-install -m 0644 "$repo_root/docs/releases/v0.6.2.md" "$plugin/docs/releases/v0.6.2.md"
+install -m 0644 "$release_notes" "$plugin/docs/releases/v${version}.md"
 install -m 0644 "$repo_root/docs/releases/unreleased.md" "$plugin/docs/releases/unreleased.md"
 install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$plugin/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 
 install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
+install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
 install -m 0644 "$repo_root/docs/evaluation.md" "$standalone/docs/evaluation.md"
-install -m 0644 "$repo_root/docs/releases/v0.6.2.md" "$standalone/docs/releases/v0.6.2.md"
+install -m 0644 "$release_notes" "$standalone/docs/releases/v${version}.md"
 install -m 0644 "$repo_root/docs/releases/unreleased.md" "$standalone/docs/releases/unreleased.md"
 install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$standalone/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 
@@ -160,7 +169,7 @@ def verify(path: Path, kind: str) -> None:
             }
         required |= {
         f"{name}/docs/evaluation.md",
-        f"{name}/docs/releases/v0.6.2.md",
+        f"{name}/docs/releases/v{version}.md",
         f"{name}/docs/releases/unreleased.md",
         f"{name}/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md",
         }

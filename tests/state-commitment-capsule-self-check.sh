@@ -17,7 +17,7 @@ project="$vault/projects/$project_id"
 mkdir -p "$project/okf/claims" "$project/okf/procedures" "$project/sources"
 
 fail() { printf 'state/commitment/capsule self-check: %s\n' "$*" >&2; exit 1; }
-assert_contains() { printf '%s' "$1" | grep -Fq -- "$2" || fail "expected output to contain: $2"; }
+assert_contains() { grep -Fq -- "$2" <<<"$1" || fail "expected output to contain: $2"; }
 write_claim() {
   local file="$1" id="$2" title="$3" body="$4" extra="${5:-}"
   {

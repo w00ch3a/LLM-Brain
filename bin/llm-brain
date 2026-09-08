@@ -81,10 +81,11 @@ Commands:
   review list|show|decide PROJECT_ID [ARGS]
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT
-  index build|status PROJECT_ID [--embedder EXECUTABLE]
+  index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold]
   pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory]
   adapters build PROJECT_ID [--agent NAME|all]
+  adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
@@ -110,7 +111,9 @@ Commands:
   experiment replay PROJECT_ID RUN_ID --mode success|failure
   eval run PROJECT_ID --cases FILE --strategies LIST [--query-embedder EXECUTABLE] [--answer-runner EXECUTABLE] [--output DIR]
   export okf|knowledge-catalog|bundle PROJECT_ID
+  export replication PROJECT_ID [--scope project|principal] [--principal ID] [--review REF] [--output FILE]
   import bundle FILE --dry-run|--apply [--project-id ID]
+  import replication FILE --dry-run|--stage [--project-id ID] [--output DIR]
   map PROJECT_ID [ROOT]
   secret-scan FILE
   stats [--project PROJECT_ID] [ROOT]
@@ -206,6 +209,24 @@ bridge_python() {
   else
     command -v python3 || true
   fi
+}
+
+# Replication/OpenClaw validation is deliberately kept in a standard-library
+# helper so the CLI remains the reference entrypoint in standalone and plugin
+# packages.  The helper receives explicit argv only; no shell evaluation or
+# network/provider access is permitted.
+replication_helper() {
+  local helper py
+  py="$(bridge_python)"
+  [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for replication"
+  for helper in \
+    "$SCRIPT_DIR/../lib/replication.py" \
+    "$SCRIPT_DIR/replication.py" \
+    "$SCRIPT_DIR/lib/replication.py" \
+    "$SCRIPT_DIR/../../lib/replication.py"; do
+    [ -f "$helper" ] && { "$py" "$helper" "$@"; return; }
+  done
+  die 69 "replication helper is unavailable"
 }
 
 bridge_utf8_prefix() {
@@ -344,18 +365,22 @@ bridge_evidence_artifacts() {
 }
 
 bridge_rebuild_evidence_index() {
-  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir index stage file base source_hash artifacts view view_hash vector model dimensions principal observed title
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir index stage file base source_hash artifacts view view_hash vector model dimensions principal observed title previous_generation started_at generation
   [ -n "$embedder" ] || return 0
   [ -x "$embedder" ] || return 69
   require_project "$project_id" dir
   ensure_dir "$dir/indexes"
   index="$dir/indexes/evidence-vectors.tsv"
+  previous_generation="$(evidence_index_generation "$dir" 2>/dev/null || true)"
+  started_at="$(now_utc)"
+  evidence_write_rebuild_state "$dir" building building "$previous_generation" "$previous_generation" "$started_at" "" ""
   stage="$(mktemp "$dir/indexes/.evidence-build.XXXXXX")"
   printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$stage"
   while IFS= read -r file; do
     base="${file##*/}"; source_hash="${base%%-*}"
     if ! artifacts="$(bridge_evidence_artifacts "$project_id" "$source_hash" "$embedder" "$embedder_version")"; then
       rm -f "$stage"
+      evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "artifact-build-failed"
       return 69
     fi
     IFS=$'\t' read -r view view_hash vector <<EOF
@@ -367,15 +392,27 @@ EOF
   done < <(find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
   { head -1 "$stage"; tail -n +2 "$stage" | LC_ALL=C sort -u; } >"${stage}.sorted"
   acquire_lock "project-$project_id"
-  mv "${stage}.sorted" "$index"
+  if ! mv "${stage}.sorted" "$index"; then
+    release_lock
+    rm -f "$stage"
+    evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "index-publish-failed"
+    return 69
+  fi
+  if ! generation="$(evidence_index_publish_generation "$dir" "$index")"; then
+    release_lock
+    rm -f "$stage"
+    evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-publish-failed"
+    return 69
+  fi
   audit_v2 "$dir" "evidence-index" "indexes/evidence-vectors.tsv" "" "rebuilt" "$(sha256_file "$index")" "view=$EVIDENCE_VIEW_VERSION"
   release_lock
   rm -f "$stage"
+  evidence_write_rebuild_state "$dir" idle ready "$generation" "$generation" "$started_at" "$(now_utc)" ""
 }
 
 bridge_index_evidence_source() {
   local project_id="$1" source_hash="$2" append_only="${3:-0}" dir source embedder="$EMBEDDER" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}"
-  local index artifacts view view_hash vector model dimensions rel principal observed title stage
+  local index artifacts view view_hash vector model dimensions rel principal observed title stage previous_generation started_at generation
   [ -n "$embedder" ] || return 0
   [ -x "$embedder" ] || return 69
   require_project "$project_id" dir
@@ -392,20 +429,32 @@ EOF
   principal="$(frontmatter_field "$source" brain_principal)"; observed="$(frontmatter_field "$source" brain_observed_at)"; title="$(frontmatter_field "$source" title)"
   acquire_lock "project-$project_id"
   if [ "$append_only" = 1 ]; then
+    previous_generation="$(evidence_index_generation "$dir" 2>/dev/null || true)"
+    started_at="$(now_utc)"
+    evidence_write_rebuild_state "$dir" building building "$previous_generation" "$previous_generation" "$started_at" "" ""
     [ -f "$index" ] || printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$index"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$source_hash" "$EVIDENCE_VIEW_VERSION" "$view_hash" "$view" "$model" "$dimensions" "$principal" "$observed" "$title" "$(embedding_field "$vector" vector)" "$CLAIM_PROJECTION_VERSION" >>"$index"
     local lexical_index="$dir/indexes/evidence-lexical.tsv" claims="$dir/indexes/evidence-claims/${source_hash}-${CLAIM_PROJECTION_VERSION}.txt"
     if [ -f "$lexical_index" ] && [ "$(head -1 "$lexical_index")" = "$EVIDENCE_LEXICAL_HEADER" ]; then
       printf '%s\t%s\t%s\n' "$rel" "$(base64 <"$dir/$view" | tr -d '\n')" "$(base64 <"$claims" | tr -d '\n')" >>"$lexical_index"
     fi
+    if ! generation="$(evidence_index_publish_generation "$dir" "$index")"; then
+      release_lock
+      evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-publish-failed"
+      return 69
+    fi
     audit_v2 "$dir" "evidence-index" "$rel" "" "indexed" "$source_hash" "view=$EVIDENCE_VIEW_VERSION model=$(slug "$model")"
     release_lock
+    evidence_write_rebuild_state "$dir" idle ready "$generation" "$generation" "$started_at" "$(now_utc)" ""
     return 0
   fi
   if [ -f "$index" ] && awk -F '\t' -v path="$rel" -v hash="$source_hash" -v view_hash="$view_hash" -v model="$model" -v dimensions="$dimensions" 'NR > 1 && $1 == path && $2 == hash && $3 == "user-content-v1" && $4 == view_hash && $6 == model && $7 == dimensions { found=1 } END { exit !found }' "$index"; then
     release_lock
     return 0
   fi
+  previous_generation="$(evidence_index_generation "$dir" 2>/dev/null || true)"
+  started_at="$(now_utc)"
+  evidence_write_rebuild_state "$dir" building building "$previous_generation" "$previous_generation" "$started_at" "" ""
   stage="$(mktemp "$dir/indexes/.evidence.XXXXXX")"
   printf '%s\n' "$EVIDENCE_INDEX_HEADER" >"$stage"
   if [ -f "$index" ] && [ "$(head -1 "$index")" = "$EVIDENCE_INDEX_HEADER" ]; then
@@ -413,18 +462,29 @@ EOF
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$source_hash" "$EVIDENCE_VIEW_VERSION" "$view_hash" "$view" "$model" "$dimensions" "$principal" "$observed" "$title" "$(embedding_field "$vector" vector)" "$CLAIM_PROJECTION_VERSION" >>"$stage"
   { head -1 "$stage"; tail -n +2 "$stage" | LC_ALL=C sort -u; } >"${stage}.sorted"
-  mv "${stage}.sorted" "$index"; rm -f "$stage"
+  mv "${stage}.sorted" "$index"
+  if ! generation="$(evidence_index_publish_generation "$dir" "$index")"; then
+    rm -f "$stage"
+    release_lock
+    evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-publish-failed"
+    return 69
+  fi
+  rm -f "$stage"
   audit_v2 "$dir" "evidence-index" "$rel" "" "indexed" "$source_hash" "view=$EVIDENCE_VIEW_VERSION model=$(slug "$model")"
   release_lock
+  evidence_write_rebuild_state "$dir" idle ready "$generation" "$generation" "$started_at" "$(now_utc)" ""
 }
 
 bridge_index_evidence_batch() {
-  local project_id="$1" pending="$2" dir py index lexical
+  local project_id="$1" pending="$2" dir py index lexical previous_generation started_at generation
   require_project "$project_id" dir
   py="$(bridge_python)"
   [ -n "$py" ] && [ -x "$py" ] || return 69
   index="$dir/indexes/evidence-vectors.tsv"
   lexical="$dir/indexes/evidence-lexical.tsv"
+  previous_generation="$(evidence_index_generation "$dir" 2>/dev/null || true)"
+  started_at="$(now_utc)"
+  evidence_write_rebuild_state "$dir" building building "$previous_generation" "$previous_generation" "$started_at" "" ""
   acquire_lock "project-$project_id"
   if ! "$py" - "$dir" "$pending" "$index" "$lexical" "$EVIDENCE_INDEX_HEADER" "$EVIDENCE_LEXICAL_HEADER" "$EVIDENCE_VIEW_VERSION" "$CLAIM_PROJECTION_VERSION" <<'PY'
 import base64
@@ -504,10 +564,17 @@ if lexical_path.exists():
 PY
   then
     release_lock
+    evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "batch-index-failed"
+    return 69
+  fi
+  if ! generation="$(evidence_index_publish_generation "$dir" "$index")"; then
+    release_lock
+    evidence_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-publish-failed"
     return 69
   fi
   audit_v2 "$dir" "evidence-index" "indexes/evidence-vectors.tsv" "" "batch-indexed" "$(sha256_file "$index")" "view=$EVIDENCE_VIEW_VERSION"
   release_lock
+  evidence_write_rebuild_state "$dir" idle ready "$generation" "$generation" "$started_at" "$(now_utc)" ""
 }
 
 bridge_query_mode() {
@@ -1086,15 +1153,54 @@ bridge_search_evidence() {
 }
 
 bridge_render_context() {
-  local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title lexical_rank semantic_rank graph_source graph_relation authority index_status excerpt claims claims_file evidence_refs evidence_file excerpt_bytes next_payload warning_bytes evidence_started=0 observed observed_line resolution_mode view_tmp final_resolution_note="" intent principal state_reason effective_ref evidence_group independent_count correlated_count provenance_state lifecycle_bundle lifecycle_warnings state_warnings
+  local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title lexical_rank semantic_rank graph_source graph_relation authority index_status excerpt claims claims_file evidence_refs evidence_file excerpt_bytes next_payload warning_bytes evidence_started=0 observed observed_line resolution_mode view_tmp final_resolution_note="" intent principal state_reason effective_ref evidence_group independent_count correlated_count provenance_state lifecycle_bundle lifecycle_warnings state_warnings raw_line visible_results visible_evidence_refs visible_evidence_ref first_visible
   local header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$"
+  local context_bytes context_selected_count=0 context_rendered_count=0 context_truncated=false bounded_context
   require_project "$project_id" dir
-  awk 'NR > 1 && NF { found=1 } END { exit !found }' "$results" 2>/dev/null || { : >"$output"; return 0; }
   max_bytes=$((budget * 4))
   resolution_mode="$(awk -F= '$1 == "resolution_mode" { print $2; exit }' "$metadata" 2>/dev/null || printf static)"
   intent="$(awk -F= '$1 == "intent" { print $2; exit }' "$metadata" 2>/dev/null || printf factual)"
   principal="$(awk -F= '$1 == "principal" { print $2; exit }' "$metadata" 2>/dev/null || true)"
   [ "$principal" = none ] && principal=""
+  visible_results="${results}.visible.$$"
+  head -n 1 "$results" >"$visible_results"
+  while IFS= read -r raw_line; do
+    [ -n "$raw_line" ] || continue
+    case "$raw_line" in
+      *$'\t'*) path="${raw_line%%$'\t'*}" ;;
+      *) path="$raw_line" ;;
+    esac
+    bridge_render_record_visible "$dir" "$path" "$principal" || continue
+    printf '%s\n' "$raw_line" >>"$visible_results"
+  done < <(tail -n +2 "$results" 2>/dev/null)
+  mv -f "$visible_results" "$results"
+  evidence_refs="$(awk -F= '$1 == "evidence_refs" { print $2; exit }' "$metadata" 2>/dev/null || true)"
+  visible_evidence_refs=""
+  first_visible=1
+  if [ -n "$evidence_refs" ] && [ "$evidence_refs" != "none" ]; then
+    while IFS= read -r visible_evidence_ref; do
+      [ -n "$visible_evidence_ref" ] || continue
+      bridge_render_record_visible "$dir" "$visible_evidence_ref" "$principal" || continue
+      if [ "$first_visible" = 1 ]; then
+        visible_evidence_refs="$visible_evidence_ref"
+        first_visible=0
+      else
+        visible_evidence_refs="$visible_evidence_refs,$visible_evidence_ref"
+      fi
+    done < <(printf '%s\n' "$evidence_refs" | tr ',' '\n')
+  fi
+  visible_evidence_refs="${visible_evidence_refs:-none}"
+  awk -F= -v refs="$visible_evidence_refs" '
+    $1 == "evidence_refs" { print "evidence_refs=" refs; replaced=1; next }
+    { print }
+    END { if (!replaced) print "evidence_refs=" refs }
+  ' "$metadata" >"${metadata}.visible.$$"
+  mv -f "${metadata}.visible.$$" "$metadata"
+  if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "$results" 2>/dev/null; then
+    : >"$output"
+    printf 'context_limit_bytes=%s\ncontext_bytes=0\ncontext_truncated=false\ncontext_selected_count=0\ncontext_rendered_count=0\n' "$max_bytes" >>"$metadata"
+    return 0
+  fi
   state_warnings="$(mktemp "${TMPDIR:-/tmp}/llm-brain-state-warnings.XXXXXX")"
   {
     printf '%s\n\n' '## LLM-Brain Recall'
@@ -1113,11 +1219,17 @@ bridge_render_context() {
   printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$evidence_payload_bytes" "$(( (evidence_payload_bytes + 3) / 4 ))" >"$footer"
   [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
   used_bytes="$(wc -c <"$header" | tr -d ' ')"
-  [ $((used_bytes + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || { : >"$output"; rm -f "$state_warnings"; return 0; }
+  if [ $((used_bytes + $(wc -c <"$footer" | tr -d ' '))) -gt "$max_bytes" ]; then
+    : >"$output"
+    printf 'context_limit_bytes=%s\ncontext_bytes=0\ncontext_truncated=true\ncontext_selected_count=%s\ncontext_rendered_count=0\n' "$max_bytes" "$(awk 'NR > 1 && NF { count++ } END { print count + 0 }' "$results")" >>"$metadata"
+    rm -f "$state_warnings"
+    return 0
+  fi
   cp "$header" "$output"
   view_tmp="$(mktemp "${TMPDIR:-/tmp}/llm-brain-context-view.XXXXXX")"
   while IFS=$'\034' read -r path score type state status trust freshness sensitivity title lexical_rank semantic_rank graph_source graph_relation authority index_status state_reason effective_ref evidence_group independent_count correlated_count provenance_state lifecycle_bundle; do
     [ -n "$path" ] || continue
+    context_selected_count=$((context_selected_count + 1))
     if [ "$intent" = "current_state" ] && [ "$type" != "HermesTurn" ] && [ "$state" != "current" ]; then
       printf '%s\t%s\t%s\n' "$title" "$path" "$state" >>"$state_warnings"
       continue
@@ -1148,6 +1260,7 @@ bridge_render_context() {
     printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
     [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
     if [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -gt "$max_bytes" ]; then
+      context_truncated=true
       if [ -n "$lifecycle_warnings" ]; then
         warning_bytes="$(printf '%s\n\n' "$lifecycle_warnings" | wc -c | tr -d ' ')"
         if [ $((used_bytes + warning_bytes + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ]; then
@@ -1159,6 +1272,7 @@ bridge_render_context() {
     fi
     cat "$block" >>"$output"
     used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
+    context_rendered_count=$((context_rendered_count + 1))
     evidence_payload_bytes="$next_payload"
   done < <(tail -n +2 "$results" 2>/dev/null | tr '\t' '\034')
   rm -f "$view_tmp"
@@ -1166,9 +1280,8 @@ bridge_render_context() {
   if [ -n "$evidence_refs" ] && [ "$evidence_refs" != "none" ]; then
     while IFS= read -r evidence_file; do
       [ -n "$evidence_file" ] || continue
+      bridge_render_record_visible "$dir" "$evidence_file" "$principal" || continue
       case "$evidence_file" in sources/*|episodes/*|review/*) ;; *) continue ;; esac
-      [ -f "$dir/$evidence_file" ] || continue
-      [ "$(frontmatter_field "$dir/$evidence_file" brain_sensitivity sensitivity)" = restricted ] && continue
       excerpt="$(body_after_frontmatter "$dir/$evidence_file" 2>/dev/null | bridge_utf8_prefix 800)"
       excerpt_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
       {
@@ -1178,7 +1291,10 @@ bridge_render_context() {
       next_payload=$((evidence_payload_bytes + excerpt_bytes))
       printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
       [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
-      [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -le "$max_bytes" ] || break
+      if [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -gt "$max_bytes" ]; then
+        context_truncated=true
+        break
+      fi
       cat "$block" >>"$output"
       used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
       evidence_payload_bytes="$next_payload"
@@ -1195,21 +1311,44 @@ bridge_render_context() {
   printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$evidence_payload_bytes" "$(( (evidence_payload_bytes + 3) / 4 ))" >"$footer"
   [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
   cat "$footer" >>"$output"
+  context_bytes="$(wc -c <"$output" | tr -d ' ')"
+  if [ "$context_bytes" -gt "$max_bytes" ]; then
+    bounded_context="${output}.bounded.$$"
+    bridge_utf8_prefix "$max_bytes" <"$output" >"$bounded_context"
+    mv -f "$bounded_context" "$output"
+    context_bytes="$(wc -c <"$output" | tr -d ' ')"
+    context_truncated=true
+  fi
+  printf 'context_limit_bytes=%s\ncontext_bytes=%s\ncontext_truncated=%s\ncontext_selected_count=%s\ncontext_rendered_count=%s\n' \
+    "$max_bytes" "$context_bytes" "$context_truncated" "$context_selected_count" "$context_rendered_count" >>"$metadata"
   rm -f "$state_warnings"
 }
 
 bridge_json_output() {
-  local kind="$1" project_id="$2" metadata="$3" context="$4" result="$5" requested="$6" actual="$7" degraded="$8" project_path="${9:-}" request_id="${10:-}" py
+  local kind="$1" project_id="$2" metadata="$3" context="$4" result="$5" requested="$6" actual="$7" degraded="$8" project_path="${9:-}" request_id="${10:-}" budget="${11:-}" py
   py="$(bridge_python)"
   [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for bridge JSON output"
-  "$py" - "$kind" "$project_id" "$metadata" "$context" "$result" "$requested" "$actual" "$degraded" "$project_path" "$request_id" <<'PY'
+  "$py" - "$kind" "$project_id" "$metadata" "$context" "$result" "$requested" "$actual" "$degraded" "$project_path" "$request_id" "$budget" <<'PY'
 import hashlib
 import json
 import re
 import sys
 from pathlib import Path
 
-kind, project_id, metadata_path, context_path, result_path, requested, actual, degraded, project_path, request_id = sys.argv[1:]
+kind, project_id, metadata_path, context_path, result_path, requested, actual, degraded, project_path, request_id, budget = sys.argv[1:]
+
+def integer(value, default=0):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+def utf8_prefix(value, limit):
+    return value.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+budget_tokens = integer(budget)
+budget_bytes = budget_tokens * 4 if budget_tokens else 0
 
 def kv(path):
     values = {}
@@ -1300,12 +1439,57 @@ if kind == "recall":
             continue
         if isinstance(bundle, dict) and isinstance(bundle.get("records", []), list):
             evidence_bundles.append(bundle)
+    context_raw = Path(context_path).read_text(encoding="utf-8") if Path(context_path).exists() else ""
+    context_source_bytes = len(context_raw.encode("utf-8", "replace"))
+    context_truncated = metadata.get("context_truncated", "false") == "true"
+    if budget_bytes and context_source_bytes > budget_bytes:
+        context_raw = utf8_prefix(context_raw, budget_bytes)
+        context_truncated = True
+    context_bytes = len(context_raw.encode("utf-8", "replace"))
+    degraded_value = metadata.get("degraded", degraded) == "true"
+    warnings = []
+    actions = []
+    if degraded_value:
+        warnings.append("retrieval-degraded")
+    if context_truncated:
+        warnings.append("context-truncated")
+        actions.append("request-larger-budget")
+    response_state = "partial" if context_truncated else "degraded" if degraded_value else "complete"
+    retrieval = {
+        "state": response_state,
+        "complete": response_state == "complete",
+        "partial": response_state == "partial",
+        "degraded": degraded_value,
+        "failed": False,
+        "warnings": warnings,
+        "actions": actions,
+        "budget": {
+            "requested_tokens": budget_tokens or None,
+            "limit_bytes": budget_bytes or None,
+            "context_bytes": context_bytes,
+        },
+        "truncation": {
+            "truncated": context_truncated,
+            "source_bytes": context_source_bytes,
+            "emitted_bytes": context_bytes,
+            "omitted_bytes": max(0, context_source_bytes - context_bytes),
+        },
+    }
     payload = {
         "status": "ok",
+        "state": response_state,
+        "complete": response_state == "complete",
+        "partial": response_state == "partial",
+        "failed": False,
+        "warnings": warnings,
+        "actions": actions,
+        "budget": retrieval["budget"],
+        "truncation": retrieval["truncation"],
+        "retrieval": retrieval,
         "project_id": project_id,
         "requested_strategy": requested,
         "actual_strategy": metadata.get("retrieval_mode", actual),
-        "degraded": metadata.get("degraded", degraded) == "true",
+        "degraded": degraded_value,
         "temporal": {"as_of": metadata.get("as_of", "none")},
         "evidence_refs": [] if evidence in ("", "none") else evidence.split(","),
         "resolution_mode": metadata.get("resolution_mode", "static"),
@@ -1318,7 +1502,7 @@ if kind == "recall":
         "evidence_bundles": evidence_bundles,
         "conflicts": [row["path"] for row in rows if "conflicted" in row["state"]],
         "results": rows,
-        "context_markdown": Path(context_path).read_text(encoding="utf-8") if Path(context_path).exists() else "",
+        "context_markdown": context_raw,
     }
 else:
     raw = Path(result_path).read_text(encoding="utf-8") if Path(result_path).exists() else ""
@@ -1335,8 +1519,32 @@ else:
         except ValueError:
             return value
 
+    capture_ok = "ingest=captured" in raw
+    response_state = "complete" if capture_ok else "failed"
+    warnings = [] if capture_ok else ["capture-failed"]
+    actions = [] if capture_ok else ["retry"]
+    retrieval = {
+        "state": response_state,
+        "complete": capture_ok,
+        "partial": False,
+        "degraded": not capture_ok,
+        "failed": not capture_ok,
+        "warnings": warnings,
+        "actions": actions,
+        "budget": {"requested_tokens": None, "limit_bytes": None, "context_bytes": 0},
+        "truncation": {"truncated": False, "source_bytes": 0, "emitted_bytes": 0, "omitted_bytes": 0},
+    }
     payload = {
-        "status": "ok" if "ingest=captured" in raw else "failed",
+        "status": "ok" if capture_ok else "failed",
+        "state": response_state,
+        "complete": capture_ok,
+        "partial": False,
+        "failed": not capture_ok,
+        "warnings": warnings,
+        "actions": actions,
+        "budget": retrieval["budget"],
+        "truncation": retrieval["truncation"],
+        "retrieval": retrieval,
         "project_id": project_id,
         "request_id": request_id,
         "episode_ref": project_relative(fields.get("episode", "")),
@@ -2545,7 +2753,7 @@ reflection_schedule() {
   source_text="$(cat "$source" 2>/dev/null || true)"
   text="$(cat "$source" "$episode" 2>/dev/null || true)"
   lower="$(printf '%s' "$text" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-  if printf '%s' "$lower" | grep -Eq 'correction|corrected|actually|decision|decided|requirement|must[[:space:]]|procedure|step-by-step|outcome|failed|failure|contradict|conflict|authoritative|source of truth|supersed|deprecated'; then
+  if grep -Eq 'correction|corrected|actually|decision|decided|requirement|must[[:space:]]|procedure|step-by-step|outcome|failed|failure|contradict|conflict|authoritative|source of truth|supersed|deprecated' <<<"$lower"; then
     reflection_schedule_record "$project_id" "$episode_ref" immediate explicit-signal
   elif [ "$(printf '%s' "$source_text" | wc -c | tr -d ' ')" -le 160 ] && printf '%s' "$source_text" | tr '\n' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]' | grep -Eq '^[[:space:]]*(hi|hello|thanks([[:space:]]+for[[:space:]]+the[[:space:]]+update)?|thank you|ok|okay|ack|noted|lgtm)[.![:space:]]*$'; then
     reflection_schedule_record "$project_id" "$episode_ref" deferred low-value-transient
@@ -2869,7 +3077,7 @@ cmd_bridge() {
       bridge_render_context "$id" "$results" "$metadata" "$budget" "$context"
       actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
       degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
-      bridge_json_output recall "$id" "$metadata" "$context" "$results" "$requested_strategy" "$actual_strategy" "$degraded" "$dir"
+      bridge_json_output recall "$id" "$metadata" "$context" "$results" "$requested_strategy" "$actual_strategy" "$degraded" "$dir" "" "$budget"
       rm -rf "$tmp"
       ;;
     capture)
@@ -4118,14 +4326,275 @@ canonical_signature() {
 
 index_manifest_hash() {
   local dir="$1" manifest
-  manifest="$dir/indexes/manifest.tsv"
+  manifest="$(index_file_path "$dir" manifest.tsv)"
   if [ -f "$manifest" ]; then sha256_file "$manifest"; fi
+  return 0
+}
+
+# Derived indexes are published as complete generations. The plain files at
+# indexes/*.tsv remain compatibility aliases for older readers; new readers
+# resolve the current pointer first and fall back to those legacy paths.
+index_current_generation() {
+  local dir="$1" pointer generation
+  pointer="$dir/indexes/current"
+  [ -f "$pointer" ] || return 1
+  IFS= read -r generation <"$pointer" || true
+  case "$generation" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ -d "$dir/indexes/generations/$generation" ] || return 1
+  printf '%s\n' "$generation"
+}
+
+index_active_root() {
+  local dir="$1" generation
+  generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  if [ -n "$generation" ]; then
+    printf '%s/indexes/generations/%s\n' "$dir" "$generation"
+  else
+    printf '%s/indexes\n' "$dir"
+  fi
+}
+
+index_file_path() {
+  local dir="$1" name="$2" root
+  root="$(index_active_root "$dir")"
+  if [ -f "$root/$name" ] || [ -L "$root/$name" ]; then
+    printf '%s/%s\n' "$root" "$name"
+  else
+    # A lexical-only generation may not contain optional files; retain the
+    # legacy root lookup in that case.
+    printf '%s/indexes/%s\n' "$dir" "$name"
+  fi
+}
+
+index_rebuild_state_path() {
+  printf '%s/indexes/rebuild-state.json\n' "$1"
+}
+
+evidence_index_state_path() {
+  printf '%s/indexes/evidence-rebuild-state.json\n' "$1"
+}
+
+evidence_index_generation_path() {
+  printf '%s/indexes/evidence-current\n' "$1"
+}
+
+evidence_index_generation() {
+  local dir="$1" pointer generation
+  pointer="$(evidence_index_generation_path "$dir")"
+  [ -f "$pointer" ] || return 1
+  IFS= read -r generation <"$pointer" || true
+  case "$generation" in
+    evidence_[A-Fa-f0-9]*) printf '%s\n' "$generation" ;;
+    *) return 1 ;;
+  esac
+}
+
+evidence_index_publish_generation() {
+  local dir="$1" index="${2:-$1/indexes/evidence-vectors.tsv}" pointer pointer_tmp generation
+  [ -f "$index" ] || return 1
+  generation="evidence_$(sha256_file "$index" | cut -c1-16)"
+  pointer="$(evidence_index_generation_path "$dir")"
+  pointer_tmp="${pointer}.tmp.$$"
+  printf '%s\n' "$generation" >"$pointer_tmp"
+  mv -f "$pointer_tmp" "$pointer"
+  printf '%s\n' "$generation"
+}
+
+evidence_write_rebuild_state() {
+  local dir="$1" state="$2" status="$3" generation="${4:-}" previous="${5:-}" started="${6:-}" finished="${7:-}" reason="${8:-}" path tmp py
+  path="$(evidence_index_state_path "$dir")"
+  ensure_dir "$(dirname "$path")"
+  tmp="${path}.tmp.$$"
+  py="$(bridge_python 2>/dev/null || true)"
+  if [ -n "$py" ] && [ -x "$py" ]; then
+    "$py" - "$tmp" "$state" "$status" "$generation" "$previous" "$started" "$finished" "$reason" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, state, status, generation, previous, started, finished, reason = sys.argv[1:]
+payload = {
+    "state": state,
+    "status": status,
+    "phase": "complete" if state == "idle" else state,
+    "generation": generation or None,
+    "last_good_generation": previous or None,
+    "started_at": started or None,
+    "finished_at": finished or None,
+    "reason": reason or None,
+}
+Path(path).write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  else
+    printf '{"state":"%s","status":"%s","phase":"%s","generation":%s,"last_good_generation":%s,"reason":%s}\n' \
+      "$state" "$status" "$([ "$state" = idle ] && printf complete || printf '%s' "$state")" \
+      "$([ -n "$generation" ] && printf '"%s"' "$generation" || printf null)" \
+      "$([ -n "$previous" ] && printf '"%s"' "$previous" || printf null)" \
+      "$([ -n "$reason" ] && printf '"%s"' "$reason" || printf null)" >"$tmp"
+  fi
+  mv -f "$tmp" "$path"
+}
+
+evidence_index_health_contract() {
+  local dir="$1" index="$dir/indexes/evidence-vectors.tsv" state_file generation expected state status reason metadata_generation
+  state_file="$(evidence_index_state_path "$dir")"
+  state="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null || true)"
+  status="$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null || true)"
+  metadata_generation="$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null || true)"
+  generation="$(evidence_index_generation "$dir" 2>/dev/null || true)"
+  if [ "$state" = building ] || [ "$status" = building ]; then
+    printf 'rebuild-pending\tevidence-index-rebuild-in-progress\t%s\n' "${generation:-$metadata_generation}"
+    return 0
+  fi
+  if [ ! -f "$index" ]; then
+    printf 'missing\tevidence-index-absent\t\n'
+    return 0
+  fi
+  if [ "$(sed -n '1p' "$index" 2>/dev/null)" != "$EVIDENCE_INDEX_HEADER" ]; then
+    printf 'stale\tevidence-index-header-invalid\t\n'
+    return 0
+  fi
+  expected="evidence_$(sha256_file "$index" | cut -c1-16)"
+  if [ "$state" = failed ] || [ "$status" = failed ] || [ -z "$generation" ] || [ "$generation" != "$expected" ] || [ -z "$metadata_generation" ] || [ "$metadata_generation" != "$generation" ]; then
+    reason="evidence-index-generation-metadata-missing"
+    [ -n "$generation" ] || reason="evidence-index-generation-missing"
+    [ "$generation" = "$expected" ] || reason="evidence-index-generation-drift"
+    [ "$state" != failed ] && [ "$status" != failed ] || reason="evidence-index-rebuild-failed"
+    printf 'stale\t%s\t%s\n' "$reason" "${generation:-$metadata_generation}"
+  else
+    printf 'current\tevidence-index-current\t%s\n' "$generation"
+  fi
+}
+
+index_pointer_state() {
+  local dir="$1" pointer="$dir/indexes/current"
+  if [ ! -e "$pointer" ]; then
+    printf 'absent\n'
+  elif [ -n "$(index_current_generation "$dir" 2>/dev/null || true)" ]; then
+    printf 'active\n'
+  else
+    printf 'invalid\n'
+  fi
+}
+
+index_health_contract() {
+  local dir="$1" index_status="$2" generation="$3" documents_state="$4" graph_state="$5" vectors_state="$6" manifest_state="$7" state_file="$8" rebuild_state rebuild_status pointer_state
+  rebuild_state="$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null || true)"
+  rebuild_status="$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" 2>/dev/null || true)"
+  if [ "$rebuild_state" = building ] || [ "$rebuild_status" = building ]; then
+    printf 'rebuild-pending\tindex-rebuild-in-progress\n'
+    return 0
+  fi
+  [ "$index_status" = present ] || { printf 'missing\tindex-manifest-missing\n'; return 0; }
+  pointer_state="$(index_pointer_state "$dir")"
+  if [ "$pointer_state" = invalid ]; then
+    printf 'stale\tindex-current-pointer-invalid\n'
+  elif [ "$rebuild_state" = failed ] || [ "$rebuild_status" = failed ]; then
+    printf 'stale\tindex-rebuild-failed\n'
+  elif [ "$documents_state" != current ] || [ "$graph_state" != current ] || [ "$vectors_state" = stale ] || [ "$manifest_state" != current ]; then
+    printf 'stale\tindex-manifest-or-generation-stale\n'
+  elif [ -n "$generation" ]; then
+    printf 'current\tactive-generation\n'
+  else
+    printf 'current\tlegacy-index-without-generation-pointer\n'
+  fi
+}
+
+index_write_rebuild_state() {
+  local dir="$1" state="$2" status="$3" generation="${4:-}" previous="${5:-}" started="${6:-}" finished="${7:-}" reason="${8:-}" path tmp py
+  path="$(index_rebuild_state_path "$dir")"
+  ensure_dir "$(dirname "$path")"
+  tmp="${path}.tmp.$$"
+  py="$(bridge_python 2>/dev/null || true)"
+  if [ -n "$py" ] && [ -x "$py" ]; then
+    "$py" - "$tmp" "$state" "$status" "$generation" "$previous" "$started" "$finished" "$reason" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, state, status, generation, previous, started, finished, reason = sys.argv[1:]
+payload = {
+    "state": state,
+    "status": status,
+    "phase": "complete" if state == "idle" else state,
+    "generation": generation or None,
+    "last_good_generation": previous or None,
+    "started_at": started or None,
+    "finished_at": finished or None,
+    "reason": reason or None,
+}
+Path(path).write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  else
+    # Normal environments have Python (bridge JSON already requires it), but
+    # retain a valid minimal state document if that runtime is unavailable.
+    printf '{"state":"%s","status":"%s","phase":"%s","generation":%s,"last_good_generation":%s,"reason":%s}\n' \
+      "$state" "$status" "$([ "$state" = idle ] && printf complete || printf '%s' "$state")" \
+      "$([ -n "$generation" ] && printf '"%s"' "$generation" || printf null)" \
+      "$([ -n "$previous" ] && printf '"%s"' "$previous" || printf null)" \
+      "$([ -n "$reason" ] && printf '"%s"' "$reason" || printf null)" >"$tmp"
+  fi
+  mv -f "$tmp" "$path"
+}
+
+index_publish_compat() {
+  local dir="$1" generation="$2" indexes root name tmp
+  indexes="$dir/indexes"
+  root="$indexes/generations/$generation"
+  ensure_dir "$indexes"
+  for name in documents.tsv terms.tsv graph.tsv manifest.tsv vectors.tsv; do
+    if [ -f "$root/$name" ]; then
+      tmp="$indexes/.${name}.compat.$$"
+      rm -f "$tmp"
+      ln -s "generations/$generation/$name" "$tmp"
+      mv -f "$tmp" "$indexes/$name"
+    else
+      rm -f "$indexes/$name"
+    fi
+  done
+}
+
+index_validate_generation() {
+  local dir="$1" root="$2" embedder="${3:-}" docs terms graph manifest vectors path hash model dimensions vector docs_signature manifest_signature vector_signature
+  [ -d "$root" ] || return 1
+  docs="$root/documents.tsv"; terms="$root/terms.tsv"; graph="$root/graph.tsv"; manifest="$root/manifest.tsv"; vectors="$root/vectors.tsv"
+  [ -f "$docs" ] && [ -f "$terms" ] && [ -f "$graph" ] && [ -f "$manifest" ] || return 1
+  [ "$(sed -n '1p' "$docs")" = $'path\thash\ttype\ttitle\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttemperature\ttopic_id\tgenerated_at\tstale_after\tsources\truntime' ] || return 1
+  [ "$(sed -n '1p' "$terms")" = $'term\tpath\tcount' ] || return 1
+  [ "$(sed -n '1p' "$graph")" = $'source\trelation\ttarget' ] || return 1
+  [ "$(sed -n '1p' "$manifest")" = $'path\thash\tschema\tembedder' ] || return 1
+  awk -F '\t' 'NR > 1 && (NF < 15 || $1 == "" || seen[$1]++) { invalid=1 } END { exit invalid }' "$docs" || return 1
+  awk -F '\t' 'NR > 1 && (NF < 4 || $1 == "" || seen[$1]++) { invalid=1 } END { exit invalid }' "$manifest" || return 1
+  while IFS=$'\t' read -r path hash _; do
+    [ -n "$path" ] || continue
+    case "$path" in /*|*..*|*$'\n'*|*$'\r'*) return 1 ;; esac
+    [ -f "$dir/$path" ] || return 1
+    [ "$(sha256_file "$dir/$path")" = "$hash" ] || return 1
+  done < <(tail -n +2 "$docs")
+  docs_signature="$(tail -n +2 "$docs" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
+  manifest_signature="$(tail -n +2 "$manifest" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
+  [ "$docs_signature" = "$manifest_signature" ] || return 1
+  if [ -n "$embedder" ]; then
+    [ -f "$vectors" ] || return 1
+    [ "$(sed -n '1p' "$vectors")" = $'path\thash\tmodel\tdimensions\tvector' ] || return 1
+    awk -F '\t' 'NR > 1 && (NF < 5 || $1 == "" || seen[$1]++) { invalid=1 } END { exit invalid }' "$vectors" || return 1
+    while IFS=$'\t' read -r path hash model dimensions vector; do
+      [ -n "$path" ] || continue
+      [ -f "$dir/$path" ] || return 1
+      [ "$(sha256_file "$dir/$path")" = "$hash" ] || return 1
+      valid_embedding_row "$dimensions" "$vector" || return 1
+    done < <(tail -n +2 "$vectors")
+    vector_signature="$(tail -n +2 "$vectors" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
+    [ "$docs_signature" = "$vector_signature" ] || return 1
+  fi
   return 0
 }
 
 index_documents_state() {
   local dir="$1" file expected actual
-  file="$dir/indexes/documents.tsv"
+  file="$(index_file_path "$dir" documents.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
   actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
@@ -4134,7 +4603,7 @@ index_documents_state() {
 
 index_manifest_state() {
   local dir="$1" file expected actual
-  file="$dir/indexes/manifest.tsv"
+  file="$(index_file_path "$dir" manifest.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
   actual="$(tail -n +2 "$file" | awk -F '\t' 'NF >= 2 { print $1 "\t" $2 }' | sort)"
@@ -4143,7 +4612,7 @@ index_manifest_state() {
 
 index_graph_state() {
   local dir="$1" file header docs manifest
-  file="$dir/indexes/graph.tsv"
+  file="$(index_file_path "$dir" graph.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   header="$(sed -n '1p' "$file")"
   [ "$header" = $'source\trelation\ttarget' ] || { printf 'stale\n'; return; }
@@ -4169,7 +4638,7 @@ valid_embedding_row() {
 
 index_vectors_state() {
   local dir="$1" file manifest_state expected_count actual_count path hash model dimensions vector first_model="" first_dimensions=""
-  file="$dir/indexes/vectors.tsv"
+  file="$(index_file_path "$dir" vectors.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   [ "$(sed -n '1p' "$file")" = $'path\thash\tmodel\tdimensions\tvector' ] || { printf 'stale\n'; return; }
   manifest_state="$(index_manifest_state "$dir")"
@@ -4310,6 +4779,20 @@ principal_visible() {
   [ -z "$scope" ] && [ -z "$audience" ] && return 0
   visibility_matches "$scope" "$principal" && return 0
   visibility_matches "$audience" "$principal"
+}
+
+bridge_render_record_visible() {
+  local dir="$1" path="$2" principal="$3" file sensitivity
+  case "$path" in
+    /*|*..*|*$'\n'*|*$'\r'*) return 1 ;;
+    okf/*.md|sources/*.md|episodes/*.md|review/*.md) ;;
+    *) return 1 ;;
+  esac
+  file="$dir/$path"
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  [ "$sensitivity" != restricted ] || return 1
+  principal_visible "$file" "$principal"
 }
 
 state_resolution_for_file() {
@@ -4827,10 +5310,15 @@ search_file_eligible() {
 }
 
 file_conflict_state() {
-  local file="$1" graph_file="${2:-}" rel
+  local file="$1" graph_file="${2:-}" rel graph_root
   [ -n "$(frontmatter_field "$file" brain_conflicts)" ] && { printf 'conflicted\n'; return; }
   if [ -n "$graph_file" ] && [ -f "$graph_file" ]; then
-    rel="${file#"${graph_file%/indexes/graph.tsv}"/}"
+    case "$graph_file" in
+      */indexes/generations/*/graph.tsv) graph_root="${graph_file%%/indexes/generations/*}" ;;
+      */indexes/graph.tsv) graph_root="${graph_file%/indexes/graph.tsv}" ;;
+      *) graph_root="" ;;
+    esac
+    rel="${file#"$graph_root"/}"
     if awk -F '\t' -v path="$rel" '$2 == "conflicts_with" && ($1 == path || $3 == path) { found=1 } END { exit !found }' "$graph_file"; then
       printf 'conflicted\n'; return
     fi
@@ -4839,13 +5327,18 @@ file_conflict_state() {
 }
 
 build_indexes() {
-  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors stage tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts vector vector_tmp
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors stage generation generation_dir previous_generation started_at pointer_tmp tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts vector vector_tmp
   require_project "$project_id" dir
   [ -z "$embedder" ] || [ -x "$embedder" ] || die 69 "embedder is not executable: $embedder"
   docs="$dir/indexes/documents.tsv"; terms="$dir/indexes/terms.tsv"; graph="$dir/indexes/graph.tsv"; manifest="$dir/indexes/manifest.tsv"; vectors="$dir/indexes/vectors.tsv"
   ensure_dir "$dir/indexes"
   ensure_dir "$dir/indexes/embeddings"
   stage="$(mktemp -d "$dir/indexes/.build.XXXXXX")"
+  generation="gen_$(date -u '+%Y%m%dT%H%M%SZ')_$(basename "$stage" | sed 's/^\.build\.//')"
+  generation_dir="$dir/indexes/generations/$generation"
+  previous_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  started_at="$(now_utc)"
+  index_write_rebuild_state "$dir" building building "$generation" "$previous_generation" "$started_at" "" ""
   tmp_docs="$stage/documents.tsv"; tmp_terms="$stage/terms.tsv"; tmp_graph="$stage/graph.tsv"; tmp_manifest="$stage/manifest.tsv"; tmp_vectors="$stage/vectors.tsv"
   printf 'path\thash\ttype\ttitle\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttemperature\ttopic_id\tgenerated_at\tstale_after\tsources\truntime\n' >"$tmp_docs"
   printf 'term\tpath\tcount\n' >"$tmp_terms"
@@ -4855,7 +5348,11 @@ build_indexes() {
   while IFS= read -r file; do
     canonical_file_effective "$dir" "$file" || continue
     rel="${file#"$dir"/}"; hash="$(sha256_file "$file")"
-    facts="$(okf facts "$file")"
+    if ! facts="$(okf facts "$file")"; then
+      rm -rf "$stage"
+      index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "facts-unavailable"
+      return 69
+    fi
     IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
     state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; temp="$(frontmatter_field "$file" brain_loading_temperature)"; [ -n "$temp" ] || temp="warm"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$type" "$title" "$state" "$status" "$trust" "$freshness" "${sensitivity:-internal}" "$temp" "$(frontmatter_field "$file" brain_topic_id topic_id)" "$generated_at" "$stale_after" "$source_count" "$runtime" >>"$tmp_docs"
@@ -4878,7 +5375,8 @@ build_indexes() {
         else
           rm -f "$vector_tmp"
           rm -rf "$stage"
-          die 69 "embedder returned an invalid vector for: $rel"
+          index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "embedder-invalid-vector"
+          return 69
         fi
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$(embedding_field "$vector" model)" "$(embedding_field "$vector" dimensions)" "$(embedding_field "$vector" vector)" >>"$tmp_vectors"
@@ -4887,28 +5385,140 @@ build_indexes() {
   { head -1 "$tmp_docs"; tail -n +2 "$tmp_docs" | sort -u; } >"${tmp_docs}.sorted"; mv "${tmp_docs}.sorted" "$tmp_docs"
   { head -1 "$tmp_terms"; tail -n +2 "$tmp_terms" | sort -u; } >"${tmp_terms}.sorted"; mv "${tmp_terms}.sorted" "$tmp_terms"
   { head -1 "$tmp_graph"; tail -n +2 "$tmp_graph" | sort -u; } >"${tmp_graph}.sorted"; mv "${tmp_graph}.sorted" "$tmp_graph"
+  if ! index_validate_generation "$dir" "$stage" "$embedder"; then
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-validation-failed"
+    return 69
+  fi
   acquire_lock "project-$project_id"
-  mv "$tmp_docs" "$docs"; mv "$tmp_terms" "$terms"; mv "$tmp_graph" "$graph"; mv "$tmp_manifest" "$manifest"
-  if [ -n "$embedder" ]; then mv "$tmp_vectors" "$vectors"; else rm -f "$tmp_vectors" "$vectors"; fi
-  audit_v2 "$dir" "index-build" "indexes" "" "rebuilt" "$(sha256_file "$docs")" "embedder=${embedder:+configured}"
+  previous_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  ensure_dir "$dir/indexes/generations"
+  [ ! -e "$generation_dir" ] || {
+    release_lock
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-already-exists"
+    return 69
+  }
+  if ! mv "$stage" "$generation_dir"; then
+    release_lock
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-publish-failed"
+    return 69
+  fi
+  pointer_tmp="$dir/indexes/.current.$$"
+  printf '%s\n' "$generation" >"$pointer_tmp"
+  if ! mv -f "$pointer_tmp" "$dir/indexes/current"; then
+    rm -f "$pointer_tmp"
+    release_lock
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "current-pointer-publish-failed"
+    return 69
+  fi
+  index_publish_compat "$dir" "$generation"
+  audit_v2 "$dir" "index-build" "indexes/$generation" "" "rebuilt" "$(sha256_file "$generation_dir/documents.tsv")" "embedder=${embedder:+configured}"
   release_lock
-  rmdir "$stage" 2>/dev/null || true
+  index_write_rebuild_state "$dir" idle ready "$generation" "$generation" "$started_at" "$(now_utc)" ""
   [ -z "$embedder" ] || bridge_rebuild_evidence_index "$project_id" "$embedder" || say_error "evidence index rebuild unavailable for project $project_id"
   printf 'index=rebuilt project_id=%s documents=%s terms=%s graph=%s\n' "$project_id" "$docs" "$terms" "$graph"
 }
 
+index_status_json() {
+  local project_id="$1" index_status="$2" generation="$3" documents="$4" documents_state="$5" graph_state="$6" vectors_state="$7" manifest_state="$8" retrieval_mode="$9" hybrid_ready="${10}" manifest_hash="${11}" state_file="${12}" health="${13}" health_reason="${14}" watcher="${15}" evidence_status="${16}" evidence_health="${17}" evidence_generation="${18}" evidence_reason="${19}" evidence_state_file="${20}" py
+  py="$(bridge_python 2>/dev/null || true)"
+  [ -n "$py" ] && [ -x "$py" ] || return 69
+  "$py" - "$project_id" "$index_status" "$generation" "$documents" "$documents_state" "$graph_state" "$vectors_state" "$manifest_state" "$retrieval_mode" "$hybrid_ready" "$manifest_hash" "$state_file" "$health" "$health_reason" "$watcher" "$evidence_status" "$evidence_health" "$evidence_generation" "$evidence_reason" "$evidence_state_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(project_id, index_status, generation, documents, documents_state, graph_state,
+ vectors_state, manifest_state, retrieval_mode, hybrid_ready, manifest_hash,
+ state_file, health, health_reason, watcher, evidence_status, evidence_health,
+ evidence_generation, evidence_reason, evidence_state_file) = sys.argv[1:]
+try:
+    rebuild = json.loads(Path(state_file).read_text(encoding="utf-8")) if Path(state_file).exists() else {
+        "state": "unknown", "status": "unknown", "phase": "unknown",
+    }
+except (OSError, ValueError):
+    rebuild = {"state": "invalid", "status": "invalid", "phase": "invalid"}
+try:
+    evidence_rebuild = json.loads(Path(evidence_state_file).read_text(encoding="utf-8")) if Path(evidence_state_file).exists() else {
+        "state": "unknown", "status": "unknown", "phase": "unknown",
+    }
+except (OSError, ValueError):
+    evidence_rebuild = {"state": "invalid", "status": "invalid", "phase": "invalid"}
+try:
+    documents_value = int(documents or 0)
+except ValueError:
+    documents_value = 0
+payload = {
+    "status": "ok" if index_status == "present" else index_status,
+    "health": health,
+    "health_reason": health_reason or None,
+    "watcher": watcher,
+    "project_id": project_id,
+    "index_status": index_status,
+    "generation": generation or None,
+    "current_pointer": "indexes/current" if generation else None,
+    "documents": documents_value,
+    "documents_index": documents_state,
+    "graph_index": graph_state,
+    "vector_index": vectors_state,
+    "manifest_index": manifest_state,
+    "retrieval_mode": retrieval_mode,
+    "hybrid_ready": hybrid_ready == "true",
+    "manifest_hash": manifest_hash or None,
+    "rebuild_state": rebuild,
+    "evidence_index": evidence_status,
+    "evidence_health": evidence_health,
+    "evidence_watcher": "none",
+    "evidence_generation": evidence_generation or None,
+    "evidence_health_reason": evidence_reason or None,
+    "evidence_rebuild_state": evidence_rebuild,
+}
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
 cmd_index() {
-  local action="$1" project_id="$2"; shift 2 || true
+  local action="${1:-}" project_id="" json=0 embedder="$EMBEDDER"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --embedder) embedder="${2:-}"; shift 2 ;;
+      *) [ -z "$project_id" ] || die 64 "unknown index option: $1"; project_id="$1"; shift ;;
+    esac
+  done
+  [ -n "$project_id" ] || die 64 "index requires PROJECT_ID"
   case "$action" in
     build)
-      local embedder="$EMBEDDER"; [ "${1:-}" = "--embedder" ] && embedder="${2:-}"
       build_indexes "$project_id" "$embedder"
       ;;
     status)
-      local dir manifest docs_state graph_state vectors_state manifest_state manifest_hash documents hybrid_ready
+      local dir manifest docs_state graph_state vectors_state manifest_state manifest_hash documents hybrid_ready generation rebuild_state_file health health_reason evidence_status evidence_health evidence_generation evidence_reason evidence_state_file health_contract evidence_contract
       require_project "$project_id" dir
-      manifest="$dir/indexes/manifest.tsv"
-      [ -f "$manifest" ] || { printf 'index_status=missing project_id=%s documents_index=missing graph_index=missing vector_index=missing retrieval_mode=lexical hybrid_ready=false manifest_hash=none\n' "$project_id"; return 1; }
+      manifest="$(index_file_path "$dir" manifest.tsv)"
+      generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+      rebuild_state_file="$(index_rebuild_state_path "$dir")"
+      evidence_state_file="$(evidence_index_state_path "$dir")"
+      evidence_contract="$(evidence_index_health_contract "$dir")"
+      IFS=$'\t' read -r evidence_health evidence_reason evidence_generation <<EOF
+$evidence_contract
+EOF
+      evidence_status=missing
+      [ -f "$dir/indexes/evidence-vectors.tsv" ] && evidence_status=present
+      if [ ! -f "$manifest" ]; then
+        health_contract="$(index_health_contract "$dir" missing "$generation" missing missing missing missing "$rebuild_state_file")"
+        IFS=$'\t' read -r health health_reason <<EOF
+$health_contract
+EOF
+        if [ "$json" = 1 ]; then
+          index_status_json "$project_id" missing "$generation" 0 missing missing missing missing lexical false none "$rebuild_state_file" "$health" "$health_reason" none "$evidence_status" "$evidence_health" "$evidence_generation" "$evidence_reason" "$evidence_state_file"
+          return 0
+        fi
+        printf 'index_status=missing project_id=%s documents_index=missing graph_index=missing vector_index=missing retrieval_mode=lexical hybrid_ready=false manifest_hash=none rebuild_state=%s\n' "$project_id" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)"
+        printf 'index_health=%s health_reason=%s watcher=none evidence_index=%s evidence_health=%s evidence_watcher=none evidence_generation=%s\n' "$health" "$health_reason" "$evidence_status" "$evidence_health" "${evidence_generation:-none}"
+        return 1
+      fi
       docs_state="$(index_documents_state "$dir")"
       graph_state="$(index_graph_state "$dir")"
       vectors_state="$(index_vectors_state "$dir")"
@@ -4916,7 +5526,18 @@ cmd_index() {
       manifest_hash="$(index_manifest_hash "$dir")"
       documents="$(tail -n +2 "$manifest" | wc -l | tr -d ' ')"
       hybrid_ready=false; [ "$vectors_state" = "current" ] && hybrid_ready=true
-      printf 'index_status=present project_id=%s documents=%s documents_index=%s graph_index=%s vector_index=%s manifest_index=%s retrieval_mode=lexical hybrid_ready=%s manifest_hash=%s\n' "$project_id" "$documents" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" "$hybrid_ready" "${manifest_hash:-none}"
+      health_contract="$(index_health_contract "$dir" present "$generation" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" "$rebuild_state_file")"
+      IFS=$'\t' read -r health health_reason <<EOF
+$health_contract
+EOF
+      if [ "$json" = 1 ]; then
+        index_status_json "$project_id" present "$generation" "$documents" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" lexical "$hybrid_ready" "${manifest_hash:-none}" "$rebuild_state_file" "$health" "$health_reason" none "$evidence_status" "$evidence_health" "$evidence_generation" "$evidence_reason" "$evidence_state_file"
+      else
+        printf 'index_status=present project_id=%s documents=%s documents_index=%s graph_index=%s vector_index=%s manifest_index=%s retrieval_mode=lexical hybrid_ready=%s manifest_hash=%s rebuild_state=%s generation=%s\n' "$project_id" "$documents" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" "$hybrid_ready" "${manifest_hash:-none}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "${generation:-legacy}"
+      fi
+      if [ "$json" != 1 ]; then
+        printf 'index_health=%s health_reason=%s watcher=none evidence_index=%s evidence_health=%s evidence_watcher=none evidence_generation=%s\n' "$health" "$health_reason" "$evidence_status" "$evidence_health" "${evidence_generation:-none}"
+      fi
       ;;
     *) die 64 "index requires build or status" ;;
   esac
@@ -4936,7 +5557,7 @@ resolve_graph_target() {
 cmd_search() {
   local project_id="$1" query="$2"; shift 2 || true
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
-  local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file=""
+  local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
   local state_reason="" effective_ref="" evidence_group="unknown" provenance_state="unknown" independent_source_count=0 correlated_record_count=0 state_unresolved_count=0 lifecycle_bundle="" lifecycle_bundle_record_count=0
@@ -4977,9 +5598,11 @@ cmd_search() {
   case "$strategy" in lexical|vector|hybrid) ;; *) die 64 "search strategy must be lexical, vector, or hybrid" ;; esac
   require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   require_project "$project_id" dir
+  index_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  rebuild_state_file="$(index_rebuild_state_path "$dir")"
   if [ "$require_evidence" = 1 ] && [ "$exploratory" = 0 ] && [ "$include_proposed" = 0 ] && ! find "$dir/okf/claims" "$dir/okf/computations" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' -print -quit 2>/dev/null | grep -q .; then
     printf 'path\tscore\ttype\ttitle\tstate\n'
-    [ -z "$metadata_file" ] || printf 'retrieval_mode=lexical\ndegraded=true\nmanifest_hash=none\nstrategy_requested=%s\n' "$strategy" >"$metadata_file"
+    [ -z "$metadata_file" ] || printf 'retrieval_mode=lexical\ndegraded=true\nmanifest_hash=none\nstrategy_requested=%s\nindex_generation=%s\nrebuild_state=%s\n' "$strategy" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" >"$metadata_file"
     return 0
   fi
   INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
@@ -4988,7 +5611,8 @@ cmd_search() {
   graph_state="$(index_graph_state "$dir")"
   vectors_state="$(index_vectors_state "$dir")"
   manifest_hash="$(index_manifest_hash "$dir")"
-  [ "$graph_state" = "current" ] && graph_file="$dir/indexes/graph.tsv"
+  [ "$graph_state" = "current" ] && graph_file="$(index_file_path "$dir" graph.tsv)"
+  vector_index="$(index_file_path "$dir" vectors.tsv)"
   tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-search.XXXXXX")"
   lexical_raw="$tmp_dir/lexical.raw.tsv"; lexical_rank="$tmp_dir/lexical.rank.tsv"
   semantic_raw="$tmp_dir/semantic.raw.tsv"; semantic_rank="$tmp_dir/semantic.rank.tsv"; union="$tmp_dir/union.tsv"
@@ -5021,7 +5645,7 @@ cmd_search() {
       printf '%s\n' "$query" >"$query_input"
       if "$query_embedder" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
         query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
-        vector_model="$(awk -F '\t' 'NR == 2 { print $3; exit }' "$dir/indexes/vectors.tsv")"; vector_dimensions="$(awk -F '\t' 'NR == 2 { print $4; exit }' "$dir/indexes/vectors.tsv")"
+        vector_model="$(awk -F '\t' 'NR == 2 { print $3; exit }' "$vector_index")"; vector_dimensions="$(awk -F '\t' 'NR == 2 { print $4; exit }' "$vector_index")"
         if [ "$query_model" = "$vector_model" ] && [ "$query_dimensions" = "$vector_dimensions" ]; then
           awk -F '\t' -v q="$(embedding_field "$query_vector" vector)" -v model="$query_model" -v dimensions="$query_dimensions" '
             BEGIN { split(q, qv, /[[:space:]]+/) }
@@ -5030,7 +5654,7 @@ cmd_search() {
               for (i=1; i<=dimensions; i++) { dot += qv[i] * v[i]; qn += qv[i] * qv[i]; vn += v[i] * v[i] }
               if (qn > 0 && vn > 0) printf "%s\t%.12f\n", $1, dot / (sqrt(qn) * sqrt(vn))
             }
-          ' "$dir/indexes/vectors.tsv" >"$semantic_raw"
+          ' "$vector_index" >"$semantic_raw"
           while IFS=$'\t' read -r rel score; do
             [ -n "$rel" ] || continue
             search_file_eligible "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" && printf '%s\t%s\n' "$rel" "$score"
@@ -5086,7 +5710,7 @@ cmd_search() {
           graph_score="$(awk -v value="$score" 'BEGIN { printf "%.12f", value * 0.5 }')"
           printf 'G\t%s\t%s\t%s\t%s\n' "$target_rel" "$graph_score" "$rel" "$relation" >>"$graph_records"
           graph_candidate_count=$((graph_candidate_count + 1))
-        done < <(awk -F '\t' -v source="$rel" '$1 == source { print $1 "\t" $2 "\t" $3 }' "$dir/indexes/graph.tsv")
+        done < <(awk -F '\t' -v source="$rel" '$1 == source { print $1 "\t" $2 "\t" $3 }' "$graph_file")
       done <"$base_records"
     else
       degraded=1
@@ -5184,7 +5808,7 @@ cmd_search() {
     evidence_refs="none"
   fi
   if [ -n "$metadata_file" ]; then
-    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" >"$metadata_file"
+    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" >"$metadata_file"
   fi
   rm -rf "$tmp_dir"
   SEARCH_SUPERSESSION_MAP=""
@@ -5243,7 +5867,7 @@ eval_history_hash() {
 }
 
 cmd_eval() {
-  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
+  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash vector_index answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
   shift 2 || true
   [ "$action" = "run" ] || die 64 "eval requires run"
   [ -n "$project_id" ] || die 64 "eval run requires PROJECT_ID"
@@ -5269,7 +5893,7 @@ cmd_eval() {
   done
   history_hash="$(eval_history_hash "$dir" | sha256_file /dev/stdin)"
   manifest_hash="$(index_manifest_hash "$dir")"; [ -n "$manifest_hash" ] || manifest_hash=none
-  vectors_hash=none; [ ! -f "$dir/indexes/vectors.tsv" ] || vectors_hash="$(sha256_file "$dir/indexes/vectors.tsv")"
+  vectors_hash=none; vector_index="$(index_file_path "$dir" vectors.tsv)"; [ ! -f "$vector_index" ] || vectors_hash="$(sha256_file "$vector_index")"
   answer_runner_hash=none; [ -z "$answer_runner" ] || answer_runner_hash="$(sha256_file "$answer_runner")"
   query_embedder_hash=none; [ -z "$query_embedder" ] || query_embedder_hash="$(sha256_file "$query_embedder")"
   eval_id="eval_$(sha256_text "$project_id|$cases_hash|$strategies|$answer_runner_hash|$query_embedder_hash|$history_hash|$manifest_hash|$vectors_hash" | cut -c1-16)"
@@ -5523,8 +6147,44 @@ cmd_pack() {
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 
+cmd_adapters_openclaw() {
+  local action="${1:-}" project_id="${2:-}" input="" output="" scope="" principal="" dir
+  [ "${LLM_BRAIN_EXPERIMENT_OPENCLAW:-0}" = 1 ] || die 77 "OpenClaw adapter is disabled; set LLM_BRAIN_EXPERIMENT_OPENCLAW=1"
+  [ "$action" = inspect ] || [ "$action" = stage ] || die 64 "adapters openclaw requires inspect or stage"
+  [ -n "$project_id" ] || die 64 "adapters openclaw requires PROJECT_ID INPUT"
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --input) input="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      --scope) scope="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --*) die 64 "unknown OpenClaw adapter option: $1" ;;
+      *) [ -z "$input" ] || die 64 "adapters openclaw accepts one INPUT"; input="$1"; shift ;;
+    esac
+  done
+  [ -n "$input" ] || die 64 "adapters openclaw requires INPUT"
+  require_project "$project_id" dir
+  if [ "$action" = stage ] && [ -z "$output" ]; then output="$dir/adapters/openclaw"; fi
+  if [ -n "$output" ]; then
+    case "$output" in
+      "$dir/okf"|"$dir/okf"/*) die 73 "OpenClaw stage output may not be inside canonical okf/" ;;
+    esac
+  fi
+  local args=(openclaw "$action" --input "$input" --project-id "$project_id" --project-dir "$dir")
+  [ -z "$scope" ] || args+=(--scope "$scope")
+  [ -z "$principal" ] || args+=(--principal "$principal")
+  [ -z "$output" ] || args+=(--output "$output")
+  replication_helper "${args[@]}"
+}
+
 cmd_adapters() {
-  local action="$1" project_id="$2"; shift 2 || true
+  if [ "${1:-}" = openclaw ]; then
+    shift
+    cmd_adapters_openclaw "$@"
+    return
+  fi
+  local action="${1:-}" project_id="${2:-}"; shift 2 || true
   [ "$action" = "build" ] || die 64 "adapters requires build"
   local agent="all" dir name=generic file
   [ "${1:-}" = "--agent" ] && agent="${2:-all}"
@@ -5551,8 +6211,41 @@ EOF
   printf 'adapters=ok project_id=%s agent=%s\n' "$project_id" "$agent"
 }
 
+cmd_export_replication() {
+  local project_id="${1:-}" scope=project principal="" review="" output="" dir
+  [ -n "$project_id" ] || die 64 "export replication requires PROJECT_ID"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --review) review="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      *) die 64 "unknown replication export option: $1" ;;
+    esac
+  done
+  validate_id "$project_id" || die 64 "invalid project id: $project_id"
+  case "$scope" in project|principal) ;; *) die 64 "invalid replication scope: $scope" ;; esac
+  if [ "$scope" = principal ]; then
+    [ -n "$principal" ] && [ -n "$review" ] || die 64 "principal replication requires --principal ID and --review REF"
+  fi
+  require_project "$project_id" dir
+  local args=(export --project-dir "$dir" --project-id "$project_id" --scope "$scope")
+  [ -z "$principal" ] || args+=(--principal "$principal")
+  [ -z "$review" ] || args+=(--review "$review")
+  [ -z "$output" ] || args+=(--output "$output")
+  replication_helper "${args[@]}"
+}
+
 cmd_export() {
-  local kind="$1" project_id="$2" dir out stage
+  local kind="${1:-}"
+  if [ "$kind" = replication ]; then
+    shift
+    cmd_export_replication "$@"
+    return
+  fi
+  local project_id="${2:-}" dir out stage
+  [ -n "$kind" ] || die 64 "export requires kind"
   require_project "$project_id" dir
   okf validate-bundle "$dir/okf" >/dev/null || die 65 "export refused non-conformant OKF bundle"
   case "$kind" in
@@ -5601,8 +6294,43 @@ cmd_export() {
   esac
 }
 
+cmd_import_replication() {
+  local file="${1:-}" mode="" project_id="${PROJECT_OVERRIDE:-}" output="" dir
+  [ -n "$file" ] || die 64 "import replication requires FILE"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) [ -z "$mode" ] || die 64 "import replication accepts one mode"; mode=dry-run; shift ;;
+      --stage) [ -z "$mode" ] || die 64 "import replication accepts one mode"; mode=stage; shift ;;
+      --project-id) project_id="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      *) die 64 "unknown replication import option: $1" ;;
+    esac
+  done
+  [ -n "$mode" ] || die 64 "import replication requires --dry-run or --stage"
+  [ -z "$project_id" ] || validate_id "$project_id" || die 64 "invalid project id: $project_id"
+  if [ "$mode" = stage ] && [ -z "$project_id" ]; then
+    die 64 "import replication stage requires --project-id for canonical protection"
+  fi
+  if [ "$mode" = stage ] && [ -n "$project_id" ]; then
+    require_project "$project_id" dir
+  fi
+  local args=(import --archive "$file" "--$mode")
+  if [ -n "$project_id" ]; then
+    args+=(--project-id "$project_id" --project-dir "$dir")
+  fi
+  [ -z "$output" ] || args+=(--output "$output")
+  replication_helper "${args[@]}"
+}
+
 cmd_import() {
-  local kind="$1" file="$2" mode="$3" project_id="${PROJECT_OVERRIDE:-}"
+  local kind="${1:-}"
+  if [ "$kind" = replication ]; then
+    shift
+    cmd_import_replication "$@"
+    return
+  fi
+  local file="${2:-}" mode="${3:-}" project_id="${PROJECT_OVERRIDE:-}"
   [ "$kind" = "bundle" ] || die 64 "import requires bundle"
   [ -f "$file" ] || die 66 "bundle missing: $file"
   case "$mode" in --dry-run|--apply) ;; *) die 64 "import requires --dry-run or --apply" ;; esac

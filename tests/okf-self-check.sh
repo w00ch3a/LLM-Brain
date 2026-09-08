@@ -8,7 +8,7 @@ fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
 fail() { printf 'okf self-check: %s\n' "$*" >&2; exit 1; }
-contains() { printf '%s' "$1" | grep -Fq "$2" || fail "expected: $2"; }
+contains() { grep -Fq -- "$2" <<<"$1" || fail "expected: $2"; }
 tree_hash() {
   local root="$1"
   (

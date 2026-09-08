@@ -1,5 +1,12 @@
 # Changelog
 
+# 0.6.3 - 2026-09-07
+
+- Prepared the candidate release with version-controlled package metadata and
+  release checks that derive the moving release path from `VERSION`.
+- Preserved the filesystem-first, schema-3, Hermes-compatible lifecycle and
+  migration-free upgrade boundaries.
+
 # 0.6.2 - 2026-09-06
 
 ## Research-driven lifecycle safety
