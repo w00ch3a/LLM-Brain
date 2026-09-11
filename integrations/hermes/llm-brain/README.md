@@ -2,6 +2,8 @@
 
 This standalone plugin connects Hermes Agent to a local LLM-Brain vault. Hermes receives automatic project recall and durable turn capture while Markdown remains the source of truth.
 
+The current local candidate uses OKF v0.2 canonical records in storage schema 3. Hermes defaults remain unchanged: factual prefetch through the MemoryProvider and the native `compressor`; current-state and evidence retrieval are explicit caller choices.
+
 ## Components
 
 ### `LLMBrainMemoryProvider`
@@ -93,3 +95,5 @@ When a caller requests `intent: evidence`, the bridge includes bounded lifecycle
 ## Runtime footprint
 
 The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service or Python dependency.
+
+Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. LLM-Brain is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.

@@ -1068,15 +1068,19 @@ def trace_row(
     visibility_leakage = bool(path_set.intersection(query.visibility_forbidden_paths))
     repair_ok: bool | None = None
     if query.require_repair:
-        repair_targets = set(query.poisoned_paths or query.forbidden_paths)
-        repair_ok = any(
+        # A repair assertion must name the records actually repaired.  Do not
+        # infer targets from arbitrary forbidden retrieval paths: those may be
+        # unrelated negatives and would make poisoning results look stronger.
+        repair_targets = set(query.poisoned_paths)
+        matching_repairs = [
             item.get("action_performed")
             and item.get("authority_preserved")
             and item.get("unrelated_preserved")
             and item.get("source_custody_preserved")
             and (not repair_targets or item.get("target") in repair_targets)
             for item in runtime.repair_results
-        )
+        ]
+        repair_ok = bool(matching_repairs) and all(matching_repairs)
     capsule_ok: bool | None = None
     if query.require_capsule_validation:
         capsule_ok = runtime.capsule_validated
@@ -1422,6 +1426,21 @@ def summary(rows: list[dict[str, Any]], repeats: int) -> dict[str, Any]:
     for elapsed in scenario_operation_elapsed.values():
         for operation, duration in elapsed.items():
             operation_elapsed_ms[operation] = round(operation_elapsed_ms.get(operation, 0.0) + duration, 3)
+    # Disposable v0.7 labels.  These are deliberately descriptive rows rather
+    # than new lifecycle primitives; external KV/session state is out of scope.
+    experiments = [
+        {"label": "indirect_association", "benchmark": "Keep It InMind", "status": "unmeasured", "metric": "unmeasured", "scope": "external_kv_session_state"},
+        {"label": "eviction_restore_counterfactual", "benchmark": "What Eviction Destroys", "status": "unmeasured", "metric": "unmeasured", "scope": "external_kv_session_state"},
+        {"label": "execution_state_forgetting", "benchmark": "Forgetting Without Restarting", "status": "unmeasured", "metric": "unmeasured", "scope": "external_kv_session_state"},
+    ]
+    repair_rows = [row for row in rows if row.get("repair_ok") is not None]
+    repair_experiment = {
+        "raw_source_vs_derived_only": "measured_by_repair_isolation",
+        "source_hashes_preserved": bool(repair_rows) and all(row.get("repair_ok") for row in repair_rows),
+        "unrelated_records_preserved": bool(repair_rows) and all(row.get("poisoning_safe") for row in repair_rows),
+        "rows": len(repair_rows),
+    }
+    portability = {"status": "unsupported", "metric": "unmeasured", "reason": "external KV and session-state portability is outside this repository-only harness", "matrix": []}
     return {
         "repeats": repeats,
         "repetition_semantics": "deterministic retrieval repetition; not model pass^5",
@@ -1435,7 +1454,45 @@ def summary(rows: list[dict[str, Any]], repeats: int) -> dict[str, Any]:
         "checkpoint_rows": sum(1 for row in rows if row.get("checkpoint_evaluated")),
         "horizon_endpoint_rows": sum(1 for row in rows if row.get("horizon_endpoint")),
         "model_accuracy_note": "host-scored answer text only; runner outcome is not accuracy",
+        "experiments": experiments,
+        "repair_experiment": repair_experiment,
+        "portability": portability,
     }
+
+
+def read_portability_matrix(path: Path) -> list[dict[str, str]]:
+    if not path.is_file() or path.is_symlink():
+        raise EvaluationError(f"portability matrix is not a regular file: {path}")
+    with path.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream, delimiter="\t"))
+    required = {"writer_identity", "writer_cli", "reader_identity", "reader_cli", "direction"}
+    if not rows or set(rows[0]) != required:
+        raise EvaluationError("portability matrix must contain exactly the required TSV columns")
+    for row in rows:
+        for key in required:
+            row[key] = single_line(row.get(key, ""), f"portability {key}", 512)
+        if row["direction"] not in {"forward", "reverse", "none"}:
+            raise EvaluationError("portability direction must be none, forward or reverse")
+    return rows
+
+
+def portability_results(matrix: list[dict[str, str]], families: list[Family], repo_root: Path, output_dir: Path, seed: int) -> list[dict[str, Any]]:
+    results = []
+    for item in matrix:
+        writer, reader = Path(item["writer_cli"]).expanduser().resolve(), Path(item["reader_cli"]).expanduser().resolve()
+        base = {"writer_identity": item["writer_identity"], "reader_identity": item["reader_identity"], "direction": item["direction"], "writer_cli_sha256": "unmeasured", "reader_cli_sha256": "unmeasured"}
+        if not (writer.is_file() and os.access(writer, os.X_OK) and reader.is_file() and os.access(reader, os.X_OK)):
+            results.append(dict(base, status="unmeasured", metric="unmeasured", reason="local CLI missing or not executable")); continue
+        base.update(writer_cli_sha256=digest_file(writer), reader_cli_sha256=digest_file(reader))
+        with tempfile.TemporaryDirectory(prefix="llm-brain-portability-") as temp:
+            a = run_scenario(writer, repo_root, families[0], families[0].horizons[0], 1, "portability-writer", "writer", None, Path(temp), seed)
+            b = run_scenario(reader, repo_root, families[0], families[0].horizons[0], 1, "portability-reader", "reader", None, Path(temp), seed)
+        amap = {(r["mode"], r["query_id"]): set(r["candidate_paths"]) for r in a}
+        bmap = {(r["mode"], r["query_id"]): set(r["candidate_paths"]) for r in b}
+        agreements = sum(amap.get(k) == v for k, v in amap.items() if k in bmap)
+        total = sum(k in bmap for k in amap)
+        results.append(dict(base, status="measured", agreement_rate=(agreements / total if total else 0.0), candidate_set_deltas=sum(amap.get(k, set()) != bmap.get(k, set()) for k in set(amap) | set(bmap))))
+    return results
 
 
 def write_trace(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1523,6 +1580,8 @@ def write_report(
         f"- Build status: `{identity['build_status']}`",
         f"- Warm/cold state: `{identity['warm_cold']}`",
         f"- Availability: `{identity['availability']}`; degraded path: `{identity['degraded_path']}`",
+        f"- Portability: writer `{identity['writer_identity']}` → reader `{identity['reader_identity']}`; direction `{identity['migration_direction']}`",
+        f"- Portability hashes: source `{identity['source_hash']}`, index `{identity['index_hash']}`, runner `{identity['runner_hash']}`",
         f"- Evaluation budget: `{identity['budget_tokens']}` tokens",
         f"- Run identity: `{identity['identity_hash']}`",
         "",
@@ -1547,6 +1606,7 @@ def write_report(
             "- `run.json` binds case, CLI, script, answer-runner and seed hashes.",
             "- `trace.jsonl` is the complete machine-readable trace; `trace.tsv` is its tabular view.",
             "- `summary.json` contains retrieval, unresolved-state, cost and repeat reliability metrics.",
+            "- `summary.json` also contains disposable v0.7 experiment labels and raw-source repair preservation checks; external KV/session-state portability is explicitly unsupported.",
             "- `answer-requests/` contains only question/evidence requests when an answer runner is configured.",
         ]
     )
@@ -1569,6 +1629,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warm-cold", choices=("warm", "cold", "unknown"), default="unknown")
     parser.add_argument("--availability", choices=("available", "unavailable", "degraded"), default="available")
     parser.add_argument("--degraded-path", default="none")
+    parser.add_argument("--writer-identity", default="llm-brain-evaluator")
+    parser.add_argument("--reader-identity", default="llm-brain-evaluator")
+    parser.add_argument("--migration-direction", choices=("none", "forward", "reverse"), default="none")
+    parser.add_argument("--portability-matrix", help="optional TSV of local writer/reader CLI pairs")
     args = parser.parse_args(argv)
     if args.seed < 0 or args.repeats < 1 or args.repeats > 50:
         parser.error("--seed must be non-negative and --repeats must be between 1 and 50")
@@ -1589,7 +1653,10 @@ def main(argv: list[str] | None = None) -> int:
         model = single_line(args.model, "--model", 256)
         dimensions = single_line(args.dimensions, "--dimensions", 128)
         degraded_path = single_line(args.degraded_path, "--degraded-path", 256)
+        writer_identity = single_line(args.writer_identity, "--writer-identity", 256)
+        reader_identity = single_line(args.reader_identity, "--reader-identity", 256)
         families, payload = parse_cases(read_json(cases_path))
+        portability_matrix = read_portability_matrix(Path(args.portability_matrix).expanduser().resolve()) if args.portability_matrix else []
         script_hash = digest_file(Path(__file__))
         cli_hash = digest_file(cli)
         cases_hash = digest_file(cases_path)
@@ -1616,6 +1683,16 @@ def main(argv: list[str] | None = None) -> int:
             "warm_cold": args.warm_cold,
             "availability": args.availability,
             "degraded_path": degraded_path,
+            "writer_identity": writer_identity,
+            "reader_identity": reader_identity,
+            "migration_direction": args.migration_direction,
+            # Explicitly named portability inputs; the evaluator never trusts
+            # these as semantic compatibility proof.
+            "source_hash": cases_hash,
+            # The index is rebuilt inside each disposable scenario, so there
+            # is no single pre-run index hash to claim here.
+            "index_hash": "unmeasured_disposable_index",
+            "runner_hash": answer_hash,
             "budget_tokens": EVALUATION_BUDGET_TOKENS,
             "configuration": {
                 "seed": args.seed,
@@ -1658,6 +1735,12 @@ def main(argv: list[str] | None = None) -> int:
             "warm_cold": args.warm_cold,
             "availability": args.availability,
             "degraded_path": degraded_path,
+            "writer_identity": writer_identity,
+            "reader_identity": reader_identity,
+            "migration_direction": args.migration_direction,
+            "source_hash": cases_hash,
+            "index_hash": "unmeasured_disposable_index",
+            "runner_hash": answer_hash,
             "budget_tokens": EVALUATION_BUDGET_TOKENS,
             "configuration": {
                 "seed": args.seed,
@@ -1668,6 +1751,14 @@ def main(argv: list[str] | None = None) -> int:
         for row in rows:
             row.update(trace_metadata)
         metrics = summary(rows, args.repeats)
+        if portability_matrix:
+            matrix_results = portability_results(portability_matrix, families, repo_root, output_dir, args.seed)
+            metrics["portability"] = {
+                "status": "measured" if all(row["status"] == "measured" for row in matrix_results) else "unmeasured",
+                "metric": "local_cli_candidate_agreement",
+                "scope": "local_cli_only",
+                "matrix": matrix_results,
+            }
         write_trace(output_dir / "trace.jsonl", rows)
         write_tsv(output_dir / "trace.tsv", rows)
         write_json(output_dir / "summary.json", {"run_id": run_id, "evaluation_metadata": trace_metadata, **metrics})

@@ -7,6 +7,10 @@ description: Automatically use filesystem-first LLM-Brain memory before and afte
 
 LLM-Brain is durable, inspectable project memory. It is not a prompt, a chat transcript, or a prettier wiki.
 
+The shipped package uses canonical OKF v0.2 in storage schema 3. `search
+--receipt` is opt-in; forgetting requires `retract --preview` followed by the
+returned token with `retract --confirm TOKEN`, leaving source custody intact.
+
 Its normal lifecycle is:
 
 `capture → local provider reflection → deterministic policy → safe automatic promotion → indexed retrieval → scoped pack`

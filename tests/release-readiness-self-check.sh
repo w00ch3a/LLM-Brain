@@ -76,6 +76,7 @@ core_checks() {
     bash "$repo_root/tests/procedure-run-self-check.sh" -- \
     bash "$repo_root/tests/reconsolidation-self-check.sh" -- \
     bash "$repo_root/tests/scope-feedback-self-check.sh" -- \
+    bash "$repo_root/tests/v07-regression-self-check.sh" -- \
     bash "$repo_root/tests/experimental-gates-self-check.sh" -- \
     bash "$repo_root/tests/research-upgrades-self-check.sh" -- \
     bash "$repo_root/tests/lifecycle-eval-self-check.sh" -- \

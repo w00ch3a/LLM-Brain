@@ -5,6 +5,12 @@ description: Retrieve approved filesystem-first LLM-Brain context before non-tri
 
 # LLM-Brain
 
+Canonical knowledge is OKF v0.2 with storage schema 3. Receipts are opt-in
+(`search --receipt`); retraction is preview-then-confirm (`retract
+--preview`, then `retract --confirm TOKEN`) and leaves historical custody
+inspectable. Experimental and portability claims remain evaluation evidence
+unless separately verified.
+
 For ordinary non-trivial project work:
 
 1. Resolve the project from the configured registry, current Git root, origin, and physical path.

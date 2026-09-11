@@ -80,16 +80,16 @@ Commands:
   reflect list|prepare|submit|run PROJECT_ID [ARGS]
   review list|show|decide PROJECT_ID [ARGS]
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
-  retract PROJECT_ID CANONICAL_ID --reason TEXT
+  retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt]
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
-  bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory]
+  bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory] [--receipt]
   bridge capture --source-root PATH [--project-id ID] --record FILE
   run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--principal ID] [--obligation TEXT] [--capsule REF]
   run prepare PROJECT_ID PROCEDURE_REF --task TEXT [--principal ID] [--binding KEY=VALUE] [--verification TEXT] [--depends-on REF]
@@ -209,6 +209,42 @@ bridge_python() {
   else
     command -v python3 || true
   fi
+}
+
+# Opt-in, derived retrieval audit trail. JSONL is intentionally outside the vault
+# schema/canonical tree and only written when a caller supplies a destination.
+retrieval_receipt() {
+  local file="$1" kind="$2" project="$3" query="$4" metadata="${5:-}" selected="${6:-}" extra="${7:-}" py
+  [ -n "$file" ] || return 0
+  py="$(bridge_python)"; [ -n "$py" ] || return 69
+  ensure_dir "$(dirname "$file")" || return 69
+  "$py" - "$file" "$kind" "$project" "$query" "$metadata" "$selected" "$extra" <<'PY'
+import json, sys, fcntl
+from datetime import datetime, timezone
+path, kind, project, query, metadata, selected, extra = sys.argv[1:]
+values = {}
+if metadata:
+    for line in open(metadata, encoding='utf-8', errors='replace'):
+        if '=' in line:
+            key, value = line.rstrip('\n').split('=', 1); values[key] = value
+query_hash = __import__('hashlib').sha256(query.encode()).hexdigest()
+receipt_id = __import__('hashlib').sha256((kind+'|'+project+'|'+query_hash+'|'+selected).encode()).hexdigest()[:24]
+try:
+    for line in open(path, encoding='utf-8'):
+        if json.loads(line).get('receipt_id') == receipt_id: raise SystemExit(0)
+except FileNotFoundError: pass
+record = {'schema': 'llm-brain.retrieval-receipt.v1', 'receipt_id': receipt_id, 'recorded_at': datetime.now(timezone.utc).isoformat(), 'surface': kind, 'project_id': project, 'query_sha256': query_hash, 'selected': [x for x in selected.split('\n') if x]}
+record.update({k: values[k] for k in ('retrieval_mode','degraded','intent','principal','evidence_refs','context_truncated','context_rendered_count','evidence_opened','evidence_incomplete') if k in values})
+if extra:
+    try: record.update(json.loads(extra))
+    except Exception: record['extra'] = extra
+with open(path, 'a+', encoding='utf-8') as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    stream.seek(0)
+    if any(json.loads(line).get('receipt_id') == receipt_id for line in stream): raise SystemExit(0)
+    stream.seek(0, 2)
+    stream.write(json.dumps(record, sort_keys=True) + '\n')
+PY
 }
 
 # Replication/OpenClaw validation is deliberately kept in a standard-library
@@ -1196,6 +1232,17 @@ bridge_render_context() {
     END { if (!replaced) print "evidence_refs=" refs }
   ' "$metadata" >"${metadata}.visible.$$"
   mv -f "${metadata}.visible.$$" "$metadata"
+  if [ "$evidence_refs" != "" ] && [ "$evidence_refs" != "none" ]; then
+    if [ "$visible_evidence_refs" = "none" ]; then
+      printf 'evidence_opened=false\nevidence_incomplete=true\n' >>"$metadata"
+    elif [ "$visible_evidence_refs" != "$evidence_refs" ]; then
+      printf 'evidence_opened=true\nevidence_incomplete=true\n' >>"$metadata"
+    else
+      printf 'evidence_opened=true\nevidence_incomplete=false\n' >>"$metadata"
+    fi
+  else
+    printf 'evidence_opened=false\nevidence_incomplete=%s\n' "$([ "$intent" = evidence ] && printf true || printf false)" >>"$metadata"
+  fi
   if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "$results" 2>/dev/null; then
     : >"$output"
     printf 'context_limit_bytes=%s\ncontext_bytes=0\ncontext_truncated=false\ncontext_selected_count=0\ncontext_rendered_count=0\n' "$max_bytes" >>"$metadata"
@@ -2958,7 +3005,7 @@ cmd_work() {
 }
 
 cmd_bridge() {
-  local action="${1:-}" source_root="" project_id="" query_file="" principal="" intent="factual" budget=4000 require_evidence=0 exploratory=0 dir id tmp metadata results context query requested_strategy="hybrid" actual_strategy degraded capture_status=0 record="" record_dir="" result_file request_id="" evidence_results evidence_metadata evidence_mode evidence_degraded evidence_resolution source_hash combined_results evidence_rows
+  local action="${1:-}" source_root="" project_id="" query_file="" principal="" intent="factual" budget=4000 require_evidence=0 exploratory=0 receipt_file="" dir id tmp metadata results context query requested_strategy="hybrid" actual_strategy degraded capture_status=0 record="" record_dir="" result_file request_id="" evidence_results evidence_metadata evidence_mode evidence_degraded evidence_resolution source_hash combined_results evidence_rows
   shift || true
   case "$action" in
     recall)
@@ -2973,6 +3020,7 @@ cmd_bridge() {
           --budget-tokens) budget="${2:-}"; shift 2 ;;
           --require-evidence) require_evidence=1; shift ;;
           --exploratory) exploratory=1; shift ;;
+          --receipt) receipt_file="__CANONICAL__"; shift ;;
           *) die 64 "unknown bridge recall option: $1" ;;
         esac
       done
@@ -2989,6 +3037,7 @@ cmd_bridge() {
       [ "$(printf '%s' "$query" | wc -c | tr -d ' ')" -le 65536 ] || die 65 "bridge query exceeds 64 KiB"
       id="$(bridge_resolve_project "$source_root" "$project_id")"
       require_project "$id" dir
+  [ "$receipt_file" = __CANONICAL__ ] && receipt_file="$dir/audit/retrieval-receipts.jsonl"
       if [ -s "$dir/indexes/evidence-pending.txt" ]; then
         local pending_hash pending_stage batch_manifest source view view_hash vector claims
         pending_stage="$(mktemp "$dir/indexes/.evidence-pending.XXXXXX")"
@@ -3075,6 +3124,7 @@ cmd_bridge() {
         [ -z "$evidence_resolution" ] || :
       fi
       bridge_render_context "$id" "$results" "$metadata" "$budget" "$context"
+      retrieval_receipt "$receipt_file" bridge-recall "$id" "$query" "$metadata" "$(tail -n +2 "$results" | cut -f1)" || say_error "retrieval receipt unavailable"
       actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
       degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
       bridge_json_output recall "$id" "$metadata" "$context" "$results" "$requested_strategy" "$actual_strategy" "$degraded" "$dir" "" "$budget"
@@ -4239,13 +4289,51 @@ cmd_validate_source() {
 
 cmd_retract() {
   local project_id="$1" canonical_id="$2"; shift 2 || true
-  local reason=""
-  [ "${1:-}" = "--reason" ] && reason="${2:-}"
+  local reason="" mode=legacy token="" supplied_token="" principal="" dir file canonical canonical_hash scope dependants visible_dependants hidden_dependants affected residual
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) reason="${2:-}"; shift 2 ;;
+      --preview) mode=preview; shift ;;
+      --confirm) mode=confirm; supplied_token="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      *) die 64 "unknown retract option: $1" ;;
+    esac
+  done
   [ -n "$reason" ] || die 64 "retract requires --reason TEXT"
   validate_id "$canonical_id" || die 64 "invalid canonical id"
-  local dir file
   require_project "$project_id" dir
   file="$dir/okf/retractions/$canonical_id.md"
+  if [ "$mode" != legacy ]; then
+    canonical=""
+    for candidate in "$dir"/okf/claims/"$canonical_id".md "$dir"/okf/procedures/"$canonical_id".md "$dir"/okf/references/"$canonical_id".md "$dir"/okf/topics/"$canonical_id".md; do
+      [ -f "$candidate" ] || continue
+      [ -z "$canonical" ] || die 65 "canonical id is ambiguous: $canonical_id"
+      canonical="$candidate"
+    done
+    [ -n "$canonical" ] || die 66 "canonical item missing: $canonical_id"
+    canonical_hash="$(sha256_file "$canonical")"
+    dependants="$(find "$dir/okf" "$dir/projections" "$dir/context-packs" -type f -name '*.md' -not -path '*/retractions/*' -exec grep -l "$canonical_id" {} + 2>/dev/null | LC_ALL=C sort -u || true)"
+    visible_dependants=""; hidden_dependants=0
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      if principal_visible "$candidate" "$principal"; then visible_dependants="${visible_dependants}${visible_dependants:+$'\n'}${candidate#"$dir"/}"; else hidden_dependants=$((hidden_dependants + 1)); fi
+    done <<EOF
+$dependants
+EOF
+    scope="project=$project_id canonical=$canonical_id hash=$canonical_hash principal=$principal reason=$reason dependants=$dependants"
+    token="$(sha256_text "$scope")"
+  fi
+  if [ "$mode" = preview ]; then
+    printf 'retraction_preview=ok project_id=%s canonical_id=%s canonical_hash=%s principal=%s token=%s\n' "$project_id" "$canonical_id" "$canonical_hash" "${principal:-shared}" "$token"
+    if [ "$hidden_dependants" -gt 0 ]; then printf 'dependants=%s inaccessible=unknown\n' "${visible_dependants:-none}"; else printf 'dependants=%s\n' "${visible_dependants:-none}"; fi
+    printf 'derived=known indexes, projections, context-packs; residual=bounded exact-scope cleanup on confirmation; inaccessible_scope=%s; raw_custody=preserved provenance=preserved\n' "$([ "$hidden_dependants" -gt 0 ] && printf unknown || printf none)"
+    return 0
+  fi
+  if [ "$mode" = confirm ]; then
+    [ -n "$supplied_token" ] || die 64 "retract confirmation requires TOKEN"
+    [ "$supplied_token" = "$token" ] || die 65 "retract confirmation token is stale or invalid"
+    [ ! -f "$file" ] || die 65 "retract confirmation token has already been used"
+  fi
   acquire_lock "project-$project_id"
   cat >"${file}.tmp.$$" <<EOF
 ---
@@ -4263,8 +4351,24 @@ $reason
 EOF
   mv "${file}.tmp.$$" "$file"
   audit_v2 "$dir" "retract" "$canonical_id" "approved" "superseded" "$(sha256_file "$file")" "reason=$(slug "$reason")"
+  if [ "$mode" = confirm ]; then
+    # Invalidate only artefacts that explicitly contain this canonical id or hash.
+    affected=""
+    find "$dir/indexes" "$dir/projections" "$dir/context-packs" -type f \( -name '*.tsv' -o -name '*.txt' -o -name '*.md' -o -name '*.json' \) -not -path '*/retractions/*' 2>/dev/null | while IFS= read -r derived; do
+      grep -q -e "$canonical_id" -e "$canonical_hash" "$derived" 2>/dev/null || continue
+      [ -z "$principal" ] || principal_visible "$derived" "$principal" || continue
+      printf '%s\n' "${derived#"$dir"/}" >>"${file}.affected.$$"
+      case "$derived" in
+        *.md) case "$derived" in *"$canonical_id"*) rm -f "$derived" ;; esac ;;
+        *) tmp="${derived}.tmp.$$"; grep -v -e "$canonical_id" -e "$canonical_hash" "$derived" >"$tmp" && mv "$tmp" "$derived" || rm -f "$tmp" ;;
+      esac
+    done
+    affected="$(sort -u "${file}.affected.$$" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"; rm -f "${file}.affected.$$"
+    residual="$(find "$dir/indexes" "$dir/projections" "$dir/context-packs" -type f -not -path '*/retractions/*' -exec grep -l -e "$canonical_id" -e "$canonical_hash" {} + 2>/dev/null | while IFS= read -r derived; do [ -z "$principal" ] || principal_visible "$derived" "$principal" || continue; printf '%s\n' "$derived"; done | sed "s#^$dir/##" | tr '\n' ',' | sed 's/,$//' || true)"
+    printf 'retraction_apply=ok project_id=%s canonical_id=%s token=%s affected=%s residual=%s residual_reason=%s raw_custody=preserved provenance=preserved\n' "$project_id" "$canonical_id" "$supplied_token" "${affected:-none}" "${residual:-none}" "${residual:+exact-scope artefact remained}${residual:-none}"
+  fi
   release_lock
-  printf 'retraction=ok project_id=%s canonical_id=%s\n' "$project_id" "$canonical_id"
+  [ "$mode" = confirm ] || printf 'retraction=ok project_id=%s canonical_id=%s\n' "$project_id" "$canonical_id"
 }
 
 canonical_file_effective() {
@@ -5556,7 +5660,7 @@ resolve_graph_target() {
 
 cmd_search() {
   local project_id="$1" query="$2"; shift 2 || true
-  local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
+  local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -5578,6 +5682,7 @@ cmd_search() {
       --include-proposed) include_proposed=1; shift ;;
       --include-cold) include_cold=1; shift ;;
       --metadata-file) metadata_file="${2:-}"; shift 2 ;;
+      --receipt) receipt_file="__CANONICAL__"; shift ;;
       *) die 64 "unknown search option: $1" ;;
     esac
   done
@@ -5598,6 +5703,7 @@ cmd_search() {
   case "$strategy" in lexical|vector|hybrid) ;; *) die 64 "search strategy must be lexical, vector, or hybrid" ;; esac
   require_positive_integer "$limit" || die 64 "--limit must be a positive integer"
   require_project "$project_id" dir
+  [ "$receipt_file" = __CANONICAL__ ] && receipt_file="$dir/audit/retrieval-receipts.jsonl"
   index_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
   rebuild_state_file="$(index_rebuild_state_path "$dir")"
   if [ "$require_evidence" = 1 ] && [ "$exploratory" = 0 ] && [ "$include_proposed" = 0 ] && ! find "$dir/okf/claims" "$dir/okf/computations" "$dir/okf/procedures" "$dir/okf/references" "$dir/okf/topics" -type f -name '*.md' -print -quit 2>/dev/null | grep -q .; then
@@ -5810,6 +5916,7 @@ cmd_search() {
   if [ -n "$metadata_file" ]; then
     printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" >"$metadata_file"
   fi
+  retrieval_receipt "$receipt_file" search "$project_id" "$query" "$metadata_file" "$(cat "$selected_paths" 2>/dev/null || true)" || say_error "retrieval receipt unavailable"
   rm -rf "$tmp_dir"
   SEARCH_SUPERSESSION_MAP=""
   SEARCH_GRAPH_FILE=""
@@ -6014,7 +6121,7 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 dir results metadata warnings selected evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 lifecycle_bundle_resolution="disabled" lifecycle_bundle_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots lifecycle_bundle lifecycle_warnings
+  local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 receipt_file="" dir results metadata warnings selected evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 lifecycle_bundle_resolution="disabled" lifecycle_bundle_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots lifecycle_bundle lifecycle_warnings
   while [ $# -gt 0 ]; do
     case "$1" in
       --task) task="${2:-}"; shift 2 ;;
@@ -6032,6 +6139,7 @@ cmd_pack() {
       --exploratory) exploratory=1; shift ;;
       --include-proposed) include_proposed=1; shift ;;
       --include-cold) include_cold=1; shift ;;
+      --receipt) receipt_file="__CANONICAL__"; shift ;;
       *) die 64 "unknown pack option: $1" ;;
     esac
   done
@@ -6048,6 +6156,7 @@ cmd_pack() {
   case "$budget" in ''|*[!0-9]*) die 64 "--budget-tokens must be a non-negative integer" ;; esac
   [ "$budget" -gt 0 ] || die 64 "--budget-tokens must be positive"
   require_project "$project_id" dir
+  [ "$receipt_file" = __CANONICAL__ ] && receipt_file="$dir/audit/retrieval-receipts.jsonl"
   results="$(mktemp "$dir/context-packs/.search.XXXXXX")"
   metadata="$(mktemp "$dir/context-packs/.metadata.XXXXXX")"
   warnings="$(mktemp "$dir/context-packs/.warnings.XXXXXX")"
@@ -6143,6 +6252,7 @@ cmd_pack() {
   mv "${pack}.tmp.$$" "$pack"
   audit_v2 "$dir" "pack-build" "$(basename "$pack")" "" "built" "$(sha256_file "$pack")" "bytes=$bytes"
   release_lock
+  retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
   rm -f "$results" "$metadata" "$warnings"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }

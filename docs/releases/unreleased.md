@@ -1,6 +1,7 @@
 # Development / unreleased
 
-This note records the current development scope only. It is not a release
+This note records the current development scope after the v0.7.0 local
+candidate. It is not a release
 announcement, installation proof, deployment statement or live-vault migration
 record. `VERSION` remains the package-version authority.
 
@@ -44,6 +45,13 @@ The existing schema-3 OKF format, factual retrieval default, current-state
 opt-in behaviour, shadow commitment policy, Hermes provider/ContextEngine
 contract and fail-open boundaries remain unchanged. No migration, external
 action, automatic capsule execution or implicit lifecycle injection is implied.
+
+Receipts are opt-in derived records (`search --receipt`); forgetting remains a
+preview/confirm operation (`retract --preview`, then `retract --confirm TOKEN`)
+that records a tombstone without deleting custody. Portability, repair and
+research scenarios in the lifecycle evaluator are evaluation evidence only;
+without an answer runner, model-answer accuracy is unmeasured. This is not a
+published v0.7.0 release.
 
 See [the lifecycle evaluation guide](../evaluation.md) for the case schema,
 runner contract, output files and acceptance boundary.

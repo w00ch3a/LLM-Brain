@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Development continues after the v0.7.0 local candidate; no published
+  release or live-vault mutation is implied.
+- Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
+- Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
+- Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
+
+# 0.7.0 - local candidate
+
+- Added migration-free release documentation for opt-in receipts and
+  preview/confirm tombstone retraction interfaces.
+- Documented portability and evaluation limits, including unmeasured
+  model-answer accuracy without a trusted local answer runner.
+- Preserved Hermes defaults and fail-open boundaries; no published release is
+  claimed.
+
 # 0.6.3 - 2026-09-07
 
 - Prepared the candidate release with version-controlled package metadata and

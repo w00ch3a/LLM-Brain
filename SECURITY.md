@@ -15,3 +15,7 @@ Do not file public issues containing credentials, customer data, patient data, p
 - Canonical memory is human-readable but private; use a root with appropriate access controls. The CLI starts with `umask 077`.
 
 No warranty of secret detection is implied. Review source scope before ingesting production, customer, patient, payment or credential material.
+
+## Licence and responsibility
+
+LLM-Brain is provided under the Apache License 2.0, subject to that licence's disclaimers and applicable-law limits. Users remain responsible for access controls, source selection, validation, migration and deployment. No security policy, test or evaluation guarantees that all secrets, attacks or unsafe content will be detected.

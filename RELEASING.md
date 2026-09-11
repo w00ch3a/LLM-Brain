@@ -2,6 +2,15 @@
 
 `VERSION` is the only package-version authority. Storage schema and OKF version are independent.
 
+The current storage schema is 3 and canonical knowledge is OKF v0.2. Receipts
+are opt-in; verify retraction as a preview/confirm operation without mutating a
+live vault. Do not describe evaluation-only portability, repair or research
+results as production guarantees, or an unreleased change as published.
+
+LLM-Brain is distributed under Apache License 2.0, subject to its disclaimers
+and applicable-law limits. Users remain responsible for installation,
+validation and deployment; release checks are not guarantees.
+
 ## Local release gate
 
 ```bash

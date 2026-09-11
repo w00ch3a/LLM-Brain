@@ -1,6 +1,6 @@
 {
   "name": "llm-brain",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "Automatic filesystem-first durable memory using Google Open Knowledge Format v0.2.",
   "author": {
     "name": "LLM-Brain Maintainers",

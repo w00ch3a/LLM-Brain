@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/github/license/w00ch3a/LLM-Brain)](LICENSE)
 [![Storage](https://img.shields.io/badge/storage-Markdown-4B5563)](references/architecture.md)
 
-**Durable, inspectable memory for AI agents.**
+**Durable, inspectable, filesystem-first memory for AI agents.**
 
 LLM-Brain gives Codex, Claude Code, Gemini CLI, Hermes Agent and custom agents a shared project memory. It stores knowledge as Markdown, tracks the evidence behind each claim, and retrieves the right context before an agent starts work.
 
@@ -40,6 +40,39 @@ authoritative files
 ```
 
 Canonical knowledge follows [Google Open Knowledge Format v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md). Raw evidence, episodes, review decisions and audit records remain beside it, so an agent can cite where a memory came from and revise it without erasing history.
+
+The current local candidate is v0.7.0 and uses storage schema 3. `VERSION` is the package authority; OKF v0.2 is the canonical knowledge format. The vault is ordinary, portable Markdown and TSV, so it remains inspectable, copyable and repairable without a database or hosted service. This candidate is not a published release.
+
+### Shipped, experimental and deliberately out of scope
+
+| Label | Boundary |
+|---|---|
+| **Shipped** | Markdown custody, OKF v0.2/schema 3, provenance and independent-root accounting, opt-in current-state resolution, evidence bundles, procedure capsule validation, repairable background work, and Hermes recall/capture. |
+| **Experimental / opt-in** | Prediction-error reflection, procedure replay and commitment decisions. They are disabled by default and do not silently become canonical memory. |
+| **Non-goal** | A hosted memory service, database, autonomous truth engine, universal prompt-injection defence, automatic procedure execution, learned routing, latent/KV memory or a claim that evaluation proves production deployment. |
+
+### The lifecycle in one view
+
+```text
+capture → custody + episode → policy/review → canonical OKF
+                                      ↓
+                         lexical · vector · graph retrieval
+                                      ↓
+                     current/as-of/evidence-safe context pack → agent
+                                      ↓
+                         optional receipt or reviewed correction
+```
+
+### Feature grid
+
+| Concern | What is inspectable |
+|---|---|
+| Truth and time | Current-state is explicit; validity gaps, conflicts, retractions and dependencies remain warnings, not invented certainty. |
+| Provenance | Source hashes, lineage and independent roots distinguish corroboration from repeated copies. |
+| Forgetting | `retract --preview` shows the exact target and confirmation token; only `--confirm TOKEN` records a reversible tombstone. |
+| Usefulness | `--receipt` and `feedback record` are opt-in derived records; reading memory never writes a receipt by default. |
+| Portability and repair | Markdown/TSV custody, rebuildable indexes and staged migration/reconciliation keep recovery local and inspectable. |
+| Hermes | Native provider recall and durable capture share the same bridge; Hermes never writes canonical `okf/` directly or executes capsules. |
 
 ## Why agents use it
 
@@ -87,6 +120,25 @@ $brain project ensure /path/to/repository
 $brain search PROJECT_ID "current task" --require-evidence
 $brain pack build PROJECT_ID --task "current task" --budget-tokens 4000
 ```
+
+### A 60-second CLI tour
+
+```bash
+# inspect the host and vault (read-only)
+./bin/llm-brain detect
+./bin/llm-brain doctor --strict
+
+# register a repository, then retrieve evidence-backed context
+./bin/llm-brain project ensure /path/to/repository
+./bin/llm-brain search PROJECT_ID "release state" --intent current_state --require-evidence
+./bin/llm-brain pack build PROJECT_ID --task "release state" --intent evidence --budget-tokens 2000
+
+# preview a forgetting action; confirmation is deliberately separate
+./bin/llm-brain retract PROJECT_ID okf/claims/example.md --reason "obsolete" --preview
+./bin/llm-brain retract PROJECT_ID okf/claims/example.md --reason "obsolete" --confirm TOKEN
+```
+
+The final command is only an example: use the exact token and target returned by the preview. Retraction records a tombstone and audit event; it does not pretend that historical custody never existed.
 
 The project layout stays readable without LLM-Brain:
 
@@ -258,13 +310,17 @@ The repository-only lifecycle evaluator runs twelve ground-truth scenario famili
 
 Public archives exclude vault records, task captures, local usernames, home-directory paths, private network addresses and host identifiers. The packaging gate scans archive inputs for machine-specific data.
 
+## Licence and responsibility
+
+LLM-Brain is provided under the Apache License 2.0. The licence governs the grant of rights and its disclaimers and limitations; applicable law may limit how those terms operate. Use, configuration, validation, migration and deployment remain the user's responsibility. No documentation, test or evaluation result is a guarantee of correctness, availability, security, regulatory compliance or fitness for a particular purpose.
+
 ## Upgrade
 
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.6.3
-./bin/llm-brain upgrade apply --all --host auto --target 0.6.3 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target 0.7.0
+./bin/llm-brain upgrade apply --all --host auto --target 0.7.0 --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -277,4 +333,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.6.3 release notes](docs/releases/v0.6.3.md) for this migration-free candidate, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.7.0 release notes](docs/releases/v0.7.0.md) for this migration-free local candidate, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.

@@ -132,3 +132,21 @@ All records, traces, reports and runner artefacts are disposable derived data.
 Do not import them into canonical OKF memory, promote their text, or treat an
 answer runner as an authority source. The harness exercises only local CLI
 operations and does not execute external actions.
+
+## v0.7 evaluation extensions
+
+The evaluator accepts `--writer-identity`, `--reader-identity`, and
+`--migration-direction {none,forward,reverse}`. These are recorded with the
+case/source, index/CLI, and answer-runner hashes for bidirectional comparisons
+without changing OKF storage. The disposable index is rebuilt separately for
+each scenario, so `index_hash` is explicitly `unmeasured_disposable_index`,
+not a falsely reused CLI hash. Semantic scoring is disabled for incompatible
+model or embedding dimensions; typed degradation/fallback remains measured.
+The summary adds disposable, explicitly `unmeasured` rows for
+`indirect_association` (Keep It InMind), `eviction_restore_counterfactual`
+(What Eviction Destroys), and `execution_state_forgetting` (Forgetting Without
+Restarting). These labels do not claim support for external KV or session
+state. The optional `--portability-matrix` compares explicitly supplied local
+CLI pairs only; missing or non-executable pairs keep the aggregate
+`portability.status=unmeasured`. It does not measure external KV/session-state
+portability or shipped compatibility.

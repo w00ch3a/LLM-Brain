@@ -1,6 +1,6 @@
-# LLM-Brain v0.6 architecture reference
+# LLM-Brain v0.7.0 architecture reference (local candidate)
 
-LLM-Brain v0.6.3 is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction.
+LLM-Brain v0.7.0 is the current local release candidate for a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction. Markdown and TSV remain the inspectable recovery surface; indexes, packs, receipts and other derived artefacts are never canonical truth.
 
 ## Data layers
 
@@ -112,4 +112,5 @@ The public `upgrade` transaction:
 
 Codex package updates are source-aware. Git marketplaces use Codex's native marketplace refresh; local marketplaces are atomically replaced from the checksum-verified polyglot plugin archive before Codex refreshes its installed cache. Host inventory failures abort detection instead of silently falling back to a different installation type.
 
-Package v0.6.3 reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. The four upgrades add no schema migration, daemon, model training, KV-cache integration, graph database or mandatory dependency.
+The v0.7.0 local candidate reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. The four upgrades add no schema migration, daemon, model training, KV-cache integration, graph database or mandatory dependency.
+Retraction is a two-step safety boundary: `retract --preview` resolves the exact canonical target and emits a confirmation token; `retract --confirm TOKEN` records the tombstone and audit event. A preview never mutates the vault, and retraction does not delete source custody or historical episodes. Search and pack receipts are opt-in derived records (`--receipt`); normal reads do not create them.
