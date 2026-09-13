@@ -2,11 +2,23 @@
 
 ## Unreleased
 
-- Development continues after the v0.7.0 local candidate; no published
-  release or live-vault mutation is implied.
+- Development continues after the v0.7.1 release; no live-vault mutation is
+  implied.
 - Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
+
+# 0.7.1 - 2026-09-13
+
+- Added governed maintenance previews, status, derived reports and explicit
+  host-native schedule declarations without automatic deletion, promotion or
+  scheduler installation.
+- Added visibility-filtered freshness, work, receipt, index, provenance and
+  retraction diagnostics, plus a progressive-disclosure maintenance skill.
+- Refreshed the README with a navigation bar, documentation map, release
+  guidance and privacy-safe public examples.
+- Preserved schema 3, OKF v0.2, factual retrieval defaults, Hermes contracts,
+  fail-open behaviour and migration-free upgrades.
 
 # 0.7.0 - local candidate
 

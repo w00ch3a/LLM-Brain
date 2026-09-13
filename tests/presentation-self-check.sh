@@ -13,6 +13,8 @@ for phrase in \
   'run prepare PROJECT_ID PROCEDURE_REF' \
   'run start PROJECT_ID PROCEDURE_REF' \
   '--capsule REF' \
+  'maintenance preview|run|status PROJECT_ID' \
+  'maintenance schedule declare PROJECT_ID' \
   'help | --version'
 do
   grep -Fq -- "$phrase" <<<"$help_output" || fail "CLI help omitted: $phrase"
@@ -26,6 +28,9 @@ do
   [ -s "$repo_root/$path" ] || fail "missing user-facing documentation: $path"
 done
 
+[ -s "$repo_root/skills/llm-brain-maintenance/SKILL.md" ] ||
+  fail 'maintenance skill is missing'
+
 grep -Fq 'Current-state retrieval is opt-in' "$repo_root/README.md" ||
   fail 'README does not state current-state opt-in behaviour'
 grep -Fq 'LLM_BRAIN_COMMITMENT_POLICY=shadow' "$repo_root/README.md" ||
@@ -36,6 +41,17 @@ grep -Fq 'memory.provider: llm-brain' "$repo_root/integrations/hermes/llm-brain/
   fail 'Hermes documentation lost provider compatibility'
 grep -Fq 'fail-open' "$repo_root/integrations/hermes/llm-brain/README.md" ||
   fail 'Hermes documentation lost fail-open behaviour'
+grep -Eqi 'maintenance.*derived|derived.*maintenance' "$repo_root/README.md" ||
+  fail 'README does not explain that maintenance output is derived'
+grep -Fq '<a href="#start-here">Start here</a>' "$repo_root/README.md" ||
+  fail 'README is missing the quick-navigation bar'
+grep -Fq 'The README is the versioned front door.' "$repo_root/README.md" ||
+  fail 'README is missing the documentation map guidance'
+if grep -Eq '/Users/|/Volumes/|(^|[^0-9])(10|127|169\.254|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]+\.[0-9]+|[[:alnum:]_.+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}' "$repo_root/README.md"; then
+  fail 'README contains a private path, address or email'
+fi
+grep -Eqi 'maintenance.*optional|optional.*maintenance' "$repo_root/integrations/hermes/llm-brain/README.md" ||
+  fail 'Hermes documentation does not state maintenance is optional'
 grep -Fq 'tests/release-readiness-self-check.sh' "$repo_root/RELEASING.md" ||
   fail 'release guide does not use the aggregate gate'
 for path in README.md RELEASING.md SKILL.md references/architecture.md \
@@ -56,7 +72,8 @@ for member in \
   "llm-brain/README.md" \
   "llm-brain/install_prompt.md" \
   "llm-brain/skills/llm-brain/SKILL.md" \
-  "llm-brain/skills/llm-brain/references/architecture.md"
+  "llm-brain/skills/llm-brain/references/architecture.md" \
+  "llm-brain/skills/llm-brain-maintenance/SKILL.md"
 do
   grep -Fqx "$member" <<<"$plugin_members" || fail "plugin omitted packaged documentation: $member"
 done

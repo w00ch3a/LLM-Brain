@@ -18,7 +18,14 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-The aggregate gate includes the v3, work-queue, reflection-scheduler, temporal, retrieval-planner, procedure, capsule-dependency, lifecycle-evidence, poisoning, ground-truth evaluation, reconsolidation, scope-feedback, experimental, compatibility, Hermes, upgrade, packaging and presentation checks. `--release` additionally requires real Hermes source, skill/plugin validators and the packaged Hermes plugin. The v3 gate is authoritative; the deleted legacy gate must not be called.
+The aggregate gate includes the v3, work-queue, reflection-scheduler, temporal, retrieval-planner, procedure, capsule-dependency, lifecycle-evidence, poisoning, ground-truth evaluation, reconsolidation, scope-feedback, experimental, compatibility, Hermes, maintenance, upgrade, packaging and presentation checks. `--release` additionally requires real Hermes source, skill/plugin validators and the packaged Hermes plugin. The v3 gate is authoritative; the deleted legacy gate must not be called.
+
+The maintenance check uses disposable vaults to prove read-only preview/status,
+visibility-safe bounded findings, derived-only report writes, stale/attention/
+blocked state handling, schedule declarations and fail-open behaviour. It must
+also prove that maintenance never deletes, retracts, promotes, rebuilds an
+index or installs a scheduler. Host-native scheduling remains outside the
+release transaction.
 
 The capsule checks must prove that preparation records the declared dependency closure, read-only validation detects changed, hidden, expired and unresolved dependencies, start rechecks under the project lease, and unrelated changes do not stale a capsule. Dependency-free legacy capsules retain compatibility; capsules that depend on state records must be re-prepared before use.
 
@@ -30,7 +37,7 @@ The ground-truth lifecycle evaluator runs twelve scenario families at 20-event a
 
 The Hermes checks verify `hermes memory setup llm-brain`, `load_memory_provider("llm-brain")`, both registrations, the unchanged six configuration keys and any saved configuration. Optional `llm_brain_search` intent is additive, while provider capture, ContextEngine sole-injector behaviour, native compressor inheritance and fail-open recall remain compatibility checks.
 
-Verify both archives are byte-reproducible, their checksums match, every Codex/Claude/Gemini manifest equals `VERSION`, each packaged CLI prints exactly `VERSION`, and packaged docs include the release notes and Hermes/OpenClaw comparison report while describing dependency validation, bounded evidence bundles, poisoning-test limits and the ground-truth evaluator without claiming a release or live-vault migration.
+Verify both archives are byte-reproducible, their checksums match, every Codex/Claude/Gemini manifest equals `VERSION`, each packaged CLI prints exactly `VERSION`, and packaged docs include the release notes, maintenance skill/report guidance and Hermes/OpenClaw comparison report while describing dependency validation, bounded evidence bundles, poisoning-test limits and the ground-truth evaluator without claiming a release or live-vault migration. The package must continue to state that maintenance reports are derived and no zvec/core dependency is introduced.
 
 For Codex, test both marketplace source types: a local marketplace must consume the verified plugin archive without running a Git refresh, while a Git marketplace must refresh natively. Treat a host inventory failure as a blocker; never fall back to a different installation type when detection is incomplete.
 

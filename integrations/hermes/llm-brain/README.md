@@ -2,7 +2,7 @@
 
 This standalone plugin connects Hermes Agent to a local LLM-Brain vault. Hermes receives automatic project recall and durable turn capture while Markdown remains the source of truth.
 
-The current local candidate uses OKF v0.2 canonical records in storage schema 3. Hermes defaults remain unchanged: factual prefetch through the MemoryProvider and the native `compressor`; current-state and evidence retrieval are explicit caller choices.
+The current release uses OKF v0.2 canonical records in storage schema 3. Hermes defaults remain unchanged: factual prefetch through the MemoryProvider and the native `compressor`; current-state and evidence retrieval are explicit caller choices.
 
 ## Components
 
@@ -37,6 +37,25 @@ hermes config set context.engine llm-brain
 ```
 
 The provider stops injecting recall while this engine owns context selection. Capture continues. Set `context.engine` back to `compressor` to restore Hermes' built-in context selection.
+
+### Optional governed maintenance
+
+Maintenance is an explicit LLM-Brain CLI workflow, not a Hermes memory
+provider feature. `maintenance preview` and `maintenance status` are
+read-only; `maintenance run` writes only the bounded derived report under the
+project's `maintenance/` directory. Reports cover freshness, retention
+candidates, conflicts, work, receipts, indexes, provenance and retraction
+residuals, while visibility filtering prevents restricted details from
+appearing in output. They never delete, retract, promote, rebuild or inject
+memory.
+
+Host-native scheduling is optional. A `maintenance schedule declare` command
+records an operator declaration for Hermes, Codex or cron; it does not install
+or activate a scheduler. A recent successful report, not the declaration, is
+the evidence that maintenance ran. Use the [maintenance skill](../../../skills/llm-brain-maintenance/SKILL.md)
+for the manual workflow. This adds no change to the provider name, six-key
+selector configuration, factual prefetch default, ContextEngine single
+injector contract or fail-open behaviour.
 
 ## Install
 
@@ -94,6 +113,6 @@ When a caller requests `intent: evidence`, the bridge includes bounded lifecycle
 
 ## Runtime footprint
 
-The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service or Python dependency.
+The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service, zvec engine or Python dependency. LLM-Brain's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
 
 Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. LLM-Brain is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.

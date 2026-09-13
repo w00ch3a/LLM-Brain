@@ -14,6 +14,32 @@ LLM-Brain gives Codex, Claude Code, Gemini CLI, Hermes Agent and custom agents a
 
 The infrastructure stays active. You do not have to invoke it, clear lock files or manage a memory queue during normal work.
 
+<p align="center">
+  <a href="#start-here">Start here</a> ·
+  <a href="#why-agents-use-it">Why it matters</a> ·
+  <a href="#a-60-second-cli-tour">CLI tour</a> ·
+  <a href="#hermes-agent-memory-plugin">Hermes</a> ·
+  <a href="#retrieval-and-memory-control">Retrieval</a> ·
+  <a href="#governed-maintenance">Maintenance</a> ·
+  <a href="#safety-boundaries">Safety</a>
+</p>
+
+## Start here
+
+| If you want to… | Go to… |
+|---|---|
+| Install with safe defaults | [`install_prompt.md`](install_prompt.md) |
+| Understand the storage and authority model | [`references/architecture.md`](references/architecture.md) |
+| Connect Hermes memory | [`integrations/hermes/llm-brain/README.md`](integrations/hermes/llm-brain/README.md) |
+| Run a bounded health review | [`skills/llm-brain-maintenance/SKILL.md`](skills/llm-brain-maintenance/SKILL.md) |
+| Upgrade or publish safely | [`skills/llm-brain-upgrade/SKILL.md`](skills/llm-brain-upgrade/SKILL.md) and [`RELEASING.md`](RELEASING.md) |
+
+The README is the versioned front door. The linked guides hold the detailed
+workflows, so installation and release behaviour stay reviewable with the
+code instead of drifting in an unversioned wiki. Examples use placeholders;
+this public documentation contains no vault records, credentials, hostnames
+or user-specific filesystem paths.
+
 ## Easiest install
 
 1. Open [`install_prompt.md`](install_prompt.md).
@@ -41,7 +67,10 @@ authoritative files
 
 Canonical knowledge follows [Google Open Knowledge Format v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md). Raw evidence, episodes, review decisions and audit records remain beside it, so an agent can cite where a memory came from and revise it without erasing history.
 
-The current local candidate is v0.7.0 and uses storage schema 3. `VERSION` is the package authority; OKF v0.2 is the canonical knowledge format. The vault is ordinary, portable Markdown and TSV, so it remains inspectable, copyable and repairable without a database or hosted service. This candidate is not a published release.
+The current release is v0.7.1 and uses storage schema 3. `VERSION` is the
+package authority; OKF v0.2 is the canonical knowledge format. The vault is
+ordinary, portable Markdown and TSV, so it remains inspectable, copyable and
+repairable without a database or hosted service.
 
 ### Shipped, experimental and deliberately out of scope
 
@@ -70,6 +99,7 @@ capture → custody + episode → policy/review → canonical OKF
 | Truth and time | Current-state is explicit; validity gaps, conflicts, retractions and dependencies remain warnings, not invented certainty. |
 | Provenance | Source hashes, lineage and independent roots distinguish corroboration from repeated copies. |
 | Forgetting | `retract --preview` shows the exact target and confirmation token; only `--confirm TOKEN` records a reversible tombstone. |
+| Maintenance | Bounded freshness, retention-candidate, conflict, work, receipt, index and provenance reports are derived and visibility-filtered; they never delete or promote memory. |
 | Usefulness | `--receipt` and `feedback record` are opt-in derived records; reading memory never writes a receipt by default. |
 | Portability and repair | Markdown/TSV custody, rebuildable indexes and staged migration/reconciliation keep recovery local and inspectable. |
 | Hermes | Native provider recall and durable capture share the same bridge; Hermes never writes canonical `okf/` directly or executes capsules. |
@@ -106,6 +136,8 @@ The polyglot plugin archive supports:
 - Claude Code through `.claude-plugin/` and `SessionStart` hooks;
 - Gemini CLI through `gemini-extension.json` and `GEMINI.md`;
 - generic agents through `adapters/generic.md`.
+- maintenance workflows through the progressive-disclosure
+  `skills/llm-brain-maintenance/` skill.
 
 Set `LLM_BRAIN_PASSIVE=0` when a session must opt out of automatic retrieval and closeout.
 
@@ -133,6 +165,11 @@ $brain pack build PROJECT_ID --task "current task" --budget-tokens 4000
 ./bin/llm-brain search PROJECT_ID "release state" --intent current_state --require-evidence
 ./bin/llm-brain pack build PROJECT_ID --task "release state" --intent evidence --budget-tokens 2000
 
+# inspect or write a bounded derived maintenance report
+./bin/llm-brain maintenance preview PROJECT_ID --limit 20
+./bin/llm-brain maintenance status PROJECT_ID --json
+./bin/llm-brain maintenance run PROJECT_ID --limit 20
+
 # preview a forgetting action; confirmation is deliberately separate
 ./bin/llm-brain retract PROJECT_ID okf/claims/example.md --reason "obsolete" --preview
 ./bin/llm-brain retract PROJECT_ID okf/claims/example.md --reason "obsolete" --confirm TOKEN
@@ -152,6 +189,7 @@ projects/PROJECT_ID/
 ├── indexes/          # rebuildable lexical, graph and vector data
 ├── context-packs/    # bounded retrieval output
 ├── runs/             # procedure working state and outcomes
+├── maintenance/      # bounded derived health reports and schedule declarations
 └── audit.v2.tsv      # hash-chained lifecycle events
 ```
 
@@ -294,6 +332,36 @@ Capsules bind the procedure hash, task, principal, bindings, declared dependenci
 
 Evidence retrieval is also explicit. `search` and `pack build` with `--intent evidence` can return bounded JSON `evidence_bundles` around selected records: current or historical versions, supporting evidence, conflicts, derivation and unresolved relationships. Each entry keeps its role/state, bounded excerpt and source hash; warnings and `incomplete` report hidden, unresolved or budget-limited links. The bundle follows only declared relationships; it does not merge records, infer agreement or change canonical memory. Hidden material is filtered before rendering.
 
+### Governed maintenance
+
+Maintenance is a bounded health view over one project, not another memory
+store. It reports expiry and stale verification, unknown validity,
+conflicts/dependencies, pending or failed work, receipt and index problems,
+provenance gaps and retraction residuals. Findings are visibility-filtered and
+labelled as review candidates; they recommend inspection or re-verification
+without presenting unresolved material as truth.
+
+```bash
+./bin/llm-brain maintenance preview PROJECT_ID --principal agent-id --limit 20
+./bin/llm-brain maintenance status PROJECT_ID --json
+./bin/llm-brain maintenance run PROJECT_ID --limit 20
+./bin/llm-brain maintenance schedule declare PROJECT_ID \
+  --name "weekly memory review" --cadence weekly --runner hermes
+./bin/llm-brain maintenance schedule disable PROJECT_ID
+```
+
+`preview` and `status` are read-only. `run` atomically writes only
+`projects/PROJECT_ID/maintenance/latest.md`, whose `MaintenanceReport` is a
+derived, non-canonical artefact. A schedule command records a declaration for
+Hermes, Codex or cron; it does not install or activate a host scheduler. No
+automatic deletion, retraction, promotion, index rebuild, daemon, database,
+zvec engine, cloud backend or core dependency is introduced. Use `--strict`
+when a maintenance caller wants `attention` or `blocked` findings to return
+non-zero; ordinary retrieval remains fail-open. JSON status includes the
+maintenance and schedule states, report state/hash, bounded counts/items,
+recommendations and the reminder (`none`, `run-or-schedule`, `report-stale` or
+`unavailable`).
+
 The repository-only lifecycle evaluator runs twelve ground-truth scenario families at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](docs/evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
 
 ## Safety boundaries
@@ -319,8 +387,8 @@ LLM-Brain is provided under the Apache License 2.0. The licence governs the gran
 Inspect the complete plan before applying it:
 
 ```bash
-./bin/llm-brain upgrade check --all --host auto --target 0.7.0
-./bin/llm-brain upgrade apply --all --host auto --target 0.7.0 --plan-hash HASH
+./bin/llm-brain upgrade check --all --host auto --target "$(tr -d '[:space:]' < VERSION)"
+./bin/llm-brain upgrade apply --all --host auto --target "$(tr -d '[:space:]' < VERSION)" --plan-hash HASH
 ./bin/llm-brain upgrade verify --receipt RECEIPT
 ```
 
@@ -333,4 +401,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.7.0 release notes](docs/releases/v0.7.0.md) for this migration-free local candidate, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.7.1 release notes](docs/releases/v0.7.1.md) for this migration-free release, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.

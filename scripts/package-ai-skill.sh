@@ -22,6 +22,7 @@ bash -n "$repo_root/tests/v3-self-check.sh"
 bash -n "$repo_root/tests/state-commitment-capsule-self-check.sh"
 bash -n "$repo_root/tests/compatibility-self-check.sh"
 bash -n "$repo_root/tests/presentation-self-check.sh"
+bash -n "$repo_root/tests/maintenance-self-check.sh"
 bash -n "$repo_root/tests/release-readiness-self-check.sh"
 bash -n "$repo_root/tests/upgrade-self-check.sh"
 bash -n "$repo_root/tests/automatic-use-self-check.sh"
@@ -166,6 +167,7 @@ def verify(path: Path, kind: str) -> None:
                 f"{name}/.claude-plugin/plugin.json",
                 f"{name}/gemini-extension.json",
                 f"{name}/skills/llm-brain-upgrade/SKILL.md",
+                f"{name}/skills/llm-brain-maintenance/SKILL.md",
             }
         required |= {
         f"{name}/docs/evaluation.md",

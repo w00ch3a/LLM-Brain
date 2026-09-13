@@ -89,6 +89,9 @@ Commands:
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
+  maintenance preview|run|status PROJECT_ID [--principal ID] [--limit N] [--json] [--strict]
+  maintenance schedule declare PROJECT_ID --name TEXT --cadence TEXT [--runner hermes|codex|cron|other] [--max-age-days N]
+  maintenance schedule disable PROJECT_ID
   bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory] [--receipt]
   bridge capture --source-root PATH [--project-id ID] --record FILE
   run start PROJECT_ID PROCEDURE_REF [--task TEXT] [--request-id ID] [--branch ID] [--principal ID] [--obligation TEXT] [--capsule REF]
@@ -1645,6 +1648,40 @@ yaml_quote() {
 
 frontmatter_field() {
   local file="$1" key="$2" aliases="${3:-}"
+  local cache cache_tmp wanted field value
+  if [ -n "${MAINT_FIELDS_CACHE_DIR:-}" ] && [ -f "$file" ] && [ ! -L "$file" ]; then
+    cache="$MAINT_FIELDS_CACHE_DIR/${file//\//__}"
+    if [ ! -f "$cache" ]; then
+      cache_tmp="$cache.tmp.$$.$RANDOM"
+      if awk '
+        NR == 1 && $0 == "---" { in_header=1; next }
+        in_header && $0 == "---" { exit }
+        in_header {
+          colon=index($0, ":")
+          if (colon > 1) {
+            field=substr($0, 1, colon - 1)
+            value=substr($0, colon + 1)
+            sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value)
+            gsub(/^"|"$/, "", value); gsub(/[\t\r]/, " ", value)
+            print field "\t" value
+          }
+        }
+      ' "$file" >"$cache_tmp"; then
+        mv -f "$cache_tmp" "$cache"
+      else
+        rm -f "$cache_tmp"
+      fi
+    fi
+    if [ -f "$cache" ]; then
+      wanted=",$key,$aliases,"
+      while IFS=$'\t' read -r field value; do
+        case "$wanted" in
+          *,"$field",*) printf '%s\n' "$value"; return 0 ;;
+        esac
+      done <"$cache"
+      return 0
+    fi
+  fi
   awk -v key="$key" -v aliases="$aliases" '
     BEGIN { wanted="," key "," aliases ","; in_header=0 }
     NR == 1 && $0 == "---" { in_header=1; next }
@@ -6666,6 +6703,587 @@ cmd_doctor() {
   [ "$age" = 0 ]
 }
 
+# Maintenance is a bounded derived view. Persistent writes are limited to the
+# explicitly requested report or schedule marker.
+maintenance_semantic_files() {
+  local dir="$1" kind
+  for kind in claims computations procedures references topics; do
+    [ -d "$dir/okf/$kind" ] || continue
+    find "$dir/okf/$kind" -type f -name '*.md' -not -path '*/retractions/*' 2>/dev/null
+  done | LC_ALL=C sort
+}
+
+maintenance_safe_value() {
+  printf '%s' "$1" | tr '\r\n\t|' '    -'
+}
+
+maintenance_visible() {
+  local file="$1" principal="${2:-}" sensitivity scope audience
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  [ "$sensitivity" != restricted ] || return 1
+  scope="$(frontmatter_field "$file" brain_principal)"
+  audience="$(frontmatter_field "$file" brain_audience)"
+  if [ -z "$principal" ]; then
+    # Without a principal, scoped records are not safe to expose.
+    [ -z "$scope" ] && [ -z "$audience" ]
+  else
+    principal_visible "$file" "$principal"
+  fi
+}
+
+maintenance_count_category() {
+  local category="$1"
+  awk -F '\t' -v category="$category" '$1 == category { count++ } END { print count + 0 }' "$MAINT_ITEMS_FILE" 2>/dev/null
+}
+
+maintenance_add_item() {
+  local category="$1" ref="$2" title="$3" state="$4" reason="$5" recommendation="$6"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(maintenance_safe_value "$category")" "$(maintenance_safe_value "$ref")" \
+    "$(maintenance_safe_value "$title")" "$(maintenance_safe_value "$state")" \
+    "$(maintenance_safe_value "$reason")" "$(maintenance_safe_value "$recommendation")" >>"$MAINT_ITEMS_RAW"
+}
+
+maintenance_receipt_scan() {
+  local dir="$1" project_id="$2" receipt="$dir/audit/retrieval-receipts.jsonl" py issue line reason
+  [ -e "$receipt" ] || return 0
+  if [ ! -f "$receipt" ] || [ -L "$receipt" ] || [ ! -r "$receipt" ]; then
+    maintenance_add_item receipt audit/retrieval-receipts.jsonl 'Retrieval receipts' invalid receipt-unavailable inspect-receipts
+    return 0
+  fi
+  py="$(bridge_python 2>/dev/null || true)"
+  if [ -z "$py" ] || [ ! -x "$py" ]; then
+    maintenance_add_item receipt audit/retrieval-receipts.jsonl 'Retrieval receipts' invalid receipt-check-unavailable inspect-receipts
+    return 0
+  fi
+  "$py" - "$receipt" "$project_id" >"$MAINT_RECEIPT_ISSUES" 2>/dev/null <<'PY' || {
+import json
+import re
+import sys
+
+path, project_id = sys.argv[1:]
+seen = set()
+try:
+    handle = open(path, encoding="utf-8", errors="replace")
+except OSError:
+    print("unavailable\t0")
+    raise SystemExit(0)
+with handle:
+    for number, raw in enumerate(handle, 1):
+        text = raw.strip()
+        issue = ""
+        value = None
+        if not text:
+            issue = "malformed"
+        else:
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                issue = "malformed"
+        if not issue and not isinstance(value, dict):
+            issue = "malformed"
+        if not issue:
+            required = ("schema", "receipt_id", "project_id", "selected")
+            if any(key not in value for key in required):
+                issue = "malformed"
+            elif value.get("schema") != "llm-brain.retrieval-receipt.v1":
+                issue = "inconsistent"
+            elif value.get("project_id") != project_id:
+                issue = "inconsistent"
+            elif not isinstance(value.get("selected"), list):
+                issue = "malformed"
+            elif not isinstance(value.get("receipt_id"), str) or not value.get("receipt_id"):
+                issue = "malformed"
+            elif value.get("receipt_id") in seen:
+                issue = "inconsistent"
+            elif not re.fullmatch(r"[0-9a-fA-F]{24}", value.get("receipt_id")):
+                issue = "inconsistent"
+            else:
+                for selected in value.get("selected", []):
+                    if not isinstance(selected, str) or not selected or selected.startswith("/") or ".." in selected or "\n" in selected or "\r" in selected:
+                        issue = "malformed"
+                        break
+        if value is not None and isinstance(value, dict) and isinstance(value.get("receipt_id"), str):
+            seen.add(value.get("receipt_id"))
+        if issue:
+            print(issue + "\t" + str(number))
+PY
+    maintenance_add_item receipt audit/retrieval-receipts.jsonl 'Retrieval receipts' invalid receipt-check-unavailable inspect-receipts
+    return 0
+  }
+  while IFS=$'\t' read -r issue line; do
+    [ -n "$issue" ] || continue
+    case "$issue" in
+      malformed) reason="malformed-receipt-line-$line" ;;
+      inconsistent) reason="inconsistent-receipt-line-$line" ;;
+      unavailable) reason=receipt-unavailable ;;
+      *) reason="receipt-check-$issue-line-$line" ;;
+    esac
+    maintenance_add_item receipt audit/retrieval-receipts.jsonl 'Retrieval receipts' invalid "$reason" inspect-receipts
+  done <"$MAINT_RECEIPT_ISSUES"
+}
+
+maintenance_index_scan() {
+  local dir="$1" manifest generation rebuild_state_file docs_state graph_state vectors_state manifest_state health health_reason health_contract evidence_contract evidence_health evidence_reason evidence_generation
+  INDEX_EXPECTED_SIGNATURE_READY=0
+  manifest="$(index_file_path "$dir" manifest.tsv)"
+  generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  rebuild_state_file="$(index_rebuild_state_path "$dir")"
+  if [ ! -f "$manifest" ]; then
+    maintenance_add_item index index:primary 'Primary retrieval index' missing index-manifest-missing rebuild-index
+  else
+    docs_state="$(index_documents_state "$dir" 2>/dev/null || printf missing)"
+    graph_state="$(index_graph_state "$dir" 2>/dev/null || printf missing)"
+    vectors_state="$(index_vectors_state "$dir" 2>/dev/null || printf missing)"
+    manifest_state="$(index_manifest_state "$dir" 2>/dev/null || printf missing)"
+    health_contract="$(index_health_contract "$dir" present "$generation" "$docs_state" "$graph_state" "$vectors_state" "$manifest_state" "$rebuild_state_file" 2>/dev/null || printf 'failed\tindex-health-unavailable')"
+    IFS=$'\t' read -r health health_reason <<EOF
+$health_contract
+EOF
+    [ "$health" = current ] || maintenance_add_item index index:primary 'Primary retrieval index' "$health" "${health_reason:-index-health-unavailable}" rebuild-index
+  fi
+  evidence_contract="$(evidence_index_health_contract "$dir" 2>/dev/null || printf 'missing\tevidence-index-health-unavailable\t')"
+  IFS=$'\t' read -r evidence_health evidence_reason evidence_generation <<EOF
+$evidence_contract
+EOF
+  [ "$evidence_health" = current ] || maintenance_add_item index index:evidence 'Evidence retrieval index' "$evidence_health" "${evidence_reason:-evidence-index-health-unavailable}" rebuild-index
+}
+
+maintenance_retraction_scan() {
+  local dir="$1" principal="${2:-}" ret target canonical target_hash derived
+  [ -d "$dir/okf/retractions" ] || return 0
+  while IFS= read -r ret; do
+    maintenance_visible "$ret" "$principal" || continue
+    target="$(frontmatter_field "$ret" brain_retracts)"
+    [ -n "$target" ] || continue
+    canonical="$(canonical_ref_file "$dir" "$target" 2>/dev/null || true)"
+    [ -n "$canonical" ] || continue
+    maintenance_visible "$canonical" "$principal" || continue
+    target_hash="$(sha256_file "$canonical" 2>/dev/null || true)"
+    while IFS= read -r derived; do
+      maintenance_visible "$derived" "$principal" || continue
+      maintenance_add_item retraction "${derived#"$dir"/}" 'Retraction residual' residual references-retracted-memory review-retraction
+    done < <(find "$dir/indexes" "$dir/projections" "$dir/context-packs" -type f \( -name '*.tsv' -o -name '*.txt' -o -name '*.md' -o -name '*.json' \) -not -path '*/retractions/*' -exec grep -l -F -e "$target" -e "$target_hash" {} + 2>/dev/null | LC_ALL=C sort -u || true)
+  done < <(find "$dir/okf/retractions" -type f -name '*.md' 2>/dev/null | LC_ALL=C sort)
+}
+
+maintenance_work_scan() {
+  local dir="$1" principal="${2:-}" request state request_id episode_ref pid owner_start current
+  [ -d "$dir/requests" ] || return 0
+  while IFS= read -r request; do
+    maintenance_visible "$request" "$principal" || continue
+    request_id="$(frontmatter_field "$request" brain_request_id)"; [ -n "$request_id" ] || request_id="$(basename "$request" .md)"
+    state="$(frontmatter_field "$request" brain_request_state)"
+    episode_ref="$(frontmatter_field "$request" brain_episode_ref)"
+    if [ -z "$episode_ref" ] || [ ! -f "$dir/$episode_ref" ]; then
+      maintenance_add_item orphaned-work "requests/$request_id" 'Work item' orphaned episode-missing inspect-work
+    fi
+    case "$state" in
+      pending)
+        if [ -n "$(frontmatter_field "$request" brain_recovered_at)" ]; then
+          maintenance_add_item recovered-work "requests/$request_id" 'Work item' recovered worker-recovered inspect-work
+        else
+          maintenance_add_item pending-work "requests/$request_id" 'Work item' pending awaiting-worker inspect-work
+        fi
+        ;;
+      running)
+        pid="$(frontmatter_field "$request" brain_owner_pid)"; owner_start="$(frontmatter_field "$request" brain_owner_process_start)"; current=""
+        case "$pid" in
+          ''|*[!0-9]*) maintenance_add_item orphaned-work "requests/$request_id" 'Work item' orphaned worker-owner-missing inspect-work ;;
+          *)
+            if ! kill -0 "$pid" 2>/dev/null; then
+              current="$(lock_process_start "$pid")"
+              [ -z "$current" ] && maintenance_add_item orphaned-work "requests/$request_id" 'Work item' orphaned worker-lost inspect-work
+            elif [ -n "$owner_start" ] && [ -n "$(lock_process_start "$pid")" ] && [ "$owner_start" != "$(lock_process_start "$pid")" ]; then
+              maintenance_add_item orphaned-work "requests/$request_id" 'Work item' orphaned worker-owner-changed inspect-work
+            fi
+            ;;
+        esac
+        ;;
+      failed) maintenance_add_item failed-work "requests/$request_id" 'Work item' failed "$(frontmatter_field "$request" brain_error)" inspect-work ;;
+      committed|complete|done|'') : ;;
+      *) maintenance_add_item orphaned-work "requests/$request_id" 'Work item' orphaned unknown-work-state inspect-work ;;
+    esac
+  done < <(find "$dir/requests" -maxdepth 1 -type f -name '*.md' -not -path '*/.staging/*' 2>/dev/null | LC_ALL=C sort)
+}
+
+maintenance_add_dependencies() {
+  local dir="$1" file="$2" title="$3" principal="$4" dep dep_file
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    dep_file="$(canonical_ref_file "$dir" "$dep" 2>/dev/null || true)"
+    [ -n "$dep_file" ] || continue
+    maintenance_visible "$dep_file" "$principal" || { maintenance_add_item unresolved-inaccessible "${file#"$dir"/}" "$title" unresolved-inaccessible dependency-not-visible reverify; break; }
+  done < <(reference_lines "$(frontmatter_field "$file" brain_depends_on)")
+}
+
+maintenance_collect() {
+  local project_id="$1" principal="${2:-}" output_dir="$3" dir file type title status valid_from valid_to stale_after verified conflict state_key depends version supersedes resolution reason provenance roots rel now today source_hash
+  require_project "$project_id" dir
+  MAINT_ITEMS_RAW="$output_dir/items.raw.tsv"; MAINT_ITEMS_FILE="$output_dir/items.tsv"; MAINT_ROOT_RECORDS="$output_dir/root-records.tsv"; MAINT_SCOPE_FILE="$output_dir/scope.tsv"; MAINT_RECEIPT_ISSUES="$output_dir/receipt-issues.tsv"; MAINT_FIELDS_CACHE_DIR="$output_dir/fields"; ensure_dir "$MAINT_FIELDS_CACHE_DIR"
+  : >"$MAINT_ITEMS_RAW"; : >"$MAINT_ROOT_RECORDS"; : >"$MAINT_SCOPE_FILE"; : >"$MAINT_RECEIPT_ISSUES"
+  MAINT_COLLECTION_STATE=ok; now="$(now_utc)"; today="$(today_utc)"
+  while IFS= read -r file; do
+    maintenance_visible "$file" "$principal" || continue
+    type="$(frontmatter_field "$file" type)"
+    [ -n "$type" ] || { maintenance_add_item provenance "${file#"$dir"/}" 'Canonical record' invalid record-type-missing review-provenance; continue; }
+    case "$type" in Project|Directory) continue ;; esac
+    rel="${file#"$dir"/}"
+    printf '%s\t%s\n' "$rel" "$(sha256_file "$file")" >>"$MAINT_SCOPE_FILE"
+    title="$(frontmatter_field "$file" title)"; status="$(frontmatter_field "$file" status)"; [ -n "$status" ] || status=stable
+    valid_from="$(frontmatter_field "$file" brain_valid_from)"; valid_to="$(frontmatter_field "$file" brain_valid_to)"
+    if [ -n "$valid_from" ] && ! brain_datetime_valid "$valid_from"; then
+      maintenance_add_item unknown-validity "$rel" "$title" unknown invalid-valid-from reverify
+    elif [ -n "$valid_to" ] && ! brain_datetime_valid "$valid_to"; then
+      maintenance_add_item unknown-validity "$rel" "$title" unknown invalid-valid-to reverify
+    elif [ -n "$valid_to" ] && { [ "$valid_to" \< "$now" ] || [ "$valid_to" = "$now" ]; }; then
+      maintenance_add_item expired-validity "$rel" "$title" expired "valid-to=$valid_to" reverify
+    elif [ -z "$valid_from" ] && [ -z "$valid_to" ]; then
+      maintenance_add_item unknown-validity "$rel" "$title" unknown validity-not-declared reverify
+    fi
+    stale_after="$(frontmatter_field "$file" stale_after)"; verified="$(frontmatter_field "$file" brain_last_verified_at)"
+    case "$stale_after" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) [ "$stale_after" \> "$today" ] || maintenance_add_item stale-verification "$rel" "$title" stale "stale-after=$stale_after" reverify ;;
+      '') : ;;
+      *) maintenance_add_item stale-verification "$rel" "$title" stale invalid-stale-after reverify ;;
+    esac
+    [ -z "$verified" ] || brain_datetime_valid "$verified" || maintenance_add_item stale-verification "$rel" "$title" stale invalid-last-verified-at reverify
+    conflict="$(file_conflict_state "$file" "$(index_file_path "$dir" graph.tsv)" 2>/dev/null || printf clear)"
+    [ "$conflict" = conflicted ] && maintenance_add_item unresolved-conflict "$rel" "$title" unresolved-conflict explicit-conflict reverify
+    state_key="$(frontmatter_field "$file" brain_state_key)"; depends="$(frontmatter_field "$file" brain_depends_on)"; version="$(frontmatter_field "$file" brain_version_of)"; supersedes="$(frontmatter_field "$file" brain_supersedes)"
+    if [ -n "$state_key$depends$version$supersedes" ] || [ -n "$valid_from$valid_to" ]; then
+      state_resolution_for_file "$dir" "$file" "" "$principal"
+      resolution="$STATE_RESOLUTION"; reason="$STATE_REASON"
+      case "$resolution" in
+        unresolved-conflict) [ "$conflict" = conflicted ] || maintenance_add_item unresolved-conflict "$rel" "$title" "$resolution" "$reason" reverify ;;
+        unresolved-dependency) maintenance_add_item unresolved-dependency "$rel" "$title" "$resolution" "$reason" reverify ;;
+        unresolved-inaccessible) maintenance_add_item unresolved-inaccessible "$rel" "$title" "$resolution" "$reason" reverify ;;
+        invalid-cycle) maintenance_add_item invalid-cycle "$rel" "$title" "$resolution" "$reason" reverify ;;
+      esac
+    fi
+    maintenance_add_dependencies "$dir" "$file" "$title" "$principal"
+    provenance="$(frontmatter_field "$file" brain_provenance)"
+    if ! evidence_provenance_known "$dir" "$file"; then
+      if [ -n "$provenance" ]; then reason=broken-provenance; else reason=unknown-provenance; fi
+      maintenance_add_item provenance "$rel" "$title" invalid "$reason" review-provenance
+    fi
+    roots="$(evidence_root_hashes "$dir" "$file" 0 "" "$principal" 2>/dev/null || true)"
+    if [ -n "$roots" ]; then
+      while IFS= read -r source_hash; do
+        [ -n "$source_hash" ] || continue
+        printf '%s\t%s\n' "$source_hash" "$rel" >>"$MAINT_ROOT_RECORDS"
+      done <<<"$roots"
+    fi
+  done < <(maintenance_semantic_files "$dir")
+  maintenance_work_scan "$dir" "$principal"; maintenance_receipt_scan "$dir" "$project_id"; maintenance_index_scan "$dir"; maintenance_retraction_scan "$dir" "$principal"
+  LC_ALL=C sort -u "$MAINT_SCOPE_FILE" -o "$MAINT_SCOPE_FILE" 2>/dev/null || true
+  LC_ALL=C sort -u "$MAINT_ROOT_RECORDS" -o "$MAINT_ROOT_RECORDS" 2>/dev/null || true
+  LC_ALL=C sort "$MAINT_ITEMS_RAW" >"$MAINT_ITEMS_FILE"
+  MAINT_SCOPE_HASH="$(sha256_file "$MAINT_SCOPE_FILE")"; MAINT_TOTAL_FINDINGS="$(wc -l <"$MAINT_ITEMS_FILE" | tr -d ' ')"
+  MAINT_COUNT_EXPIRED="$(maintenance_count_category expired-validity)"; MAINT_COUNT_STALE="$(maintenance_count_category stale-verification)"; MAINT_COUNT_UNKNOWN="$(maintenance_count_category unknown-validity)"; MAINT_COUNT_CONFLICT="$(maintenance_count_category unresolved-conflict)"; MAINT_COUNT_DEPENDENCY="$(maintenance_count_category unresolved-dependency)"; MAINT_COUNT_INACCESSIBLE="$(maintenance_count_category unresolved-inaccessible)"; MAINT_COUNT_CYCLE="$(maintenance_count_category invalid-cycle)"
+  MAINT_COUNT_PENDING_WORK="$(maintenance_count_category pending-work)"; MAINT_COUNT_FAILED_WORK="$(maintenance_count_category failed-work)"; MAINT_COUNT_RECOVERED_WORK="$(maintenance_count_category recovered-work)"; MAINT_COUNT_ORPHANED_WORK="$(maintenance_count_category orphaned-work)"; MAINT_COUNT_RECEIPTS="$(maintenance_count_category receipt)"; MAINT_COUNT_INDEX="$(maintenance_count_category index)"; MAINT_COUNT_PROVENANCE="$(maintenance_count_category provenance)"; MAINT_COUNT_RETRACTION="$(maintenance_count_category retraction)"
+  MAINT_COUNT_UNRESOLVED_STATE=$((MAINT_COUNT_CONFLICT + MAINT_COUNT_DEPENDENCY + MAINT_COUNT_INACCESSIBLE + MAINT_COUNT_CYCLE)); MAINT_ROOT_COUNT="$(awk -F '\t' 'NF { seen[$1]=1 } END { for (item in seen) count++; print count + 0 }' "$MAINT_ROOT_RECORDS")"; MAINT_CORRELATED_RECORD_COUNT="$(awk -F '\t' 'NF { count[$1]++ } END { for (item in count) if (count[item] > 1) total += count[item]; print total + 0 }' "$MAINT_ROOT_RECORDS")"
+  MAINT_RECOMMENDATIONS_FILE="$output_dir/recommendations.txt"; : >"$MAINT_RECOMMENDATIONS_FILE"; awk -F '\t' '{ print $6 }' "$MAINT_ITEMS_FILE" | awk 'NF && !seen[$0]++' >"$MAINT_RECOMMENDATIONS_FILE"
+  if [ "$MAINT_COLLECTION_STATE" != ok ]; then MAINT_HEALTH=blocked; elif [ "$MAINT_TOTAL_FINDINGS" -gt 0 ]; then MAINT_HEALTH=attention; else MAINT_HEALTH=healthy; fi
+}
+
+maintenance_render_category() {
+  local category="$1" heading="$2" selected="$3" ref title state reason
+  printf '## %s\n\n' "$heading"
+  if ! awk -F '\t' -v category="$category" '$1 == category { found=1 } END { exit !found }' "$selected"; then
+    printf 'None detected.\n\n'
+    return 0
+  fi
+  while IFS=$'\t' read -r _ ref title state reason _; do
+    [ -n "$ref" ] || continue
+    [ -n "$title" ] || title='Diagnostic item'
+    printf '%s\n' "- \`$ref\` — $title — $state ($reason)."
+  done < <(awk -F '\t' -v category="$category" '$1 == category' "$selected")
+  printf '\n'
+}
+
+maintenance_render_body() {
+  local snapshot="$1" limit="$2" selected="$snapshot/items.selected.tsv"
+  head -n "$limit" "$MAINT_ITEMS_FILE" >"$selected"
+  {
+    printf '# LLM-Brain maintenance report\n\n'
+    printf 'Maintenance state: `%s`.\n\n' "$MAINT_HEALTH"
+    printf 'This is a bounded derived diagnostic report, not canonical memory. It never deletes, retracts or promotes records.\n\n'
+    printf 'Visible scope: `%s`; visible evidence roots: `%s`; correlated records: `%s`.\n\n' "${MAINT_PRINCIPAL:-shared}" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
+    printf '## Diagnostic summary\n\n| Finding | Count |\n|---|---:|\n'
+    printf '| Expired validity | %s |\n| Stale verification | %s |\n| Unknown validity | %s |\n| Unresolved conflicts | %s |\n| Unresolved dependencies | %s |\n| Unresolved inaccessible | %s |\n| Invalid cycles | %s |\n| Pending work | %s |\n| Failed work | %s |\n| Recovered work | %s |\n| Orphaned work | %s |\n| Receipt issues | %s |\n| Index issues | %s |\n| Provenance issues | %s |\n| Retraction residuals | %s |\n\n' \
+      "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION"
+  } >"$snapshot/report.body"
+  maintenance_render_category expired-validity 'Retention review candidates (no automatic deletion)' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category stale-verification 'Freshness review candidates' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category unknown-validity 'Unknown validity warnings' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category unresolved-conflict 'Conflict warnings' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category unresolved-dependency 'Dependency warnings' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category unresolved-inaccessible 'Visibility warnings' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category invalid-cycle 'Lineage cycle warnings' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category pending-work 'Pending work queue' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category failed-work 'Failed work queue' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category recovered-work 'Recovered work queue' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category orphaned-work 'Orphaned work queue' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category receipt 'Retrieval receipt diagnostics' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category index 'Index health diagnostics' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category provenance 'Provenance diagnostics' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category retraction 'Retraction residuals' "$selected" >>"$snapshot/report.body"
+  {
+    printf '## Recommendations\n\n'
+    if [ -s "$MAINT_RECOMMENDATIONS_FILE" ]; then
+      while IFS= read -r reason; do printf '%s\n' "- \`$reason\`"; done <"$MAINT_RECOMMENDATIONS_FILE"
+    else
+      printf 'None.\n'
+    fi
+    printf '\n'
+    [ "$MAINT_TOTAL_FINDINGS" -le "$limit" ] || printf 'Additional findings omitted by --limit %s.\n\n' "$limit"
+  } >>"$snapshot/report.body"
+}
+
+maintenance_schedule_read() {
+  local dir="$1" file max
+  file="$dir/maintenance/schedule.md"
+  MAINT_SCHEDULE_STATE=missing; MAINT_SCHEDULE_NAME=""; MAINT_SCHEDULE_CADENCE=""; MAINT_SCHEDULE_RUNNER=other; MAINT_SCHEDULE_MAX_AGE=7
+  [ -e "$file" ] || return 0
+  [ -f "$file" ] && [ ! -L "$file" ] || { MAINT_SCHEDULE_STATE=unavailable; return 0; }
+  MAINT_SCHEDULE_STATE="$(frontmatter_field "$file" brain_schedule_state)"; MAINT_SCHEDULE_NAME="$(frontmatter_field "$file" brain_schedule_name)"; MAINT_SCHEDULE_CADENCE="$(frontmatter_field "$file" brain_schedule_cadence)"; MAINT_SCHEDULE_RUNNER="$(frontmatter_field "$file" brain_schedule_runner)"; [ -n "$MAINT_SCHEDULE_RUNNER" ] || MAINT_SCHEDULE_RUNNER=other
+  max="$(frontmatter_field "$file" brain_schedule_max_age_days)"; case "$max" in ''|*[!0-9]*) MAINT_SCHEDULE_MAX_AGE=7 ;; *) MAINT_SCHEDULE_MAX_AGE="$max" ;; esac
+  case "$MAINT_SCHEDULE_STATE" in declared-unverified|disabled) ;; *) MAINT_SCHEDULE_STATE=unavailable ;; esac
+}
+
+maintenance_report_hash() {
+  local file="$1" temp hash
+  temp="${file}.hash.$$"
+  awk 'NR == 1 { in_header=($0 == "---") } in_header && ($0 ~ /^brain_report_hash_sha256:/ || $0 ~ /^brain_report_generated_at:/) { next } { print } in_header && NR > 1 && $0 == "---" { in_header=0 }' "$file" >"$temp" 2>/dev/null || return 1
+  hash="$(sha256_file "$temp" 2>/dev/null || true)"; rm -f "$temp"; [ -n "$hash" ] || return 1; printf '%s\n' "$hash"
+}
+
+maintenance_report_read() {
+  local dir="$1" report expected actual generated generated_epoch now_epoch age_seconds report_mtime
+  report="$dir/maintenance/latest.md"
+  MAINT_REPORT_STATE=missing; MAINT_REPORT_HASH=""; MAINT_REPORT_GENERATED_AT=""
+  [ -e "$report" ] || return 0
+  [ -f "$report" ] && [ ! -L "$report" ] || { MAINT_REPORT_STATE=failed; return 0; }
+  [ "$(frontmatter_field "$report" type)" = MaintenanceReport ] || { MAINT_REPORT_STATE=failed; return 0; }
+  [ "$(frontmatter_field "$report" brain_maintenance_schema)" = 1 ] || { MAINT_REPORT_STATE=failed; return 0; }
+  [ "$(frontmatter_field "$report" brain_artifact_state)" = derived ] || { MAINT_REPORT_STATE=failed; return 0; }
+  expected="$(frontmatter_field "$report" brain_report_hash_sha256)"
+  case "$expected" in [a-fA-F0-9][a-fA-F0-9][a-fA-F0-9][a-fA-F0-9][a-fA-F0-9][a-fA-F0-9][a-fA-F0-9][a-fA-F0-9]*) ;; *) MAINT_REPORT_STATE=failed; return 0 ;; esac
+  actual="$(maintenance_report_hash "$report" 2>/dev/null || true)"; [ "$actual" = "$expected" ] || { MAINT_REPORT_STATE=failed; MAINT_REPORT_HASH="$expected"; return 0; }
+  MAINT_REPORT_HASH="$expected"; MAINT_REPORT_GENERATED_AT="$(frontmatter_field "$report" brain_report_generated_at)"
+  if [ -n "$MAINT_SCOPE_HASH" ] && [ "$(frontmatter_field "$report" brain_scope_snapshot_sha256)" != "$MAINT_SCOPE_HASH" ]; then MAINT_REPORT_STATE=stale; return 0; fi
+  report_mtime="$(file_mtime "$report" 2>/dev/null || true)"
+  generated_epoch="$report_mtime"
+  case "$generated_epoch" in ''|*[!0-9]*) generated_epoch="$(iso_to_epoch "$MAINT_REPORT_GENERATED_AT" 2>/dev/null || true)" ;; esac
+  now_epoch="$(date -u '+%s')"
+  [ -n "$generated_epoch" ] || { MAINT_REPORT_STATE=failed; return 0; }
+  age_seconds=$((now_epoch - generated_epoch)); [ "$age_seconds" -lt 0 ] && age_seconds=0
+  [ "$age_seconds" -le $((MAINT_SCHEDULE_MAX_AGE * 86400)) ] || { MAINT_REPORT_STATE=stale; return 0; }
+  MAINT_REPORT_STATE=current
+}
+
+maintenance_write_report() {
+  local project_id="$1" principal="${2:-}" limit="$3" snapshot="$4" dir report base tmp hash generated
+  require_project "$project_id" dir
+  [ ! -e "$dir/maintenance" ] || [ ! -L "$dir/maintenance" ] || die 65 'maintenance directory symlink refused'
+  ensure_dir "$dir/maintenance"
+  report="$dir/maintenance/latest.md"; [ ! -L "$report" ] || die 65 'maintenance report symlink refused'
+  base="$snapshot/report.base"; tmp="$dir/maintenance/.latest.$$.tmp"; generated="$(now_utc)"
+  {
+    printf '%s\n' '---'
+    printf 'type: MaintenanceReport\ntitle: %s\nbrain_project_id: %s\nbrain_maintenance_schema: 1\nbrain_artifact_state: derived\nbrain_report_state: current\nbrain_maintenance_state: %s\nbrain_scope_principal: %s\nbrain_scope_snapshot_sha256: %s\nbrain_report_max_items: %s\n' \
+      "$(yaml_quote 'LLM-Brain maintenance report')" "$project_id" "$MAINT_HEALTH" "$(yaml_quote "${principal:-shared}")" "$MAINT_SCOPE_HASH" "$limit"
+    printf 'brain_count_expired_validity: %s\nbrain_count_stale_verification: %s\nbrain_count_unknown_validity: %s\nbrain_count_unresolved_conflict: %s\nbrain_count_unresolved_dependency: %s\nbrain_count_unresolved_inaccessible: %s\nbrain_count_invalid_cycle: %s\nbrain_count_pending_work: %s\nbrain_count_failed_work: %s\nbrain_count_recovered_work: %s\nbrain_count_orphaned_work: %s\nbrain_count_receipt_issues: %s\nbrain_count_index_issues: %s\nbrain_count_provenance_issues: %s\nbrain_count_retraction_residuals: %s\nbrain_count_total_findings: %s\n' \
+      "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_TOTAL_FINDINGS"
+    printf 'brain_independent_source_count: %s\nbrain_correlated_record_count: %s\n' "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
+    printf '%s\n' 'brain_schema_version: '"$SCHEMA_VERSION" '---'
+    cat "$snapshot/report.body"
+  } >"$base"
+  hash="$(maintenance_report_hash "$base")"
+  {
+    printf '%s\n' '---'
+    printf 'type: MaintenanceReport\ntitle: %s\nbrain_project_id: %s\nbrain_maintenance_schema: 1\nbrain_artifact_state: derived\nbrain_report_hash_sha256: %s\nbrain_report_state: current\nbrain_maintenance_state: %s\nbrain_scope_principal: %s\nbrain_scope_snapshot_sha256: %s\nbrain_report_max_items: %s\n' \
+      "$(yaml_quote 'LLM-Brain maintenance report')" "$project_id" "$hash" "$MAINT_HEALTH" "$(yaml_quote "${principal:-shared}")" "$MAINT_SCOPE_HASH" "$limit"
+    printf 'brain_count_expired_validity: %s\nbrain_count_stale_verification: %s\nbrain_count_unknown_validity: %s\nbrain_count_unresolved_conflict: %s\nbrain_count_unresolved_dependency: %s\nbrain_count_unresolved_inaccessible: %s\nbrain_count_invalid_cycle: %s\nbrain_count_pending_work: %s\nbrain_count_failed_work: %s\nbrain_count_recovered_work: %s\nbrain_count_orphaned_work: %s\nbrain_count_receipt_issues: %s\nbrain_count_index_issues: %s\nbrain_count_provenance_issues: %s\nbrain_count_retraction_residuals: %s\nbrain_count_total_findings: %s\n' \
+      "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_TOTAL_FINDINGS"
+    printf 'brain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_schema_version: %s\n---\n' "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT" "$SCHEMA_VERSION"
+    cat "$snapshot/report.body"
+  } >"$tmp"
+  mv -f "$tmp" "$report"; MAINT_REPORT_HASH="$(sha256_file "$report")"
+  printf '%s\n' "$report"
+}
+
+maintenance_json_output() {
+  local command="$1" project_id="$2" report_state="$3" report_hash="$4" reminder="$5" report_path="$6" schedule_file="$7" py
+  py="$(bridge_python 2>/dev/null || true)"; [ -n "$py" ] && [ -x "$py" ] || die 69 'Python 3 is unavailable for maintenance JSON output'
+  "$py" - "$command" "$project_id" "$MAINT_STATUS_HEALTH" "$MAINT_SCHEDULE_STATE" "$report_state" "$report_hash" "$reminder" "$report_path" "$schedule_file" "$MAINT_PRINCIPAL" "$MAINT_SCOPE_HASH" "$MAINT_ITEMS_FILE" "$MAINT_RECOMMENDATIONS_FILE" "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT" "$MAINT_SCHEDULE_NAME" "$MAINT_SCHEDULE_CADENCE" "$MAINT_SCHEDULE_RUNNER" "$MAINT_SCHEDULE_MAX_AGE" "$MAINT_LIMIT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(command, project_id, health, schedule_state, report_state, report_hash,
+ reminder, report_path, schedule_file, principal, scope_hash, items_path,
+ recommendations_path, expired, stale, unknown, conflict, dependency,
+ inaccessible, cycle, pending, failed, recovered, orphaned, receipts, index,
+ provenance, retraction, roots, correlated, schedule_name, schedule_cadence,
+ schedule_runner, schedule_max_age, items_limit) = sys.argv[1:]
+def number(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+counts = {
+    "expired_validity": number(expired), "stale_verification": number(stale),
+    "unknown_validity": number(unknown), "unresolved_conflict": number(conflict),
+    "unresolved_dependency": number(dependency), "unresolved_inaccessible": number(inaccessible),
+    "invalid_cycle": number(cycle), "pending_work": number(pending),
+    "failed_work": number(failed), "recovered_work": number(recovered),
+    "orphaned_work": number(orphaned), "receipt_issues": number(receipts),
+    "index_issues": number(index), "provenance_issues": number(provenance),
+    "retraction_residuals": number(retraction), "independent_source_count": number(roots),
+    "correlated_record_count": number(correlated),
+}
+counts["unresolved_state"] = counts["unresolved_conflict"] + counts["unresolved_dependency"] + counts["unresolved_inaccessible"] + counts["invalid_cycle"]
+counts["total_findings"] = sum(value for key, value in counts.items() if key not in ("independent_source_count", "correlated_record_count", "unresolved_state", "total_findings"))
+items = []
+try:
+    for line in Path(items_path).read_text(encoding="utf-8").splitlines()[:max(number(items_limit), 0)]:
+        fields = line.split("\t")
+        if len(fields) >= 6:
+            items.append({"category": fields[0], "ref": fields[1], "title": fields[2], "state": fields[3], "reason": fields[4], "recommendation": fields[5]})
+except OSError:
+    pass
+try:
+    recommendations = [line.strip() for line in Path(recommendations_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+except OSError:
+    recommendations = []
+schedule = {"name": schedule_name or None, "cadence": schedule_cadence or None, "runner": schedule_runner if schedule_state in ("declared-unverified", "disabled") else None}
+try:
+    schedule["max_age_days"] = int(schedule_max_age)
+except (TypeError, ValueError):
+    schedule["max_age_days"] = 7
+payload = {
+    "status": "ok" if health != "blocked" else "blocked", "command": command,
+    "project_id": project_id, "maintenance_state": health,
+    "schedule_state": schedule_state, "report_state": report_state,
+    "report_hash": report_hash or None, "report_path": report_path or None,
+    "schedule_file": schedule_file or None, "principal": principal or "shared",
+    "scope_snapshot_hash": scope_hash or None, "counts": counts,
+    "bounded_items": items, "recommendations": recommendations,
+    "reminder": reminder, "schedule": schedule,
+}
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+maintenance_human_output() {
+  local command="$1" report_state="$2" report_path="$3" report_hash="$4" category item title state reason recommendation
+  if [ "$command" = run ]; then command=ok; fi
+  printf 'maintenance=%s project_id=%s state=%s schedule_state=%s report_state=%s reminder=%s\n' "$command" "$MAINT_PROJECT_ID" "$MAINT_STATUS_HEALTH" "$MAINT_SCHEDULE_STATE" "$report_state" "$MAINT_REMINDER"
+  printf 'counts=expired:%s stale:%s unknown:%s conflicts:%s dependencies:%s inaccessible:%s cycles:%s pending:%s failed:%s recovered:%s orphaned:%s receipts:%s indexes:%s provenance:%s retractions:%s roots:%s correlated:%s\n' \
+    "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
+  [ -n "$report_path" ] && printf 'report=%s hash=%s\n' "$report_path" "${report_hash:-none}"
+  while IFS=$'\t' read -r category item title state reason recommendation; do
+   [ -n "$item" ] || continue
+    printf 'finding=%s category=%s state=%s reason=%s recommendation=%s\n' "$item" "$category" "$state" "$reason" "$recommendation"
+ done < <(head -n "$MAINT_LIMIT" "$MAINT_ITEMS_FILE")
+  [ "$MAINT_TOTAL_FINDINGS" -le "$MAINT_LIMIT" ] || printf 'findings_omitted=%s\n' "$((MAINT_TOTAL_FINDINGS - MAINT_LIMIT))"
+}
+
+maintenance_schedule_write() {
+  local project_id="$1" action="$2" name="$3" cadence="$4" runner="$5" max_age="$6" dir schedule tmp previous_hash previous_name previous_cadence previous_runner previous_max
+  require_project "$project_id" dir
+  [ ! -e "$dir/maintenance" ] || [ ! -L "$dir/maintenance" ] || die 65 'maintenance directory symlink refused'
+  ensure_dir "$dir/maintenance"; schedule="$dir/maintenance/schedule.md"
+  previous_hash=""; previous_name=""; previous_cadence=""; previous_runner=""; previous_max=""
+  if [ -f "$schedule" ] && [ ! -L "$schedule" ]; then
+    previous_hash="$(sha256_file "$schedule")"; previous_name="$(frontmatter_field "$schedule" brain_schedule_name)"; previous_cadence="$(frontmatter_field "$schedule" brain_schedule_cadence)"; previous_runner="$(frontmatter_field "$schedule" brain_schedule_runner)"; previous_max="$(frontmatter_field "$schedule" brain_schedule_max_age_days)"
+  fi
+  [ "$action" = declare ] || { name="${previous_name:-none}"; cadence="${previous_cadence:-none}"; runner="${previous_runner:-other}"; max_age="${previous_max:-7}"; }
+  tmp="$dir/maintenance/.schedule.$$.tmp"
+  {
+    printf '%s\n' '---'
+    printf 'type: MaintenanceSchedule\ntitle: %s\nbrain_project_id: %s\nbrain_schedule_state: %s\nbrain_schedule_name: %s\nbrain_schedule_cadence: %s\nbrain_schedule_runner: %s\nbrain_schedule_max_age_days: %s\nbrain_artifact_state: derived\nbrain_schema_version: %s\n' \
+      "$(yaml_quote 'LLM-Brain maintenance schedule')" "$project_id" "$([ "$action" = declare ] && printf declared-unverified || printf disabled)" "$(yaml_quote "$name")" "$(yaml_quote "$cadence")" "$runner" "$max_age" "$SCHEMA_VERSION"
+    if [ "$action" = declare ]; then
+      printf '%s\n' '---'
+      printf '# Maintenance schedule\n\nThis is an operator-declared host schedule, not proof that a scheduler is installed or active.\n\nName: `%s`  \nCadence: `%s`  \nRunner: `%s`\n' "$name" "$cadence" "$runner"
+    else
+      printf 'brain_schedule_previous_hash_sha256: %s\nbrain_schedule_disabled_at: %s\n---\n' "${previous_hash:-none}" "$(yaml_quote "$(now_utc)")"
+      printf '# Maintenance schedule disabled\n\nThe prior declaration is retained as a disabled marker. No scheduler was installed or stopped by LLM-Brain.\n'
+    fi
+  } >"$tmp"
+  mv -f "$tmp" "$schedule"; printf '%s\n' "$schedule"
+}
+
+cmd_maintenance_schedule() {
+  local action="${1:-}" project_id="${2:-}" name="" cadence="" runner=other max_age=7 dir file
+  shift 2 || true
+  [ -n "$project_id" ] || die 64 'maintenance schedule requires PROJECT_ID'
+  case "$action" in
+    declare)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --name) name="${2:-}"; shift 2 ;;
+          --cadence) cadence="${2:-}"; shift 2 ;;
+          --runner) runner="${2:-}"; shift 2 ;;
+          --max-age-days) max_age="${2:-}"; shift 2 ;;
+          *) die 64 "unknown maintenance schedule option: $1" ;;
+        esac
+      done
+      [ -n "$name" ] || die 64 'maintenance schedule declare requires --name TEXT'; [ -n "$cadence" ] || die 64 'maintenance schedule declare requires --cadence TEXT'
+      validate_scalar "$name" || die 65 'schedule name must be a single line'; validate_scalar "$cadence" || die 65 'schedule cadence must be a single line'
+      case "$runner" in hermes|codex|cron|other) ;; *) die 64 'schedule runner must be hermes, codex, cron, or other' ;; esac
+      case "$max_age" in ''|*[!0-9]*) die 64 '--max-age-days must be a non-negative integer' ;; esac
+      require_project "$project_id" dir; acquire_lock "project-$project_id"; maintenance_schedule_write "$project_id" declare "$name" "$cadence" "$runner" "$max_age" >/dev/null; file="$dir/maintenance/schedule.md"; release_lock
+      printf 'schedule=ok project_id=%s schedule_state=declared-unverified file=%s\n' "$project_id" "$file"
+      ;;
+    disable)
+      [ $# = 0 ] || die 64 "unknown maintenance schedule option: $1"; require_project "$project_id" dir; acquire_lock "project-$project_id"; maintenance_schedule_write "$project_id" disable '' '' other 7 >/dev/null; file="$dir/maintenance/schedule.md"; release_lock
+      printf 'schedule=disabled project_id=%s schedule_state=disabled file=%s\n' "$project_id" "$file"
+      ;;
+    *) die 64 'maintenance schedule requires declare or disable' ;;
+  esac
+}
+
+cmd_maintenance() {
+  local action="${1:-}" project_id="${2:-}" principal="" limit=20 json=0 strict=0 snapshot report report_state report_hash report_path schedule_file dir
+  if [ "$action" = schedule ]; then
+    local schedule_action="${2:-}" schedule_project_id="${3:-}"
+    shift 3 || true
+    cmd_maintenance_schedule "$schedule_action" "$schedule_project_id" "$@"
+    return $?
+  fi
+  shift 2 || true
+  [ -n "$project_id" ] || die 64 'maintenance requires PROJECT_ID'
+  case "$action" in preview|run|status) ;; *) die 64 'maintenance requires preview, run, status, or schedule' ;; esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --principal) principal="${2:-}"; shift 2 ;;
+      --limit) limit="${2:-}"; shift 2 ;;
+      --json) json=1; shift ;;
+      --strict) strict=1; shift ;;
+      *) die 64 "unknown maintenance option: $1" ;;
+    esac
+  done
+  validate_scalar "$principal" || die 65 '--principal must be a single line'; case "$principal" in *=*) die 65 "--principal cannot contain '='" ;; esac
+  require_positive_integer "$limit" || die 64 '--limit must be a positive integer'
+  MAINT_PROJECT_ID="$project_id"; MAINT_PRINCIPAL="$principal"; MAINT_LIMIT="$limit"; require_project "$project_id" dir; maintenance_schedule_read "$dir"
+  snapshot="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-maintenance.XXXXXX")"; maintenance_collect "$project_id" "$principal" "$snapshot"; MAINT_STATUS_HEALTH="$MAINT_HEALTH"
+  report_path="projects/$project_id/maintenance/latest.md"; schedule_file="projects/$project_id/maintenance/schedule.md"; report_state=missing; report_hash=""
+  if [ "$action" = run ]; then
+    maintenance_render_body "$snapshot" "$limit"; maintenance_write_report "$project_id" "$principal" "$limit" "$snapshot" >/dev/null; report="$dir/maintenance/latest.md"; report_hash="$(frontmatter_field "$report" brain_report_hash_sha256)"; report_state=current
+  elif [ "$action" = status ]; then
+    maintenance_report_read "$dir"; report_state="$MAINT_REPORT_STATE"; report_hash="$MAINT_REPORT_HASH"
+  fi
+  if [ "$report_state" = current ]; then MAINT_REMINDER=none; elif [ "$MAINT_SCHEDULE_STATE" = declared-unverified ]; then MAINT_REMINDER=report-stale; elif [ "$MAINT_SCHEDULE_STATE" = unavailable ]; then MAINT_REMINDER=unavailable; else MAINT_REMINDER=run-or-schedule; fi
+  if [ "$action" = status ] && [ "$report_state" != current ] && [ "$MAINT_STATUS_HEALTH" = healthy ]; then MAINT_STATUS_HEALTH=attention; fi
+  if [ "$json" = 1 ]; then maintenance_json_output "$action" "$project_id" "$report_state" "$report_hash" "$MAINT_REMINDER" "$report_path" "$schedule_file"; else maintenance_human_output "$action" "$report_state" "$report_path" "$report_hash"; fi
+  rm -rf "$snapshot"; if [ "$strict" = 1 ] && [ "$MAINT_STATUS_HEALTH" != healthy ]; then return 1; fi; return 0
+}
+
 is_scaffold_content() {
   body_after_frontmatter "$1" | grep -Eq '^Candidate statement: source .* was ingested into episodic memory|^Candidate statement: source context for |^Review whether this episode contains a reusable workflow before promotion\.'
 }
@@ -7931,6 +8549,7 @@ main() {
       ;;
     reflect) cmd_reflect "$@" ;;
     work) cmd_work "$@" ;;
+    maintenance) cmd_maintenance "$@" ;;
     bridge) cmd_bridge "$@" ;;
     run) cmd_run "$@" ;;
     reconcile) cmd_reconcile "$@" ;;

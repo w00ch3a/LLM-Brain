@@ -24,10 +24,15 @@ LLM-Brain is active infrastructure. “Passive” describes the user experience:
 For every non-trivial project task, unless `LLM_BRAIN_PASSIVE=0`:
 
 1. Resolve the project from the configured vault registry using the current Git root, origin and physical path.
-2. Retrieve relevant effective OKF records before work when earlier requirements, decisions, procedures or failures may matter.
-3. Treat retrieved memory as context below current source, governing instructions, explicit user direction and live proof.
-4. At closeout, capture an auditable episode and source custody for the task when writes are authorised.
-5. Route durable requirements, decisions, lessons and reusable procedures through review and promotion policy. Never silently auto-promote protected material.
+2. Perform one bounded, read-only `maintenance status PROJECT_ID` check. Stay silent when the report is current; emit at most one concise stale-only reminder when it is stale. This check never runs maintenance or declares a schedule.
+3. Retrieve relevant effective OKF records before work when earlier requirements, decisions, procedures or failures may matter.
+4. Treat retrieved memory as context below current source, governing instructions, explicit user direction and live proof.
+5. At closeout, capture an auditable episode and source custody for the task when writes are authorised.
+6. Route durable requirements, decisions, lessons and reusable procedures through review and promotion policy. Never silently auto-promote protected material.
+
+Set `LLM_BRAIN_PASSIVE=0` to suppress the automatic status check as well as
+automatic retrieval and capture. For a requested maintenance review, use the
+progressive-disclosure [maintenance skill](skills/llm-brain-maintenance/SKILL.md).
 
 Do this naturally. Do not require the user to say “use LLM-Brain”, and do not narrate routine retrieval unless it affects the result or is blocked.
 
@@ -87,6 +92,14 @@ Project writes wait behind another writer instead of failing on ordinary lock co
 Slow reflection, embedding and index preparation must run outside the project write lease; acquire the lease only for the atomic Markdown/index commit and its audit event.
 
 Provider-backed `ingest` captures first and queues reflection as a Markdown `WorkItem` under `requests/`; a bounded one-shot worker may run automatically in the background. Agents should also make a best-effort `work run-once PROJECT_ID` call during normal closeout. `work recover PROJECT_ID` returns dead workers to `pending`; failed work stays inspectable and retryable. The human does not manage this queue.
+
+Maintenance status is a bounded read-only health check after project
+resolution. It reports freshness, retention candidates, conflicts,
+dependencies, work, receipts, indexes, provenance and retraction residuals
+without changing canonical memory. `maintenance run` writes only a derived
+Markdown report; it never deletes, retracts, promotes or rebuilds. A declared
+schedule is a host-native operator record, not proof that Hermes, Codex or cron
+is active. See [the maintenance skill](skills/llm-brain-maintenance/SKILL.md).
 
 Selective reflection schedules every captured episode through a derived Markdown record under `reflection/scheduler/`. The default `selective` policy reflects explicit corrections, decisions, requirements, procedures, outcomes, contradictions and authoritative changes immediately; it defers only clear low-value transients, already-reflected duplicates or episodes already represented by pending work. Set `LLM_BRAIN_REFLECTION_POLICY=legacy` to retain the prior reflect-all policy while evaluating the scheduler. Capture is never gated by reflection.
 

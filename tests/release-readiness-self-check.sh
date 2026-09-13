@@ -92,6 +92,10 @@ compatibility_checks() {
     bash "$repo_root/tests/hermes-integration-self-check.sh"
 }
 
+maintenance_checks() {
+  bash "$repo_root/tests/maintenance-self-check.sh"
+}
+
 upgrade_checks() {
   bash "$repo_root/tests/upgrade-self-check.sh"
 }
@@ -248,6 +252,7 @@ fi
 run_group static static_checks
 run_group core core_checks
 run_group compatibility compatibility_checks
+run_group maintenance maintenance_checks
 run_group packaging packaging_checks
 run_group upgrades upgrade_checks
 run_group presentation presentation_checks

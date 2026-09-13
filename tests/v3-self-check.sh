@@ -443,7 +443,8 @@ chmod 755 "$provider"
 
 reflection="$($cli --root "$vault" reflect run "$project_id" --provider "$provider")"
 assert_contains "$reflection" 'episodes=1'
-assert_contains "$($cli --root "$vault" reflect run "$project_id" --provider "$provider")" 'episodes=0'
+reflection_repeat="$($cli --root "$vault" reflect run "$project_id" --provider "$provider")"
+assert_contains "$reflection_repeat" 'episodes=0'
 
 slow_provider="$fixture/slow-provider.sh"
 cat >"$slow_provider" <<'SLOW'
@@ -578,16 +579,18 @@ assert_contains "$(cat "$vault/projects/$project_id/review/claim_scaffold.md")" 
 assert_file "$vault/projects/$project_id/okf/retractions/claim_scaffold.md"
 assert_contains "$(cat "$vault/projects/$project_id/migrations/source-reconciliation.tsv")" 'recovered-legacy-md5'
 grep -Fxq "$preserved_reconciliation_row" "$vault/projects/$project_id/migrations/source-reconciliation.tsv" || fail "migration changed a terminal reconciliation row"
-assert_contains "$($cli --root "$vault" migrate check)" 'source_unresolved=1'
-assert_contains "$($cli --root "$vault" migrate check)" 'source_unrecoverable=1'
+post_migration_check="$($cli --root "$vault" migrate check)"
+assert_contains "$post_migration_check" 'source_unresolved=1'
+assert_contains "$post_migration_check" 'source_unrecoverable=1'
 $cli --root "$vault" validate-source "$project_id" procedure_revalidate_source "$source" --reason 'fixture current authority' >/dev/null
 if grep -Fq 'source_episode:' "$vault/projects/$project_id/okf/procedures/procedure_revalidate_source.md"; then fail "validate-source retained superseded episode dependency"; fi
 assert_contains "$(cat "$vault/projects/$project_id/okf/procedures/procedure_revalidate_source.md")" 'brain_source_hash_sha256:'
 reconciled="$($cli --root "$vault" migrate reconcile-sources "$project_id" --finalise-missing --reason 'fixture source bytes unavailable')"
 assert_contains "$reconciled" 'finalised=1'
 assert_contains "$(cat "$vault/projects/$project_id/episodes/episode_drifted_source.md")" 'brain_source_reconciliation_state: unrecoverable'
-assert_contains "$($cli --root "$vault" migrate check)" 'source_unresolved=0'
-assert_contains "$($cli --root "$vault" migrate check)" 'source_unrecoverable=2'
+post_reconcile_check="$($cli --root "$vault" migrate check)"
+assert_contains "$post_reconcile_check" 'source_unresolved=0'
+assert_contains "$post_reconcile_check" 'source_unrecoverable=2'
 assert_contains "$($cli --root "$vault" migrate verify)" 'migration_verify=ok'
 
 printf 'tamper\n' >>"$vault/projects/$project_id/audit.v2.tsv"

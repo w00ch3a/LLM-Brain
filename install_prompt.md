@@ -47,6 +47,7 @@ Apply this setup without making the user choose each item:
 - Use an existing local vector provider when available; otherwise use built-in lexical search. Include evidence and use the standard 4,000-token budget.
 - Enable privacy protections. Keep experiments and migrations off. For Hermes, enable the MemoryProvider and retain the built-in context compressor.
 - Keep `LLM_BRAIN_COMMITMENT_POLICY=shadow`: record derived transition decisions without changing existing promotion behaviour. Current-state resolution and procedure capsules remain explicit opt-in workflows.
+- Keep governed maintenance user-invocable: status is a bounded read-only check, reports are derived review candidates, and any schedule is host-native and separately verified.
 
 Configure only the agent host receiving this prompt. Mention other detected hosts after installation as optional additions; do not modify them automatically.
 
@@ -71,6 +72,7 @@ Must:
 - Install the PyYAML version pinned by `requirements-okf.lock`.
 - Back up existing host configuration or packages before replacing them and report the backup location.
 - Keep durable memory as Markdown. Do not add a database, daemon, remote memory service or external graph store.
+- Do not install a scheduler, zvec engine or other new core dependency. Maintenance never deletes, retracts, promotes or rebuilds memory automatically.
 
 Never:
 
@@ -91,6 +93,8 @@ For another local agent without a native plugin, use the host-neutral `bridge re
 3. Capture one clearly marked synthetic turn, replay it and prove the replay creates no duplicate episode.
 4. Confirm the test did not directly change canonical `okf/` memory and left no stuck work item.
 5. Confirm unavailable or malformed recall fails open so the user's agent still works.
+6. If maintenance is requested, confirm `maintenance status` is read-only and
+   that any report is derived rather than canonical.
 
 Do not use a real secret, private document or paid model call for testing.
 

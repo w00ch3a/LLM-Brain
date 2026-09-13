@@ -1,6 +1,6 @@
-# LLM-Brain v0.7.0 architecture reference (local candidate)
+# LLM-Brain architecture reference
 
-LLM-Brain v0.7.0 is the current local release candidate for a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction. Markdown and TSV remain the inspectable recovery surface; indexes, packs, receipts and other derived artefacts are never canonical truth.
+LLM-Brain is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction. Markdown and TSV remain the inspectable recovery surface; indexes, packs, receipts and other derived artefacts are never canonical truth.
 
 ## Data layers
 
@@ -12,6 +12,7 @@ LLM-Brain v0.7.0 is the current local release candidate for a portable, filesyst
 | Exceptions | `review/`, `quarantine/` | Candidates, conflicts and redaction metadata |
 | Derived retrieval | `indexes/` | Rebuildable |
 | Derived consumption | `context-packs/`, `adapters/`, `exports/` | Rebuildable |
+| Maintenance views | `maintenance/` | Bounded reports and schedule declarations; never canonical |
 
 The root `okf/index.md` contains only `okf_version: "0.2"` frontmatter plus progressive-disclosure links. Project identity is the normal `okf/project.md` concept. `okf/log.md` uses newest-first `## YYYY-MM-DD` groups. Every other Markdown file under `okf/` is a concept with parseable YAML frontmatter and a non-empty `type`.
 
@@ -58,6 +59,34 @@ Canonical records may carry optional temporal and lineage extensions: `brain_obs
 For the selected top 20 results, derived custody, episode provenance and `brain_derived_from` references are followed to root hashes with an eight-level, cycle-safe bound. Records sharing a root are one evidence group; unknown provenance is unconfirmed. `--explain`, bridge JSON and packs expose `evidence_group`, `independent_source_count`, `correlated_record_count` and `provenance_state`. Restricted paths, titles and hashes are never added to visible explanations.
 
 Evidence intent may expand each selected canonical record into a bounded lifecycle `evidence_bundles` result. Expansion follows explicit `brain_supports`, `brain_conflicts`, `brain_supersedes`, `brain_version_of`, `brain_derived_from` and `brain_depends_on` links, including safe reverse links where needed to show a successor or supporting record. It is deterministic, cycle-safe and budgeted; each bundle preserves role, state, bounded excerpt and source hash, with `warnings` and `incomplete` reporting hidden, unresolved, truncated or budget-limited relationships. It never treats a shared state key as a replacement relation, invents agreement, or rewrites canonical memory. Visibility is applied to every visited record, so inaccessible evidence cannot leak through counts, paths, titles or hashes.
+
+## Governed maintenance
+
+Maintenance is a bounded, read-only health view over the project. It reuses
+the existing lifecycle, work, receipt, index, provenance and retraction
+checks to report expiry, stale or unknown validity, conflicts and unresolved
+dependencies, pending or failed work, receipt/index failures, provenance gaps
+and retraction residuals. Findings are filtered by principal visibility before
+paths, titles, hashes or counts are rendered; unknown provenance remains
+unconfirmed and is never counted as independent support.
+
+`maintenance preview PROJECT_ID` and `maintenance status PROJECT_ID` do not
+write. `maintenance run PROJECT_ID` atomically writes only
+`projects/PROJECT_ID/maintenance/latest.md` with a derived `MaintenanceReport`
+(`brain_maintenance_schema: 1`, `brain_artifact_state: derived`,
+`brain_report_hash_sha256`, `brain_maintenance_state`, `brain_report_state`,
+`brain_scope_principal` and `brain_schema_version: 3`). Reports label expiry
+and retention as review candidates. They never delete, retract, promote or
+rebuild memory, and a failed run does not replace the last good report.
+
+`maintenance schedule declare` records a derived `MaintenanceSchedule` with
+the operator's name, cadence, runner and age bound. `disable` preserves a
+disabled marker. The declaration is not evidence that a host job is active:
+Hermes, Codex or cron remains responsible for scheduling and a recent
+successful report is the operational proof. `--strict` is an optional caller
+gate for `attention` or `blocked`; ordinary status is fail-open. This layer
+adds no OKF fields, schema migration, database, daemon, zvec engine, cloud
+backend or core dependency.
 
 ## Commitment decisions and procedure capsules
 
@@ -112,5 +141,5 @@ The public `upgrade` transaction:
 
 Codex package updates are source-aware. Git marketplaces use Codex's native marketplace refresh; local marketplaces are atomically replaced from the checksum-verified polyglot plugin archive before Codex refreshes its installed cache. Host inventory failures abort detection instead of silently falling back to a different installation type.
 
-The v0.7.0 local candidate reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. The four upgrades add no schema migration, daemon, model training, KV-cache integration, graph database or mandatory dependency.
+The current release reads schemas 1, 2 and 3. The automatic integration uses host-native skills, Claude `SessionStart`, Gemini context and an optional configured generic instruction file. It is active infrastructure with a passive user experience: the user does not need to invoke or manage it for each task. `LLM_BRAIN_PASSIVE=0` disables automatic use. The lifecycle adds no schema migration, daemon, model training, KV-cache integration, graph database or mandatory dependency.
 Retraction is a two-step safety boundary: `retract --preview` resolves the exact canonical target and emits a confirmation token; `retract --confirm TOKEN` records the tombstone and audit event. A preview never mutates the vault, and retraction does not delete source custody or historical episodes. Search and pack receipts are opt-in derived records (`--receipt`); normal reads do not create them.

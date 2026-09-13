@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain LLM-Brain"
+  short_description: "Inspect freshness, provenance and recovery health"
+  default_prompt: "Use $llm-brain-maintenance to inspect or run a bounded derived maintenance report."
