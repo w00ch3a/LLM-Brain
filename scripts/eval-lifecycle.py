@@ -1057,6 +1057,8 @@ def trace_row(
     roots: set[str] = set()
     for candidate in candidates:
         roots.update(provenance_roots(project_dir, candidate.path))
+    known_groups = Counter(candidate.evidence_group for candidate in candidates
+                           if candidate.provenance_state == "custodied" and candidate.evidence_group not in {"", "unknown"})
     provenance_ok: bool | None = None
     if query.require_provenance or query.require_independent_sources is not None:
         provenance_ok = bool(roots) and (
@@ -1117,6 +1119,7 @@ def trace_row(
         "future_leakage": future_leakage,
         "visibility_leakage": visibility_leakage,
         "root_count": len(roots),
+        "correlated_record_count": sum(max(0, count - 1) for count in known_groups.values()),
         "provenance_ok": provenance_ok,
         "unresolved_ok": unresolved_ok,
         "repair_ok": repair_ok,
@@ -1199,6 +1202,26 @@ def evaluate_query(
     metadata = parse_metadata(metadata_path)
     row["retrieval_degraded"] = metadata.get("degraded", "false") == "true"
     row["retrieval_mode"] = metadata.get("retrieval_mode", mode)
+    # Only rendered bridge context can prove a source was opened. Search hits
+    # alone cannot support that claim, so sample endpoint packs once per mode.
+    row.update(evidence_opened="unmeasured", evidence_incomplete="unmeasured", citation_present="unmeasured", rendered_context_bytes="unmeasured")
+    if mode in {"explicit", "evidence"} and repeat == 0 and checkpoint_label.startswith("horizon-") and not query.as_of:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="llm-brain-eval-query-", suffix=".txt") as query_file:
+            query_file.write(query.text)
+            query_file.flush()
+            bridge_args = ["bridge", "recall", "--source-root", str(project_dir.parent.parent.parent),
+                           "--project-id", family.family_id, "--query-file", query_file.name,
+                           "--strategy", "lexical", "--intent", MODE_INTENTS[mode], "--budget-tokens", "400"]
+            if query.principal:
+                bridge_args.extend(["--principal", query.principal])
+            if mode == "evidence":
+                bridge_args.append("--require-evidence")
+            payload = json.loads(run_cli(cli, vault, bridge_args).stdout)
+        context = payload.get("context_markdown", "")
+        row.update(evidence_opened=bool(payload.get("evidence_opened")),
+                   evidence_incomplete=bool(payload.get("evidence_incomplete")),
+                   citation_present="Reference: `" in context and "Hash: `" in context,
+                   rendered_context_bytes=len(context.encode("utf-8")))
     row["memory_write_cost"] = runtime.seed_write_cost + runtime.write_cost
     row["memory_write_bytes"] = runtime.seed_write_bytes + runtime.write_bytes
     row["operation_counts"] = dict(runtime.operation_counts)
@@ -1375,6 +1398,10 @@ def summary(rows: list[dict[str, Any]], repeats: int) -> dict[str, Any]:
             "future_leakage_rate": rate(mode_rows, "future_leakage"),
             "visibility_leakage_rate": rate(mode_rows, "visibility_leakage"),
             "provenance_rate": rate(mode_rows, "provenance_ok"),
+            "correlated_record_count": sum(row["correlated_record_count"] for row in mode_rows),
+            "evidence_opened_rate": rate(mode_rows, "evidence_opened"),
+            "evidence_incomplete_rate": rate(mode_rows, "evidence_incomplete"),
+            "citation_present_rate": rate(mode_rows, "citation_present"),
             "capsule_validation_rate": rate(mode_rows, "capsule_validation_ok"),
             "repair_selective_rate": rate(mode_rows, "repair_ok"),
             "poisoning_safe_rate": rate(mode_rows, "poisoning_safe"),
@@ -1453,6 +1480,7 @@ def summary(rows: list[dict[str, Any]], repeats: int) -> dict[str, Any]:
         "operation_elapsed_ms": operation_elapsed_ms,
         "checkpoint_rows": sum(1 for row in rows if row.get("checkpoint_evaluated")),
         "horizon_endpoint_rows": sum(1 for row in rows if row.get("horizon_endpoint")),
+        "capture_receipt_completion_rate": "unmeasured",
         "model_accuracy_note": "host-scored answer text only; runner outcome is not accuracy",
         "experiments": experiments,
         "repair_experiment": repair_experiment,
@@ -1531,6 +1559,7 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         "future_leakage",
         "visibility_leakage",
         "root_count",
+        "correlated_record_count",
         "provenance_ok",
         "repair_ok",
         "capsule_validation_ok",
@@ -1544,6 +1573,10 @@ def write_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
         "elapsed_ms",
         "answer_outcome",
         "answer_accuracy",
+        "evidence_opened",
+        "evidence_incomplete",
+        "citation_present",
+        "rendered_context_bytes",
         "retrieval_degraded",
     ]
     with path.open("w", encoding="utf-8", newline="") as stream:

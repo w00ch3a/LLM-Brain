@@ -60,6 +60,8 @@ For the selected top 20 results, derived custody, episode provenance and `brain_
 
 Evidence intent may expand each selected canonical record into a bounded lifecycle `evidence_bundles` result. Expansion follows explicit `brain_supports`, `brain_conflicts`, `brain_supersedes`, `brain_version_of`, `brain_derived_from` and `brain_depends_on` links, including safe reverse links where needed to show a successor or supporting record. It is deterministic, cycle-safe and budgeted; each bundle preserves role, state, bounded excerpt and source hash, with `warnings` and `incomplete` reporting hidden, unresolved, truncated or budget-limited relationships. It never treats a shared state key as a replacement relation, invents agreement, or rewrites canonical memory. Visibility is applied to every visited record, so inaccessible evidence cannot leak through counts, paths, titles or hashes.
 
+Rendered evidence has a stricter meaning than a retrieved reference. `evidence_opened=true` requires the renderer to read a visible `sources/` custody file and match its expected SHA-256 (from its content-addressed name or an explicit source hash). A missing, changed, hidden or merely referenced source leaves `evidence_incomplete=true`; a budget omission does too. This proves byte custody and access only, not semantic support. Explicit evidence and current-state rendering place unresolved warnings first and prefer distinct verified source roots under a tight budget; evidence, required-evidence and current-state pack identities include selected and supporting file hashes, so changed custody cannot reuse an old pack. Factual retrieval order and Hermes prefetch remain unchanged. New opt-in retrieval receipts retain JSONL schema v1 and its existing fields, add `receipt_identity_version: 2`, and bind principal, intent, as-of and actually rendered selection to idempotency. Existing receipt lines are not rewritten.
+
 ## Governed maintenance
 
 Maintenance is a bounded, read-only health view over the project. It reuses
@@ -105,6 +107,8 @@ directly. The optional `ContextEngine` subclasses Hermes' native
 the sole recall injector and the memory provider continues capture. Its
 `select_context()` result is deterministic, bounded and fail-open, and never
 mutates persisted conversation history.
+
+Hermes pre-compression checkpoint API v2 is supported without changing the provider selector or six configuration keys. Best-effort capture remains asynchronous by default. Only when Hermes explicitly requires a checkpoint does the provider synchronously capture its normalised direct user/assistant messages, require a matching durable `bridge capture` completion receipt, and raise on failure so Hermes retains the uncompressed transcript. A pending or committed outbox file without the bridge receipt is not checkpoint proof. Worker threads carry the selected profile context through Hermes' context-thread helper or a `contextvars` fallback. The operator must account for Hermes' other compaction paths disabled by `compression.checkpoint_required`.
 
 `bridge recall` and `bridge capture` are host-neutral JSON transport commands.
 Project resolution uses a configured ID, the supplied workspace identity, or

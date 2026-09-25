@@ -1,0 +1,14 @@
+# 25 September 2026 — evidence-first host memory comparison
+
+This comparison separates host-documented capability, shipped LLM-Brain behaviour and measured local proof. It is not a claim that another host's memory system has been installed or adopted.
+
+| Source | Useful host capability | LLM-Brain response | Boundary |
+|---|---|---|---|
+| [Hermes MemoryProvider](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin/) | Profile-scoped lifecycle, optional compression checkpoint API v2 | Context-bound outbox worker; strict direct-message capture only when Hermes requires a checkpoint | Default prefetch remains factual and capture remains non-blocking. A bridge completion receipt, not an outbox write, proves strict capture. |
+| [OpenClaw memory configuration](https://docs.openclaw.ai/reference/memory-config) | Scoped recall and index health; session notes can overlap with memory imports | Existing non-canonical staging now recognises LLM-Brain export envelopes for 2026.9.2 and 2026.9.6, rejects private/cross-principal and duplicate session-note entries | These descriptors are LLM-Brain envelopes, not a native OpenClaw profile format. No automatic transcript ingest or second canonical writer. |
+| [Pi extensions](https://pi.dev/docs/latest/extensions) and [sessions](https://pi.dev/docs/latest/sessions) | Branch-aware sessions and extension hooks | Use the existing LLM-Brain CLI/skill for approved durable project knowledge | Session branches remain Pi history; no new native adapter. |
+| [Oh My Pi memory](https://omp.sh/docs/memory) | Session history is separate from optional memory backends | Use the existing LLM-Brain CLI/skill when durable project memory is wanted | Do not enable a second writable memory backend as canonical truth by accident. |
+| [Claude Code memory](https://code.claude.com/docs/en/memory) | Instructions and auto-memory are distinct surfaces | Keep AGENTS/skill instructions separate from reviewed OKF knowledge | Do not import full transcripts or duplicate canonical writers. |
+| [Execution provenance](https://arxiv.org/abs/2609.25913) and [memory utility](https://arxiv.org/abs/2608.29605) research | Motivation to measure whether retrieved evidence affects the answer | Add custody-opened, citation, correlation and bounded-context metrics to the existing lifecycle harness | Search hits and hashes do not prove semantic support or model-answer improvement. |
+
+Shipped source in this checkout remains filesystem-first OKF v0.2 Markdown in storage schema 3. JSON is bridge transport; receipts and reports are derived. The focused self-checks exercise custody mismatch, receipt identity, checkpoint retry and OpenClaw staging. A synthetic fixture is not proof of a live host installation; the real-source Hermes release gate must use the tagged host source. No learned ranker, graph database, cloud backend, daemon or new core dependency was added.

@@ -13,7 +13,7 @@ Hermes activates the provider through `hermes memory setup llm-brain` and `memor
 - local availability checks and profile-scoped configuration;
 - pre-request recall through `llm-brain bridge recall`;
 - non-blocking turn capture through `llm-brain bridge capture`;
-- session switch/end and pre-compression capture;
+- session switch/end and pre-compression capture, with optional checkpoint API v2;
 - built-in memory-write and parent-delegation capture;
 - an atomic, recoverable Markdown outbox;
 - bounded shutdown draining;
@@ -96,6 +96,10 @@ Records live under `$HERMES_HOME/llm-brain/outbox/`. A short-lived standard-libr
 
 Hermes keeps working when recall times out or returns malformed JSON. Capture failures stay in the outbox with bounded attempts and error state.
 
+By default pre-compression observation is best-effort and non-blocking. The outbox is durable work, but writing it is **not** a bridge completion receipt. On Hermes builds with checkpoint API v2, an operator may explicitly set `compression.checkpoint_required: true`. In that mode LLM-Brain synchronously captures Hermes' normalised direct user/assistant messages and returns success only after `bridge capture` reports a matching request ID, episode reference and source hash. Failure raises so Hermes keeps the uncompressed transcript for retry. Sensitive direct text is redacted before custody; that is a privacy boundary, not lossless transcript backup. Worker threads preserve the active Hermes profile context; older Hermes builds use a standard-library fallback.
+
+This setting is not needed for ordinary use. Hermes documents that required checkpoints disable server-native compaction, micro-compaction and `codex_app_server` compaction paths; verify the host's desired compression behaviour before enabling it. No LLM-Brain selector configuration change is required.
+
 ## Host-neutral bridge
 
 Other local agents can use the same JSON transport:
@@ -106,6 +110,8 @@ llm-brain bridge capture --source-root PATH --record FILE
 ```
 
 JSON is transport only. Source custody, episodes, reviews and canonical OKF remain Markdown in the vault.
+
+`evidence_opened` means a visible custody source was read and its expected SHA-256 matched while rendering, not merely that a reference appeared in search. `evidence_incomplete` covers hidden, missing, changed, unverified and budget-omitted sources. These flags prove custody, not that an answer is semantically correct. New opt-in retrieval receipts retain their v1 JSONL shape, add identity version 2 and include rendered selection, principal, intent and as-of in idempotency; existing saved receipts are unchanged.
 
 Current-state context keeps unresolved records in the bounded `context_markdown` warning section. Malformed JSON, unsupported fields and bridge timeouts remain fail-open. The MemoryProvider continues durable capture while the ContextEngine is selected, and remains suppressed as an injector in that mode. Native Hermes compression, token accounting, model switching, message ordering and tool-call/result pairing are untouched. Procedure capsules are prepared and started explicitly through the CLI; Hermes does not execute or inject them.
 

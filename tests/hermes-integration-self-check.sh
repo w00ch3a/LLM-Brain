@@ -476,6 +476,41 @@ profile_two.shutdown()
 assert list((profile_two_home / "llm-brain/outbox/committed").glob("*.md"))
 assert not any("isolated record" in path.read_text(encoding="utf-8") for path in (hermes_home / "llm-brain/outbox/committed").glob("*.md"))
 
+# API v2 only reports success after the bridge returns a durable, matching
+# completion receipt. A failed checkpoint leaves the uncompressed evidence
+# retryable; a background outbox write is not a checkpoint.
+assert provider.pre_compress_checkpoint_api_version == 2
+checkpoint = [{"role": "user", "content": "checkpoint user evidence"}, {"role": "assistant", "content": "checkpoint assistant evidence"}]
+before_checkpoint = len(list((vault / "projects/proj_hermes_self_check/episodes").rglob("*.md")))
+assert provider.on_pre_compress(checkpoint, require_checkpoint=True) == ""
+after_checkpoint = len(list((vault / "projects/proj_hermes_self_check/episodes").rglob("*.md")))
+assert after_checkpoint == before_checkpoint + 1
+assert provider.on_pre_compress(checkpoint, require_checkpoint=True) == ""
+assert len(list((vault / "projects/proj_hermes_self_check/episodes").rglob("*.md"))) == after_checkpoint
+assert any("brain_bridge_receipt_sha256:" in path.read_text(encoding="utf-8") for path in (hermes_home / "llm-brain/outbox/committed").glob("*.md"))
+real_bridge_call = module._bridge_call
+module._bridge_call = lambda *args, **kwargs: None
+retry_messages = [{"role": "user", "content": "checkpoint retry evidence"}]
+try:
+    provider.on_pre_compress(retry_messages, require_checkpoint=True)
+except RuntimeError as exc:
+    assert "no durable bridge completion receipt" in str(exc)
+else:
+    raise AssertionError("checkpoint without a bridge receipt succeeded")
+assert any("checkpoint retry evidence" in path.read_text(encoding="utf-8") for path in (hermes_home / "llm-brain/outbox").glob("*.md"))
+module._bridge_call = real_bridge_call
+assert provider.on_pre_compress(retry_messages, require_checkpoint=True) == ""
+
+import contextvars
+profile_marker = contextvars.ContextVar("llm_brain_profile_test", default="missing")
+observed_profiles = []
+probe = module.LLMBrainMemoryProvider()
+profile_marker.set("profile-two")
+probe._drain = lambda: observed_profiles.append(profile_marker.get())
+probe._start_drain()
+probe._drain_thread.join(timeout=2)
+assert observed_profiles == ["profile-two"]
+
 class MemoryCollector:
     def __init__(self): self.provider = None; self.providers = []
     def register_memory_provider(self, provider): self.provider = provider; self.providers.append(provider)
@@ -553,7 +588,7 @@ PY
 
 # Use Hermes' own environment for the native ContextCompressor contract when
 # available; the isolated fake above remains the dependency-free plugin test.
-hermes_python="$hermes_root/venv/bin/python"
+hermes_python="${HERMES_PYTHON:-$hermes_root/venv/bin/python}"
 if [ -x "$hermes_python" ]; then
   PYTHONPATH="$hermes_root" HERMES_HOME="$hermes_home" "$hermes_python" - "$repo_root" "$vault" <<'PY'
 import copy
@@ -568,9 +603,25 @@ spec = importlib.util.spec_from_file_location("llm_brain_hermes_native", module_
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 from agent.context_compressor import ContextCompressor
+from agent.memory_provider import spawn_context_thread
+from agent.memory_manager import MemoryManager
 
 provider = module.LLMBrainMemoryProvider()
 assert not inspect.isabstract(provider.__class__)
+assert module.spawn_context_thread is spawn_context_thread
+native_home = vault.parent / "native-hermes-checkpoint"
+provider.save_config({
+    "vault_root": str(vault), "cli_path": str(repo_root / "bin/llm-brain"),
+    "project_id": "proj_hermes_self_check", "strategy": "lexical",
+    "recall_budget_tokens": 4000, "timeout_seconds": 10,
+}, str(native_home))
+provider.initialize("native-session", hermes_home=str(native_home), agent_workspace=str(vault.parent / "workspace"), agent_context="primary")
+assert provider.on_pre_compress([{"role": "user", "content": "native checkpoint evidence"}], require_checkpoint=True) == ""
+assert any("brain_bridge_receipt_sha256:" in path.read_text(encoding="utf-8") for path in (native_home / "llm-brain/outbox/committed").glob("*.md"))
+manager = object.__new__(MemoryManager)
+manager._providers = [provider]
+assert manager.supports_pre_compress_checkpoint()
+assert manager.on_pre_compress([], evidence_messages=[{"role": "user", "content": "native dispatcher evidence"}], require_checkpoint=True) == ""
 engine = module.LLMBrainContextEngine(config={
     "vault_root": str(vault), "cli_path": str(repo_root / "bin/llm-brain"),
     "project_id": "proj_hermes_self_check", "strategy": "lexical",
@@ -597,7 +648,9 @@ package_dir="$fixture/package"
 # Exercise Hermes' real user-plugin discovery paths for both registrations.
 mkdir -p "$hermes_home/plugins/llm-brain"
 cp "$package_dir/__init__.py" "$package_dir/plugin.yaml" "$hermes_home/plugins/llm-brain/"
-PYTHONPATH="$hermes_root" HERMES_HOME="$hermes_home" python3 - "$hermes_home" <<'PY' 2>/dev/null
+discovery_python="$hermes_python"
+[ -x "$discovery_python" ] || discovery_python="$(command -v python3)"
+PYTHONPATH="$hermes_root" HERMES_HOME="$hermes_home" "$discovery_python" - "$hermes_home" <<'PY'
 import sys
 import types
 from pathlib import Path

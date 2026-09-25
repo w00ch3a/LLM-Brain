@@ -168,6 +168,25 @@ except LaneError as exc:
     assert "exceeds 10 MiB bound" in str(exc)
 else:
     raise AssertionError("oversized inline OpenClaw content unexpectedly passed")
+new = dict(base, version="2026.9.6", profile_id="openclaw-memory-core-2026.9.6")
+assert normalise_openclaw(new, Path("/tmp"))["version"] == "2026.9.6"
+duplicate = dict(new, entries=[
+    {"path": "memory/one.md", "content": "first note", "session_id": "s1"},
+    {"path": "memory/two.md", "content": "second note", "session_id": "s1"},
+])
+try:
+    normalise_openclaw(duplicate, Path("/tmp"))
+except LaneError as exc:
+    assert "duplicate OpenClaw session-note" in str(exc)
+else:
+    raise AssertionError("duplicate session notes unexpectedly passed")
+transcript = dict(new, entries=[{"path": "memory/transcript.md", "content": "session transcript", "source_type": "session-transcript"}])
+try:
+    normalise_openclaw(transcript, Path("/tmp"))
+except LaneError as exc:
+    assert "session transcripts are not staged" in str(exc)
+else:
+    raise AssertionError("session transcript unexpectedly staged")
 PY
 
 inspect_path="$fixture/inspect.json"
@@ -191,6 +210,21 @@ assert [item["path"] for item in value["entries"]] == ["memory/note.md"]
 assert_file "$inspect_path"
 cmp "$inspect_path" <(printf '%s\n' "$inspect_output") || fail "OpenClaw inspect output file was not deterministic"
 [ "$(tree_digest "$project_dir/okf")" = "$canonical_before" ] || fail "inspect mutated canonical OKF"
+
+python3 - "$profile_root/profile.json" "$profile_root/memory/note.md" "$fixture/profile-2026.9.6.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["version"] = "2026.9.6"
+value["profile_id"] = "openclaw-memory-core-2026.9.6"
+value["entries"][0]["content"] = open(sys.argv[2], encoding="utf-8").read()
+with open(sys.argv[3], "w", encoding="utf-8") as stream:
+    json.dump(value, stream)
+PY
+new_inspect="$(LLM_BRAIN_EXPERIMENT_OPENCLAW=1 "$cli" --root "$vault" adapters openclaw inspect "$project_id" "$fixture/profile-2026.9.6.json")"
+printf '%s\n' "$new_inspect" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["openclaw_version"] == "2026.9.6" and p["profile_id"] == "openclaw-memory-core-2026.9.6"'
+new_stage="$(LLM_BRAIN_EXPERIMENT_OPENCLAW=1 "$cli" --root "$vault" adapters openclaw stage "$project_id" "$fixture/profile-2026.9.6.json" --output "$fixture/openclaw-stage-2026.9.6")"
+printf '%s\n' "$new_stage" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "staged" and p["openclaw_version"] == "2026.9.6" and p["canonical_write"] is False'
+[ "$(tree_digest "$project_dir/okf")" = "$canonical_before" ] || fail "2026.9.6 inspect mutated canonical OKF"
 
 stage_dir="$fixture/openclaw-stage"
 stage_output="$(

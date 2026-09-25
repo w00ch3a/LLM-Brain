@@ -8,6 +8,7 @@ CLI and making the adapter usable by other hosts as well.
 from __future__ import annotations
 
 import copy
+import contextvars
 import hashlib
 import json
 import os
@@ -25,6 +26,12 @@ try:
 except ImportError:  # pragma: no cover - standalone syntax checks only.
     class MemoryProvider:  # type: ignore[no-redef]
         pass
+try:
+    from agent.memory_provider import spawn_context_thread
+except ImportError:  # Older Hermes builds do not expose the helper.
+    def spawn_context_thread(target: Any, *, name: str, daemon: bool = True) -> threading.Thread:
+        context = contextvars.copy_context()
+        return threading.Thread(target=lambda: context.run(target), name=name, daemon=daemon)
 
 try:
     from agent.context_compressor import ContextCompressor
@@ -720,6 +727,7 @@ def _recall(
 
 class LLMBrainMemoryProvider(MemoryProvider):
     """Hermes persistent-memory provider backed by the LLM-Brain CLI."""
+    pre_compress_checkpoint_api_version = 2
 
     @property
     def name(self) -> str:
@@ -793,7 +801,31 @@ class LLMBrainMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         self._start_drain()
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: List[Dict[str, Any]], *, require_checkpoint: bool = False) -> str:
+        if require_checkpoint:
+            if self._agent_context not in {"", "primary"}:
+                raise RuntimeError("LLM-Brain checkpoint is unavailable outside the primary context")
+            direct = []
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    raise RuntimeError("LLM-Brain checkpoint requires plain-text direct messages")
+                if not content.strip():
+                    continue
+                direct.append(f"[{message['role']}] {content}")
+            if not direct:
+                raise RuntimeError("LLM-Brain checkpoint has no direct messages")
+            transcript = "\n\n".join(direct)
+            request_id = _sha(f"{self._source_root}|{self._principal}|{self._session_id}|checkpoint|{transcript}")[:24]
+            record = _turn_record(
+                request_id, self._source_root, self._session_id, self._principal,
+                self._platform, self._agent_identity, "pre-compress-checkpoint",
+                transcript, "", [], {"message_count": len(direct)},
+            )
+            self._checkpoint_capture(request_id, record)
+            return ""
         if self._agent_context in {"", "primary"} and messages:
             digest = _sha(json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str))
             request_id = _sha(f"{self._session_id}|pre-compress|{digest}")[:24]
@@ -892,8 +924,42 @@ class LLMBrainMemoryProvider(MemoryProvider):
         with self._drain_lock:
             if self._drain_thread and self._drain_thread.is_alive():
                 return
-            self._drain_thread = threading.Thread(target=self._drain, name="llm-brain-outbox", daemon=True)
+            self._drain_thread = spawn_context_thread(self._drain, name="llm-brain-outbox", daemon=True)
             self._drain_thread.start()
+
+    def _checkpoint_capture(self, request_id: str, record: str) -> None:
+        outbox = self._hermes_home / "llm-brain" / "outbox"
+        running = outbox / "running"
+        committed = outbox / "committed" / f"{request_id}.md"
+        running.mkdir(parents=True, exist_ok=True)
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        if committed.exists() and "brain_bridge_receipt_sha256:" in committed.read_text(encoding="utf-8"):
+            return
+        pending = outbox / f"{request_id}.md"
+        _atomic_write(pending, record)
+        claimed = running / f"{os.getpid()}-{threading.get_ident()}-{request_id}.md"
+        try:
+            os.replace(pending, claimed)
+        except OSError as exc:
+            raise RuntimeError("LLM-Brain checkpoint is pending another writer") from exc
+        try:
+            result = _bridge_call(
+                self._config, self._source_root,
+                ["capture", "--source-root", str(self._source_root), "--record", str(claimed)]
+                + (["--project-id", str(self._config["project_id"])] if self._config.get("project_id") else []),
+            )
+            if not result or result.get("status") != "ok" or result.get("complete") is not True or result.get("request_id") != request_id or not result.get("episode_ref") or not result.get("source_hash"):
+                raise RuntimeError("LLM-Brain checkpoint has no durable bridge completion receipt")
+            receipt_hash = _sha(json.dumps(result, sort_keys=True, separators=(",", ":")))
+            final = record.replace("brain_processing_state: pending\n", "brain_processing_state: committed\n" +
+                                   f"brain_bridge_receipt_sha256: {receipt_hash}\n" +
+                                   f"brain_result_ref: {_yaml_scalar(str(result['episode_ref']))}\n", 1)
+            _atomic_replace(claimed, final)
+            os.replace(claimed, committed)
+        except Exception:
+            if claimed.exists():
+                os.replace(claimed, pending)
+            raise
 
     @staticmethod
     def _claim_owner_alive(path: Path) -> bool:

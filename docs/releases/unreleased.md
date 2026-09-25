@@ -7,6 +7,22 @@ record. `VERSION` remains the package-version authority.
 
 ## LLM-Brain upgrade work in progress
 
+- Evidence-first rendering checks visible custody bytes against their expected
+  SHA-256 before claiming `evidence_opened`. Explicit evidence/current-state
+  packs lead with unresolved warnings and use distinct verified roots first;
+  omitted or unverified evidence is marked incomplete. Opt-in receipt identity
+  version 2 includes principal, intent, as-of and rendered selection while
+  retaining existing JSONL fields and leaving older receipts untouched.
+- Hermes' profile-bound worker and optional checkpoint API v2 keep normal
+  capture non-blocking. When the operator requires a compression checkpoint,
+  direct-message capture must return a matching durable bridge receipt or
+  Hermes retains the uncompressed transcript. This requires real tagged-host
+  validation; no selector keys or factual prefetch defaults change.
+- The explicit OpenClaw staging envelope accepts the tested 2026.9.2 and
+  2026.9.6 descriptors, but rejects session transcripts, duplicate session
+  notes and private/cross-principal entries. It is not a native OpenClaw
+  profile parser and does not create a second canonical writer.
+
 - Procedure capsules can declare explicit dependencies. `run prepare` records
   dependency references, content hashes and a dependency snapshot;
   `run validate` is read-only; `run start --capsule` rechecks the closure under

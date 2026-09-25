@@ -106,6 +106,22 @@ An answer runner can add separately labelled outcomes and token counts. Runner
 results never replace fixture scoring, and no answer runner means model-answer
 accuracy is reported as unmeasured rather than inferred from retrieval hits.
 
+Endpoint samples for explicit current-state and evidence intent now run the
+actual bridge renderer once per query/mode. The trace reports whether a
+hash-verified custody source was opened, whether evidence stayed incomplete,
+whether a reference/hash citation was rendered, rendered context bytes, and
+correlated record counts. Samples with an as-of scope unsupported by bridge
+recall remain `unmeasured` rather than silently dropping that scope. Search
+hits alone never count as opened evidence. This is a custody/citation check,
+not a semantic answer-quality score. The existing no-answer fixtures score
+deterministic abstention; model-level justified abstention still requires an
+answer runner. Hermes checkpoint retry and host compaction are tested in the
+integration gate, not inferred from these repository-only scenarios. Direct
+capture receipt completion and causal tool-evidence effects remain unmeasured
+by the batch lifecycle harness; its source-custody checks are not renamed as
+completion receipts. Model-upgrade answer quality remains unmeasured without
+explicit writer/reader CLIs and an answer runner.
+
 Each run identity and trace also records the provider, provider version and
 commit, model and embedding dimension, repository commit, build status,
 warm/cold state, availability, degraded path, declared evaluation budget and

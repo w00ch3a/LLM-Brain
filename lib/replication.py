@@ -27,8 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 SCHEMA_VERSION = 3
 OKF_VERSION = "0.2"
 REPLICATION_FORMAT = "llm-brain-replication.v1"
-OPENCLAW_VERSION = "2026.9.2"
-OPENCLAW_PROFILE = "openclaw-memory-core-2026.9.2"
+OPENCLAW_VERSIONS = {"2026.9.2", "2026.9.6"}
 MAX_FILE_BYTES = 10 * 1024 * 1024
 READ_ONLY_POLICY = {
     "external_observation": True,
@@ -1058,11 +1057,11 @@ def profile_alias(profile: Mapping[str, Any], keys: Sequence[str], label: str) -
 
 def normalise_openclaw(profile: Mapping[str, Any], base: Path, requested_scope: Optional[str] = None, requested_principal: Optional[str] = None) -> Dict[str, Any]:
     version = profile_alias(profile, ("version", "openclaw_version", "profile_version"), "version")
-    if version != OPENCLAW_VERSION:
-        error("unsupported OpenClaw version; expected %s" % OPENCLAW_VERSION, 65)
+    if not isinstance(version, str) or version not in OPENCLAW_VERSIONS:
+        error("unsupported OpenClaw version; expected one of %s" % ", ".join(sorted(OPENCLAW_VERSIONS)), 65)
     profile_id = profile.get("profile_id")
-    if profile_id != OPENCLAW_PROFILE:
-        error("unsupported OpenClaw profile; expected %s" % OPENCLAW_PROFILE, 65)
+    if profile_id != "openclaw-memory-core-" + version:
+        error("unsupported OpenClaw profile for version %s" % version, 65)
     validate_read_only_policy(profile, "OpenClaw profile", require_all=True)
     scope = profile_alias(profile, ("scope", "visibility"), "scope") or "project"
     if not isinstance(scope, str) or scope not in {"project", "principal"}:
@@ -1074,11 +1073,14 @@ def normalise_openclaw(profile: Mapping[str, Any], base: Path, requested_scope: 
         error("OpenClaw principal scope is not exact", 65)
     if requested_principal and requested_principal != principal:
         error("OpenClaw principal does not match requested principal", 73)
+    if sum(bool(profile.get(key)) for key in ("entries", "memories", "records")) > 1:
+        error("duplicate OpenClaw entry representations", 65)
     raw_entries = profile.get("entries") or profile.get("memories") or profile.get("records") or []
     if not isinstance(raw_entries, list):
         error("OpenClaw profile entries are not a list", 65)
     entries: List[Dict[str, Any]] = []
     seen: Set[str] = set()
+    seen_sessions: Set[str] = set()
     protected_scopes = {"private", "restricted", "secret", "quarantine"}
     for raw in raw_entries:
         if isinstance(raw, str):
@@ -1141,6 +1143,13 @@ def normalise_openclaw(profile: Mapping[str, Any], base: Path, requested_scope: 
                 continue
             error("OpenClaw entry is protected or secret", 65)
         source_type = metadata_text(raw.get("source_type") or raw.get("type"), "markdown", "source_type")
+        if source_type.lower() in {"session", "transcript", "session-transcript"}:
+            error("OpenClaw session transcripts are not staged as memory", 65)
+        session_id = raw.get("session_id") or content_meta.get("brain_session_id")
+        if session_id:
+            if not isinstance(session_id, str) or session_id in seen_sessions:
+                error("duplicate OpenClaw session-note representation", 65)
+            seen_sessions.add(session_id)
         observed_at = metadata_text(raw.get("observed_at") or raw.get("timestamp") or raw.get("created_at"), "unknown", "observed_at")
         resource = metadata_text(raw.get("resource") or raw.get("origin"), "openclaw", "resource")
         seen.add(path)
@@ -1156,11 +1165,11 @@ def normalise_openclaw(profile: Mapping[str, Any], base: Path, requested_scope: 
             "content": data,
         })
     entries.sort(key=lambda item: item["path"])
-    return {"profile_id": OPENCLAW_PROFILE, "version": OPENCLAW_VERSION, "scope": scope, "principal": principal if scope == "principal" else None, "entries": entries}
+    return {"profile_id": profile_id, "version": version, "scope": scope, "principal": principal if scope == "principal" else None, "entries": entries}
 
 
 def openclaw_manifest(normal: Mapping[str, Any], project_id: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, bytes]]:
-    if normal.get("profile_id") != OPENCLAW_PROFILE or normal.get("version") != OPENCLAW_VERSION:
+    if normal.get("version") not in OPENCLAW_VERSIONS or normal.get("profile_id") != "openclaw-memory-core-" + str(normal.get("version")):
         error("OpenClaw normalisation is not pinned to the supported profile", 73)
     payload: Dict[str, bytes] = {}
     entries: List[Dict[str, Any]] = []
@@ -1228,7 +1237,7 @@ def do_openclaw(args: argparse.Namespace) -> Dict[str, Any]:
             target = output / "observations" / rel
             if target.is_symlink() or not target.is_file() or sha256_file(target) != sha256_bytes(data):
                 error("OpenClaw stage file conflict: %s" % rel, 73)
-        return {"status": "idempotent", "adapter": "openclaw", "profile_id": normal["profile_id"], "openclaw_version": OPENCLAW_VERSION, "entries": len(payload), "output": str(output), "canonical_write": False, "reciprocal_write": False, "external_observation": True}
+        return {"status": "idempotent", "adapter": "openclaw", "profile_id": normal["profile_id"], "openclaw_version": normal["version"], "entries": len(payload), "output": str(output), "canonical_write": False, "reciprocal_write": False, "external_observation": True}
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".openclaw-stage.", dir=str(output.parent)))
     try:
@@ -1243,7 +1252,7 @@ def do_openclaw(args: argparse.Namespace) -> Dict[str, Any]:
     finally:
         if temporary.exists():
             shutil.rmtree(str(temporary))
-    return {"status": "staged", "adapter": "openclaw", "profile_id": normal["profile_id"], "openclaw_version": OPENCLAW_VERSION, "entries": len(payload), "output": str(output), "canonical_write": False, "reciprocal_write": False, "external_observation": True}
+    return {"status": "staged", "adapter": "openclaw", "profile_id": normal["profile_id"], "openclaw_version": normal["version"], "entries": len(payload), "output": str(output), "canonical_write": False, "reciprocal_write": False, "external_observation": True}
 
 
 def parser() -> argparse.ArgumentParser:

@@ -33,6 +33,7 @@ The infrastructure stays active. You do not have to invoke it, clear lock files 
 | Connect Hermes memory | [`integrations/hermes/llm-brain/README.md`](integrations/hermes/llm-brain/README.md) |
 | Run a bounded health review | [`skills/llm-brain-maintenance/SKILL.md`](skills/llm-brain-maintenance/SKILL.md) |
 | Upgrade or publish safely | [`skills/llm-brain-upgrade/SKILL.md`](skills/llm-brain-upgrade/SKILL.md) and [`RELEASING.md`](RELEASING.md) |
+| Contribute a docs or code change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 The README is the versioned front door. The linked guides hold the detailed
 workflows, so installation and release behaviour stay reviewable with the
@@ -67,8 +68,8 @@ authoritative files
 
 Canonical knowledge follows [Google Open Knowledge Format v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/3fcbb9f828c2f23d109c855ee403c3a4c81f3a96/okf/SPEC.md). Raw evidence, episodes, review decisions and audit records remain beside it, so an agent can cite where a memory came from and revise it without erasing history.
 
-The current release is v0.7.1 and uses storage schema 3. `VERSION` is the
-package authority; OKF v0.2 is the canonical knowledge format. The vault is
+`VERSION` is the package-version authority; storage schema 3 and OKF v0.2 remain
+the storage and canonical knowledge formats. The vault is
 ordinary, portable Markdown and TSV, so it remains inspectable, copyable and
 repairable without a database or hosted service.
 
@@ -100,7 +101,7 @@ capture → custody + episode → policy/review → canonical OKF
 | Provenance | Source hashes, lineage and independent roots distinguish corroboration from repeated copies. |
 | Forgetting | `retract --preview` shows the exact target and confirmation token; only `--confirm TOKEN` records a reversible tombstone. |
 | Maintenance | Bounded freshness, retention-candidate, conflict, work, receipt, index and provenance reports are derived and visibility-filtered; they never delete or promote memory. |
-| Usefulness | `--receipt` and `feedback record` are opt-in derived records; reading memory never writes a receipt by default. |
+| Usefulness | `--receipt` and `feedback record` are opt-in derived records; reading memory never writes a receipt by default. A source is marked opened only after its visible custody bytes pass their expected SHA-256 check. |
 | Portability and repair | Markdown/TSV custody, rebuildable indexes and staged migration/reconciliation keep recovery local and inspectable. |
 | Hermes | Native provider recall and durable capture share the same bridge; Hermes never writes canonical `okf/` directly or executes capsules. |
 
@@ -114,6 +115,14 @@ capture → custody + episode → policy/review → canonical OKF
 | Parallel agents keep working | Writers wait or recover proven-dead ownership; slow providers and embedders run outside the commit lease. |
 | Old knowledge stays understandable | Supersession, retraction, conflicts and as-of retrieval preserve history. |
 | Retrieval stays honest | Exact identifiers remain lexical, unavailable vector state reports degradation, and context packs expose their evidence. |
+
+### Evidence before extra memory machinery
+
+An explicit `--intent evidence` or `--intent current_state` pack puts unresolved state warnings ahead of resolved material. Under a tight budget it uses distinct, hash-verified source roots before repeated records from one source. Missing, hidden, changed or budget-omitted custody is marked incomplete, not silently counted as support. This checks bytes and visibility; it does **not** prove a source semantically supports an answer.
+
+Retrieval receipts remain opt-in (`search --receipt`, `pack build --receipt`, or `bridge recall --receipt`). New receipts retain the existing JSONL fields and include identity version 2, with principal, intent, as-of and rendered selection in the idempotency key. Old receipts remain untouched. OKF v0.2 Markdown in storage schema 3 is still authoritative; bridge JSON and receipts are transport and derived audit data.
+
+Hermes' normal capture stays non-blocking. Its optional checkpoint-required compression setting asks LLM-Brain for a durable bridge completion receipt before compression can discard direct messages; a queued outbox record alone is not that receipt. See the [Hermes guide](integrations/hermes/llm-brain/README.md) before enabling it, because the setting changes other Hermes compaction paths. OpenClaw remains an explicit staged observation, and Pi, Oh My Pi and Claude Code keep their own session mechanisms without becoming canonical memory writers.
 
 ## Install
 
@@ -401,4 +410,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, the [v0.7.1 release notes](docs/releases/v0.7.1.md) for this migration-free release, and the [Hermes/OpenClaw comparison report](docs/research/2026-09-06-hermes-openclaw-memory-comparison.md) for the next improvement goal.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.7.1 release notes](docs/releases/v0.7.1.md) for the published version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) covers this unreleased work.

@@ -20,6 +20,7 @@ cp "$repo_root/docs/evaluation.md" "$stage/docs/evaluation.md"
 cp "$release_notes" "$stage/docs/releases/v${version}.md"
 cp "$repo_root/docs/releases/unreleased.md" "$stage/docs/releases/unreleased.md"
 cp "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$stage/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
+cp "$repo_root/docs/research/2026-09-25-evidence-first-host-memory.md" "$stage/docs/research/2026-09-25-evidence-first-host-memory.md"
 sed "s/^version: .*/version: $version/" "$source_dir/plugin.yaml" >"$stage/plugin.yaml"
 python3 - "$stage/__init__.py" <<'PY'
 from pathlib import Path

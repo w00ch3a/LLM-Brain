@@ -66,7 +66,7 @@ mkdir -p \
   "$standalone/docs/releases" \
   "$standalone/docs/research"
 
-for item in LICENSE README.md install_prompt.md SKILL.md VERSION GEMINI.md gemini-extension.json requirements-okf.lock; do
+for item in LICENSE README.md CONTRIBUTING.md SECURITY.md install_prompt.md SKILL.md VERSION GEMINI.md gemini-extension.json requirements-okf.lock; do
   install -m 0644 "$repo_root/$item" "$plugin/$item"
 done
 for directory in .codex-plugin .claude-plugin adapters hooks; do
@@ -82,8 +82,9 @@ install -m 0644 "$repo_root/docs/evaluation.md" "$plugin/docs/evaluation.md"
 install -m 0644 "$release_notes" "$plugin/docs/releases/v${version}.md"
 install -m 0644 "$repo_root/docs/releases/unreleased.md" "$plugin/docs/releases/unreleased.md"
 install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$plugin/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
+install -m 0644 "$repo_root/docs/research/2026-09-25-evidence-first-host-memory.md" "$plugin/docs/research/2026-09-25-evidence-first-host-memory.md"
 
-install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
+install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/CONTRIBUTING.md" "$repo_root/SECURITY.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"
@@ -92,6 +93,7 @@ install -m 0644 "$repo_root/docs/evaluation.md" "$standalone/docs/evaluation.md"
 install -m 0644 "$release_notes" "$standalone/docs/releases/v${version}.md"
 install -m 0644 "$repo_root/docs/releases/unreleased.md" "$standalone/docs/releases/unreleased.md"
 install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$standalone/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
+install -m 0644 "$repo_root/docs/research/2026-09-25-evidence-first-host-memory.md" "$standalone/docs/research/2026-09-25-evidence-first-host-memory.md"
 
 if LC_ALL=C grep -R -nE '/Users/[^$[:space:]]+|/home/[^$[:space:]]+|(^|[^0-9])(10|127|169\.254|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]+\.[0-9]+' "$plugin" "$standalone"; then
   printf 'package: private machine identifier found in public archive input\n' >&2
@@ -160,7 +162,7 @@ def verify(path: Path, kind: str) -> None:
             if kind == "plugin"
             else f"{name}/bin/llm-brain"
         )
-        required = {f"{name}/VERSION", cli, f"{name}/requirements-okf.lock"}
+        required = {f"{name}/VERSION", cli, f"{name}/requirements-okf.lock", f"{name}/CONTRIBUTING.md", f"{name}/SECURITY.md"}
         if kind == "plugin":
             required |= {
                 f"{name}/.codex-plugin/plugin.json",
@@ -174,6 +176,7 @@ def verify(path: Path, kind: str) -> None:
         f"{name}/docs/releases/v{version}.md",
         f"{name}/docs/releases/unreleased.md",
         f"{name}/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md",
+        f"{name}/docs/research/2026-09-25-evidence-first-host-memory.md",
         }
         if not required.issubset(names):
             raise ValueError(f"{kind} archive is incomplete")

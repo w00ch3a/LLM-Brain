@@ -20,6 +20,8 @@ bash tests/release-readiness-self-check.sh --release
 
 The aggregate gate includes the v3, work-queue, reflection-scheduler, temporal, retrieval-planner, procedure, capsule-dependency, lifecycle-evidence, poisoning, ground-truth evaluation, reconsolidation, scope-feedback, experimental, compatibility, Hermes, maintenance, upgrade, packaging and presentation checks. `--release` additionally requires real Hermes source, skill/plugin validators and the packaged Hermes plugin. The v3 gate is authoritative; the deleted legacy gate must not be called.
 
+The real-source gate is pinned to Hermes v0.21.5 (tag `v2026.9.24`, commit `f97608f178d1ffeca59860195ab7da295f7c8e5f`) and requires a native Python runtime. Set `HERMES_SOURCE_ROOT` to a disposable checkout of that commit and `HERMES_PYTHON` to an existing compatible Hermes environment when the checkout has no venv. If Git transport is unavailable, an extracted GitHub tag archive is accepted only with `HERMES_SOURCE_ARCHIVE` pointing to the exact pinned SHA-256 archive; the gate compares every source file to it. An older local checkout or a synthetic fixture cannot satisfy this gate. It verifies context-bound worker isolation, checkpoint API v2 retry/failure and unchanged selector behaviour; ordinary capture still does not claim checkpoint completion.
+
 The maintenance check uses disposable vaults to prove read-only preview/status,
 visibility-safe bounded findings, derived-only report writes, stale/attention/
 blocked state handling, schedule declarations and fail-open behaviour. It must

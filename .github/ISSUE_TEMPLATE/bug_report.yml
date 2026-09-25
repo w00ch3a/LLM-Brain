@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible problem in LLM-Brain
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve LLM-Brain. Please search existing issues first and include the smallest reproducible example.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behaviour and its impact.
+      placeholder: Tell us what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the commands, inputs or fixture needed to reproduce the problem. Remove private paths and data.
+      placeholder: |
+        1. Run ...
+        2. Provide ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - CLI
+        - Retrieval or canonical memory
+        - Hermes integration
+        - Packaging or release
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the LLM-Brain version, operating system and relevant integration versions.
+      placeholder: |
+        LLM-Brain:
+        OS:
+        Integration:
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety and privacy checklist
+      options:
+        - label: I removed credentials, vault records, customer or patient data, private infrastructure details and other sensitive material.
+          required: true
+        - label: This is not a suspected security vulnerability; I will use SECURITY.md for those reports.
+          required: true

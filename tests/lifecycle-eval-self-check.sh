@@ -40,6 +40,10 @@ assert summary["horizon_endpoint_rows"] == 6
 assert summary["modes"]["raw-source"]["gold_hit_rate"] == 1.0
 assert summary["modes"]["factual"]["checkpoint_evaluated"]
 assert summary["modes"]["factual"]["model_accuracy"] == "unmeasured"
+assert summary["capture_receipt_completion_rate"] == "unmeasured"
+assert "citation_present_rate" in summary["modes"]["explicit"]
+assert "evidence_opened_rate" in summary["modes"]["evidence"]
+assert isinstance(summary["modes"]["evidence"]["correlated_record_count"], int)
 PY
 
 # Existing-output identity mismatch must fail closed rather than overwrite.

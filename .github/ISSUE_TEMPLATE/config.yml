@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and design discussion
+    url: https://github.com/w00ch3a/LLM-Brain/discussions
+    about: Ask usage and design questions in Discussions.
+  - name: Security reports
+    url: https://github.com/w00ch3a/LLM-Brain/security/policy
+    about: Report security issues privately using the security policy.

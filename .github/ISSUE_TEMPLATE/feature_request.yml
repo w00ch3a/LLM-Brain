@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest a focused improvement to LLM-Brain
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please search existing issues and discussions before opening a new request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user or maintainer problem would this address?
+      placeholder: Describe the concrete problem, not only the proposed implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest change that would solve the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What existing workflow, command or design did you consider?
+
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      description: How could the result be verified without using private or production data?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety and privacy checklist
+      options:
+        - label: I removed credentials, vault records, customer or patient data, private infrastructure details and other sensitive material.
+          required: true
+        - label: I understand that experimental or high-risk changes need evidence and maintainer review before adoption.
+          required: true

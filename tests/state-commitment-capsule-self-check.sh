@@ -51,7 +51,7 @@ assert_contains "$(cat "$state_meta")" 'state_resolution=enabled'
 grep -Eq 'state_unresolved_count=[2-9][0-9]*' "$state_meta" || fail 'state unresolved count was not recorded'
 printf '%s\n' 'release state conflict marker' >"$fixture/query.txt"
 bridge_state="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/query.txt" --intent current_state --strategy lexical --budget-tokens 200)"
-printf '%s\n' "$bridge_state" | python3 -c 'import json,sys; p=json.load(sys.stdin); c=p["context_markdown"]; marker="## State Warnings"; assert p["state_resolution"] == "enabled"; assert p["state_unresolved_count"] >= 2; assert marker in c; assert "unresolved-" not in c.split(marker,1)[0]; assert all("state_reason" in row for row in p["results"] if row["type"] != "HermesTurn" and len(row) > 0)'
+printf '%s\n' "$bridge_state" | python3 -c 'import json,sys; p=json.load(sys.stdin); c=p["context_markdown"]; marker="## State Warnings"; assert p["state_resolution"] == "enabled"; assert p["state_unresolved_count"] >= 2; assert marker in c, repr(c); assert "unresolved-" not in c.split(marker,1)[0], repr(c); assert all("state_reason" in row for row in p["results"] if row["type"] != "HermesTurn" and len(row) > 0)'
 
 missing_output="$($cli --root "$vault" search "$project_id" 'missing dependency marker' --intent current_state --explain --limit 5)"
 assert_contains "$missing_output" 'unresolved-dependency'
@@ -66,6 +66,18 @@ evidence_meta="$fixture/evidence.meta"
 "$cli" --root "$vault" search "$project_id" 'evidence independence marker' --limit 3 --metadata-file "$evidence_meta" >/dev/null
 assert_contains "$(cat "$evidence_meta")" 'independent_source_count=2'
 assert_contains "$(cat "$evidence_meta")" 'correlated_record_count=2'
+printf 'first independent origin\n' >"$fixture/diversity-one.md"
+printf 'second independent origin\n' >"$fixture/diversity-two.md"
+diversity_one="$(shasum -a 256 "$fixture/diversity-one.md" | cut -d ' ' -f1)"
+diversity_two="$(shasum -a 256 "$fixture/diversity-two.md" | cut -d ' ' -f1)"
+cp "$fixture/diversity-one.md" "$project/sources/${diversity_one}-one.md"
+cp "$fixture/diversity-two.md" "$project/sources/${diversity_two}-two.md"
+write_claim "$project/okf/claims/diversity-a.md" diversity-a 'Diversity A' 'diversity roots marker' "brain_source_ref: sources/${diversity_one}-one.md"
+write_claim "$project/okf/claims/diversity-b.md" diversity-b 'Diversity B' 'diversity roots marker' "brain_source_ref: sources/${diversity_one}-one.md"
+write_claim "$project/okf/claims/diversity-c.md" diversity-c 'Diversity C' 'diversity roots marker' "brain_source_ref: sources/${diversity_two}-two.md"
+printf 'diversity roots marker\n' >"$fixture/diversity-query.txt"
+diversity_context="$($cli --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" --query-file "$fixture/diversity-query.txt" --intent evidence --strategy lexical --budget-tokens 600)"
+printf '%s\n' "$diversity_context" | python3 -c 'import json,sys; p=json.load(sys.stdin); c=p["context_markdown"]; assert "### Diversity A" in c and "### Diversity C" in c, repr(c); assert "### Diversity B" not in c or c.index("### Diversity C") < c.index("### Diversity B"), repr(c)'
 pack_output="$($cli --root "$vault" pack build "$project_id" --agent test --task 'release state conflict marker' --intent current_state --budget-tokens 200)"
 pack_file="$(printf '%s\n' "$pack_output" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 [ -f "$pack_file" ] || fail 'current-state pack missing'

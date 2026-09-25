@@ -30,11 +30,17 @@ done
 
 [ -s "$repo_root/skills/llm-brain-maintenance/SKILL.md" ] ||
   fail 'maintenance skill is missing'
+[ -s "$repo_root/docs/research/2026-09-25-evidence-first-host-memory.md" ] ||
+  fail 'dated evidence-first host comparison is missing'
 
 grep -Fq 'Current-state retrieval is opt-in' "$repo_root/README.md" ||
   fail 'README does not state current-state opt-in behaviour'
 grep -Fq 'LLM_BRAIN_COMMITMENT_POLICY=shadow' "$repo_root/README.md" ||
   fail 'README does not state the shadow default'
+grep -Fq 'receipt_identity_version' "$repo_root/references/architecture.md" ||
+  fail 'architecture does not document receipt identity'
+grep -Fq 'checkpoint_required' "$repo_root/integrations/hermes/llm-brain/README.md" ||
+  fail 'Hermes guide does not explain strict checkpoint mode'
 grep -Fq 'No vault migration' "$repo_root/$release_notes" ||
   fail 'release notes do not state migration-free upgrade'
 grep -Fq 'memory.provider: llm-brain' "$repo_root/integrations/hermes/llm-brain/README.md" ||
@@ -70,16 +76,22 @@ plugin_members="$(tar -tzf "$plugin_archive")"
 standalone_members="$(tar -tzf "$standalone_archive")"
 for member in \
   "llm-brain/README.md" \
+  "llm-brain/CONTRIBUTING.md" \
+  "llm-brain/SECURITY.md" \
   "llm-brain/install_prompt.md" \
   "llm-brain/skills/llm-brain/SKILL.md" \
   "llm-brain/skills/llm-brain/references/architecture.md" \
-  "llm-brain/skills/llm-brain-maintenance/SKILL.md"
+  "llm-brain/skills/llm-brain-maintenance/SKILL.md" \
+  "llm-brain/docs/research/2026-09-25-evidence-first-host-memory.md"
 do
   grep -Fqx "$member" <<<"$plugin_members" || fail "plugin omitted packaged documentation: $member"
 done
 for member in \
   "llm-brain/README.md" \
-  "llm-brain/install_prompt.md"
+  "llm-brain/CONTRIBUTING.md" \
+  "llm-brain/SECURITY.md" \
+  "llm-brain/install_prompt.md" \
+  "llm-brain/docs/research/2026-09-25-evidence-first-host-memory.md"
 do
   grep -Fqx "$member" <<<"$standalone_members" || fail "standalone archive omitted: $member"
 done

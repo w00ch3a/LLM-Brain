@@ -170,6 +170,7 @@ verify_hermes_package() {
   version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
   [ -f "$primary/docs/releases/v${version}.md" ] || { printf 'Hermes package release notes missing: %s\n' "$primary/docs/releases/v${version}.md" >&2; return 1; }
   [ -f "$primary/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" ] || { printf 'Hermes package comparison report missing: %s\n' "$primary/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" >&2; return 1; }
+  [ -f "$primary/docs/research/2026-09-25-evidence-first-host-memory.md" ] || { printf 'Hermes package evidence-first report missing\n' >&2; return 1; }
   if ! bash "$repo_root/scripts/package-hermes-plugin.sh" "$repeat" >/dev/null; then
     printf 'Hermes package reproducibility rebuild failed\n' >&2
     return 1
@@ -219,6 +220,30 @@ release_checks() {
   package_dir="$fixture/hermes-package"
   [ -d "$hermes_root" ] || {
     printf 'required Hermes source is unavailable: %s\n' "$hermes_root" >&2
+    return 1
+  }
+  if [ "$(git -C "$hermes_root" rev-parse HEAD 2>/dev/null || true)" != "f97608f178d1ffeca59860195ab7da295f7c8e5f" ]; then
+    [ -n "${HERMES_SOURCE_ARCHIVE:-}" ] || { printf 'Hermes source must be tagged v2026.9.24 (v0.21.5): %s\n' "$hermes_root" >&2; return 1; }
+    [ "$(shasum -a 256 "$HERMES_SOURCE_ARCHIVE" 2>/dev/null | awk '{print $1}')" = "15b15ce4e6ec8ea424a081823709d1e17f0943e7b42b59597d24ebb94cbd1742" ] || {
+      printf 'Hermes v2026.9.24 source archive hash mismatch\n' >&2; return 1;
+    }
+    python3 - "$HERMES_SOURCE_ARCHIVE" "$hermes_root" <<'PY' || return 1
+import hashlib, sys, tarfile
+from pathlib import Path
+archive, root = sys.argv[1], Path(sys.argv[2])
+with tarfile.open(archive, "r:gz") as source:
+    files = [item for item in source if item.isfile()]
+    if not files or any(not item.name.startswith("hermes-agent-2026.9.24/") for item in files):
+        raise SystemExit("Hermes tag archive has an unexpected root")
+    for item in files:
+        relative = item.name.split("/", 1)[1]
+        target = root / relative
+        if not target.is_file() or target.is_symlink() or hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(source.extractfile(item).read()).digest():
+            raise SystemExit("Hermes source differs from pinned tag archive: " + relative)
+PY
+  fi
+  [ -x "${HERMES_PYTHON:-$hermes_root/venv/bin/python}" ] || {
+    printf 'required Hermes Python runtime is unavailable for native validation\n' >&2
     return 1
   }
   [ -f "$skills_root/.system/skill-creator/scripts/quick_validate.py" ] ||
