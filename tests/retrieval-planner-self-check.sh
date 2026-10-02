@@ -8,7 +8,9 @@ trap 'rm -rf "$fixture"' EXIT
 
 vault="$fixture/vault"
 project_id="proj_retrieval_planner_self_check"
-"$cli" --root "$vault" project ensure "$repo_root" --id "$project_id" >/dev/null
+# Keep query matching independent of the checkout directory's name.
+mkdir -p "$fixture/repository"
+"$cli" --root "$vault" project ensure "$fixture/repository" --id "$project_id" >/dev/null
 printf 'deploy-release-v2 evidence from source\n' >"$fixture/source.md"
 captured="$($cli --root "$vault" ingest-source "$project_id" "$fixture/source.md")"
 episode_file="$(printf '%s\n' "$captured" | sed -n 's/.*episode=\([^ ]*\).*/\1/p' | tail -n 1)"

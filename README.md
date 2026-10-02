@@ -41,6 +41,18 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## Indexing and retrieval updates
+
+Index builds batch OKF parsing within a single request and bind the parsed
+facts to the admitted source bytes. Before publishing an index, the writer
+rechecks source hashes, paths and effective record inventory under the project
+lock. Visibility, provenance and lifecycle checks retain their existing rules.
+
+`llm-brain search --help` lists the supported options; incomplete search
+commands report a usage error. When recalling access workflows, agents search
+exact names and remembered aliases, verify the configured root and index
+coverage, and distinguish historical recall from current tool access.
+
 ## Easiest install
 
 1. Open [`install_prompt.md`](install_prompt.md).
@@ -410,4 +422,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.7.5 release notes](docs/releases/v0.7.5.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.7.6 release notes](docs/releases/v0.7.6.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.

@@ -8,6 +8,16 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.7.6 - 2026-10-02
+
+- Batched request-local OKF facts during index preparation with source-byte
+  binding and under-lock inventory, path, visibility and hash rechecks.
+- Added search help and clean missing-argument diagnostics.
+- Added retrieval guidance for exact names, aliases, root/index coverage,
+  evidence recency and current execution-context access checks.
+- Preserved schema 3, OKF v0.2 and existing dependencies; no vault migration.
+
+
 # 0.7.1 - 2026-09-13
 
 - Added governed maintenance previews, status, derived reports and explicit

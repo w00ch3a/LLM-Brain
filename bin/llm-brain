@@ -5558,7 +5558,7 @@ file_conflict_state() {
 }
 
 build_indexes() {
-  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors stage generation generation_dir previous_generation started_at pointer_tmp tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors file rel hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp body facts vector vector_tmp
+  local project_id="$1" embedder="${2:-$EMBEDDER}" embedder_version="${LLM_BRAIN_EMBEDDER_VERSION:-unspecified}" dir docs terms graph manifest vectors stage generation generation_dir previous_generation started_at pointer_tmp tmp_docs tmp_terms tmp_graph tmp_manifest tmp_vectors tmp_all_paths tmp_fact_paths tmp_facts tmp_snapshot_dir tmp_current_paths tmp_current_effective file source_file rel hash facts_hash title type state status trust freshness generated_at stale_after source_count runtime sensitivity temp topic_id provenance conflicts supersedes body facts vector vector_tmp
   require_project "$project_id" dir
   [ -z "$embedder" ] || [ -x "$embedder" ] || die 69 "embedder is not executable: $embedder"
   docs="$dir/indexes/documents.tsv"; terms="$dir/indexes/terms.tsv"; graph="$dir/indexes/graph.tsv"; manifest="$dir/indexes/manifest.tsv"; vectors="$dir/indexes/vectors.tsv"
@@ -5571,37 +5571,62 @@ build_indexes() {
   started_at="$(now_utc)"
   index_write_rebuild_state "$dir" building building "$generation" "$previous_generation" "$started_at" "" ""
   tmp_docs="$stage/documents.tsv"; tmp_terms="$stage/terms.tsv"; tmp_graph="$stage/graph.tsv"; tmp_manifest="$stage/manifest.tsv"; tmp_vectors="$stage/vectors.tsv"
+  tmp_all_paths="$stage/all-paths.txt"; tmp_fact_paths="$stage/facts-paths.txt"; tmp_facts="$stage/facts.tsv"; tmp_snapshot_dir="$stage/source-snapshot"
   printf 'path\thash\ttype\ttitle\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttemperature\ttopic_id\tgenerated_at\tstale_after\tsources\truntime\n' >"$tmp_docs"
   printf 'term\tpath\tcount\n' >"$tmp_terms"
   printf 'source\trelation\ttarget\n' >"$tmp_graph"
   printf 'path\thash\tschema\tembedder\n' >"$tmp_manifest"
   [ -z "$embedder" ] || printf 'path\thash\tmodel\tdimensions\tvector\n' >"$tmp_vectors"
+  : >"$tmp_all_paths"; : >"$tmp_fact_paths"
   while IFS= read -r file; do
+    printf '%s\n' "$file" >>"$tmp_all_paths"
     canonical_file_effective "$dir" "$file" || continue
-    rel="${file#"$dir"/}"; hash="$(sha256_file "$file")"
-    if ! facts="$(okf facts "$file")"; then
+    printf '%s\n' "$file" >>"$tmp_fact_paths"
+  done < <(canonical_files "$dir")
+  if ! okf facts-batch "$tmp_fact_paths" --project-root "$dir" --snapshot-root "$tmp_snapshot_dir" >"$tmp_facts"; then
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "facts-unavailable"
+    return 69
+  fi
+  exec 3<"$tmp_facts"
+  while IFS= read -r file; do
+    rel="${file#"$dir"/}"
+    source_file="$tmp_snapshot_dir/$rel"
+    IFS= read -r facts <&3 || { exec 3<&-; rm -rf "$stage"; index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "facts-unavailable"; return 69; }
+    IFS=$'\t' read -r facts_hash type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
+    if [ ! -f "$source_file" ] || ! canonical_file_effective "$dir" "$source_file"; then
+      exec 3<&-
       rm -rf "$stage"
-      index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "facts-unavailable"
+      index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "source-admission-changed"
       return 69
     fi
-    IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
-    state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; temp="$(frontmatter_field "$file" brain_loading_temperature)"; [ -n "$temp" ] || temp="warm"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$type" "$title" "$state" "$status" "$trust" "$freshness" "${sensitivity:-internal}" "$temp" "$(frontmatter_field "$file" brain_topic_id topic_id)" "$generated_at" "$stale_after" "$source_count" "$runtime" >>"$tmp_docs"
-    body="$(cat "$file")"
+    if ! hash="$(sha256_file "$source_file")" || [ "$hash" != "$facts_hash" ]; then
+      exec 3<&-
+      rm -rf "$stage"
+      index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "source-changed-during-index"
+      return 69
+    fi
+    state="$(frontmatter_field "$source_file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$source_file" brain_sensitivity sensitivity)"; temp="$(frontmatter_field "$source_file" brain_loading_temperature)"; [ -n "$temp" ] || temp="warm"
+    topic_id="$(frontmatter_field "$source_file" brain_topic_id topic_id)"
+    provenance="$(frontmatter_field "$source_file" brain_provenance)"
+    conflicts="$(frontmatter_field "$source_file" brain_conflicts)"
+    supersedes="$(frontmatter_field "$source_file" brain_supersedes)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$type" "$title" "$state" "$status" "$trust" "$freshness" "${sensitivity:-internal}" "$temp" "$topic_id" "$generated_at" "$stale_after" "$source_count" "$runtime" >>"$tmp_docs"
+    body="$(cat "$source_file")"
     printf '%s\n' "$body" | LC_ALL=C tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '\n' | awk -v rel="$rel" 'length($0) > 2 { count[$0]++ } END { for (word in count) print word "\t" rel "\t" count[word] }' >>"$tmp_terms"
     printf '%s\tcontains\t%s\n' "$project_id" "$rel" >>"$tmp_graph"
-    [ -z "$(frontmatter_field "$file" brain_topic_id topic_id)" ] || printf '%s\thas_topic\t%s\n' "$rel" "$(frontmatter_field "$file" brain_topic_id topic_id)" >>"$tmp_graph"
-    [ -z "$(frontmatter_field "$file" brain_provenance)" ] || printf '%s\tprovenance\t%s\n' "$rel" "$(frontmatter_field "$file" brain_provenance)" >>"$tmp_graph"
-    [ -z "$(frontmatter_field "$file" brain_conflicts)" ] || printf '%s\tconflicts_with\t%s\n' "$rel" "$(frontmatter_field "$file" brain_conflicts)" >>"$tmp_graph"
-    [ -z "$(frontmatter_field "$file" brain_supersedes)" ] || printf '%s\tsupersedes\t%s\n' "$rel" "$(frontmatter_field "$file" brain_supersedes)" >>"$tmp_graph"
-    { grep -Eo '\[\[[^]]+\]\]|\[[^]]+\]\([^)]+\)' "$file" 2>/dev/null || true; } | sed 's/^\[\[//; s/\]\]$//; s/^[^]]*\](//; s/)$//' | while IFS= read -r target; do [ -n "$target" ] && printf '%s\tlinks_to\t%s\n' "$rel" "$target" >>"$tmp_graph"; done
+    [ -z "$topic_id" ] || printf '%s\thas_topic\t%s\n' "$rel" "$topic_id" >>"$tmp_graph"
+    [ -z "$provenance" ] || printf '%s\tprovenance\t%s\n' "$rel" "$provenance" >>"$tmp_graph"
+    [ -z "$conflicts" ] || printf '%s\tconflicts_with\t%s\n' "$rel" "$conflicts" >>"$tmp_graph"
+    [ -z "$supersedes" ] || printf '%s\tsupersedes\t%s\n' "$rel" "$supersedes" >>"$tmp_graph"
+    { grep -Eo '\[\[[^]]+\]\]|\[[^]]+\]\([^)]+\)' "$source_file" 2>/dev/null || true; } | sed 's/^\[\[//; s/\]\]$//; s/^[^]]*\](//; s/)$//' | while IFS= read -r target; do [ -n "$target" ] && printf '%s\tlinks_to\t%s\n' "$rel" "$target" >>"$tmp_graph"; done
     printf '%s\t%s\t%s\t%s\n' "$rel" "$hash" "$SCHEMA_VERSION" "${embedder:+$(slug "$(basename "$embedder")"):$embedder_version}" >>"$tmp_manifest"
     if [ -n "$embedder" ]; then
       vector="$dir/indexes/embeddings/${hash}-$(slug "$embedder_version").txt"
       if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then
         vector_tmp="${vector}.tmp.$$"
         rm -f "$vector_tmp"
-        if "$embedder" "$file" >"$vector_tmp" && valid_embedding_file "$vector_tmp"; then
+        if "$embedder" "$source_file" >"$vector_tmp" && valid_embedding_file "$vector_tmp"; then
           if [ ! -f "$vector" ] || ! valid_embedding_file "$vector"; then mv "$vector_tmp" "$vector"; else rm -f "$vector_tmp"; fi
         else
           rm -f "$vector_tmp"
@@ -5612,17 +5637,38 @@ build_indexes() {
       fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$hash" "$(embedding_field "$vector" model)" "$(embedding_field "$vector" dimensions)" "$(embedding_field "$vector" vector)" >>"$tmp_vectors"
     fi
-  done < <(canonical_files "$dir")
+  done < "$tmp_fact_paths"
+  exec 3<&-
+  rm -rf "$tmp_snapshot_dir"
   { head -1 "$tmp_docs"; tail -n +2 "$tmp_docs" | sort -u; } >"${tmp_docs}.sorted"; mv "${tmp_docs}.sorted" "$tmp_docs"
   { head -1 "$tmp_terms"; tail -n +2 "$tmp_terms" | sort -u; } >"${tmp_terms}.sorted"; mv "${tmp_terms}.sorted" "$tmp_terms"
   { head -1 "$tmp_graph"; tail -n +2 "$tmp_graph" | sort -u; } >"${tmp_graph}.sorted"; mv "${tmp_graph}.sorted" "$tmp_graph"
+  acquire_lock "project-$project_id"
+  previous_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
+  tmp_current_paths="$stage/current-paths.txt"; tmp_current_effective="$stage/current-effective-paths.txt"
+  canonical_files "$dir" >"$tmp_current_paths"
+  if ! cmp -s "$tmp_all_paths" "$tmp_current_paths"; then
+    release_lock
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "source-admission-changed-under-lock"
+    return 69
+  fi
+  : >"$tmp_current_effective"
+  while IFS= read -r file; do
+    canonical_file_effective "$dir" "$file" && printf '%s\n' "$file" >>"$tmp_current_effective"
+  done <"$tmp_current_paths"
+  if ! cmp -s "$tmp_fact_paths" "$tmp_current_effective"; then
+    release_lock
+    rm -rf "$stage"
+    index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "source-admission-changed-under-lock"
+    return 69
+  fi
   if ! index_validate_generation "$dir" "$stage" "$embedder"; then
+    release_lock
     rm -rf "$stage"
     index_write_rebuild_state "$dir" failed failed "$previous_generation" "$previous_generation" "$started_at" "$(now_utc)" "generation-validation-failed"
     return 69
   fi
-  acquire_lock "project-$project_id"
-  previous_generation="$(index_current_generation "$dir" 2>/dev/null || true)"
   ensure_dir "$dir/indexes/generations"
   [ ! -e "$generation_dir" ] || {
     release_lock
@@ -5786,6 +5832,11 @@ resolve_graph_target() {
 }
 
 cmd_search() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
+    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt]'
+    return 0
+  fi
+  [ "$#" -ge 2 ] || die 64 "search requires PROJECT_ID and QUERY (try: llm-brain search --help)"
   local project_id="$1" query="$2"; shift 2 || true
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""

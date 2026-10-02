@@ -87,6 +87,13 @@ COMPUTATION
 contains "$(python3 "$helper" validate-bundle "$bundle")" 'errors=0'
 contains "$(python3 "$helper" facts "$bundle/metrics/revenue.md")" $'unverified\tunspecified'
 contains "$(python3 "$helper" facts "$bundle/computations/revenue.md")" $'Attested Computation\tRevenue for fiscal year'
+facts_paths="$fixture/facts-paths.txt"
+printf '%s\n' "$bundle/metrics/revenue.md" "$bundle/computations/revenue.md" >"$facts_paths"
+facts_expected="$(for facts_path in "$bundle/metrics/revenue.md" "$bundle/computations/revenue.md"; do
+  printf '%s\t%s\n' "$(shasum -a 256 "$facts_path" | awk '{print $1}')" "$(python3 "$helper" facts "$facts_path")"
+done)"
+facts_batched="$(python3 "$helper" facts-batch "$facts_paths" --project-root "$bundle" --snapshot-root "$fixture/facts-snapshots")"
+[ "$facts_batched" = "$facts_expected" ] || fail "batched facts differ from individual facts output"
 roundtrip="$fixture/revenue-roundtrip.md"
 cp "$bundle/computations/revenue.md" "$roundtrip"
 body_before="$(awk 'BEGIN{seen=0} /^---[[:space:]]*$/{seen++; next} seen >= 2{print}' "$roundtrip" | shasum -a 256 | awk '{print $1}')"
@@ -106,6 +113,13 @@ type: Procedure
 # Duplicate
 DUPLICATE
 if python3 "$helper" validate-bundle "$invalid" >/dev/null 2>&1; then fail "duplicate YAML key passed"; fi
+printf '%s\n' "$invalid/duplicate.md" >"$facts_paths"
+facts_error_single="$fixture/facts-error-single.txt"
+facts_error_batch="$fixture/facts-error-batch.txt"
+if python3 "$helper" facts "$invalid/duplicate.md" >/dev/null 2>"$facts_error_single"; then fail "facts accepted duplicate YAML key"; else facts_rc_single=$?; fi
+if python3 "$helper" facts-batch "$facts_paths" --project-root "$invalid" --snapshot-root "$fixture/invalid-snapshots" >/dev/null 2>"$facts_error_batch"; then fail "facts-batch accepted duplicate YAML key"; else facts_rc_batch=$?; fi
+[ "$facts_rc_single" = "$facts_rc_batch" ] || fail "facts-batch changed malformed YAML exit status"
+cmp -s "$facts_error_single" "$facts_error_batch" || fail "facts-batch changed malformed YAML diagnostic"
 cat >"$invalid/duplicate.md" <<'ACTOR'
 ---
 type: Claim

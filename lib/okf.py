@@ -7,7 +7,9 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -83,6 +85,10 @@ def read_text(path: Path) -> str:
 
 def split_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
     text = read_text(path)
+    return split_frontmatter_text(text)
+
+
+def split_frontmatter_text(text: str) -> tuple[dict[str, Any], str]:
     match = FRONTMATTER_RE.match(text)
     if not match:
         raise OkfError("missing or unterminated YAML frontmatter")
@@ -685,8 +691,7 @@ def command_validate(args: argparse.Namespace) -> int:
     return 1 if issues else 0
 
 
-def command_facts(args: argparse.Namespace) -> int:
-    metadata, _ = split_frontmatter(Path(args.file))
+def facts_metadata_text(metadata: dict[str, Any]) -> str:
     generated = metadata.get("generated")
     generated_at = generated.get("at") if isinstance(generated, dict) else ""
     values = [
@@ -702,12 +707,70 @@ def command_facts(args: argparse.Namespace) -> int:
         else "invalid",
         scalar_text(metadata.get("runtime")),
     ]
-    print(
-        "\t".join(
-            (value or "none").replace("\t", " ").replace("\n", " ")
-            for value in values
-        )
+    return "\t".join(
+        (value or "none").replace("\t", " ").replace("\n", " ")
+        for value in values
     )
+
+
+def facts_text(path: Path) -> str:
+    metadata, _ = split_frontmatter(path)
+    return facts_metadata_text(metadata)
+
+
+def command_facts(args: argparse.Namespace) -> int:
+    print(facts_text(Path(args.file)))
+    return 0
+
+
+def command_facts_batch(args: argparse.Namespace) -> int:
+    try:
+        raw_paths = Path(args.paths_file).read_bytes()
+    except OSError as exc:
+        raise OkfError(str(exc)) from exc
+    if raw_paths and not raw_paths.endswith(b"\n"):
+        raise OkfError("facts path list is not newline-terminated")
+    paths = [os.fsdecode(line) for line in raw_paths.splitlines()]
+    project_root = Path(os.path.abspath(args.project_root))
+    snapshot_root = Path(os.path.abspath(args.snapshot_root))
+    rows: list[str] = []
+    for path in paths:
+        source = Path(os.path.abspath(path))
+        try:
+            relative = source.relative_to(project_root)
+        except ValueError as exc:
+            raise OkfError("facts path is outside project root") from exc
+        try:
+            source_fd = os.open(os.fspath(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise OkfError(str(exc)) from exc
+        try:
+            with os.fdopen(source_fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise OkfError("facts source is not a regular file")
+                raw = stream.read()
+        except OSError as exc:
+            raise OkfError(str(exc)) from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OkfError("not valid UTF-8") from exc
+        metadata, _ = split_frontmatter_text(text)
+        snapshot = snapshot_root / relative
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            snapshot_fd = os.open(
+                os.fspath(snapshot),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(snapshot_fd, "wb") as stream:
+                stream.write(raw)
+        except OSError as exc:
+            raise OkfError(str(exc)) from exc
+        rows.append(hashlib.sha256(raw).hexdigest() + "\t" + facts_metadata_text(metadata))
+    for row in rows:
+        print(row)
     return 0
 
 
@@ -1765,6 +1828,12 @@ def parser() -> argparse.ArgumentParser:
     facts = commands.add_parser("facts")
     facts.add_argument("file")
     facts.set_defaults(func=command_facts)
+
+    facts_batch = commands.add_parser("facts-batch")
+    facts_batch.add_argument("paths_file")
+    facts_batch.add_argument("--project-root", required=True)
+    facts_batch.add_argument("--snapshot-root", required=True)
+    facts_batch.set_defaults(func=command_facts_batch)
 
     field = commands.add_parser("field")
     field.add_argument("file")

@@ -335,7 +335,13 @@ done
 [ ! -d "$vault/.locks/project-$project_id.lock" ] || fail "index build held project lock during embedding"
 concurrent_topic="$($cli --root "$vault" topic add "$project_id" "During Index Build")"
 assert_contains "$concurrent_topic" 'topic=ok'
-wait "$index_pid"
+if wait "$index_pid"; then
+  fail "index build published a snapshot after a concurrent canonical write"
+else
+  index_status=$?
+  [ "$index_status" = 69 ] || fail "index build returned $index_status after concurrent canonical write"
+fi
+LLM_BRAIN_EMBEDDER_VERSION=slow "$cli" --root "$vault" index build "$project_id" --embedder "$slow_semantic_embedder" >/dev/null
 LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index build "$project_id" --embedder "$semantic_embedder" >/dev/null
 assert_file "$vault/projects/$project_id/indexes/vectors.tsv"
 index_status="$(LLM_BRAIN_EMBEDDER_VERSION=v1 "$cli" --root "$vault" index status "$project_id")"
