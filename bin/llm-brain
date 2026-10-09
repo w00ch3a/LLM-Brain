@@ -6423,7 +6423,7 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local usage_boost=0 intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
+  local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 receipt_file="" dir results metadata warnings selected render_order source_snapshot_hash="" rendered_refs="" evidence_opened=false evidence_incomplete=false context_truncated=false verified_hash evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 lifecycle_bundle_resolution="disabled" lifecycle_bundle_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots lifecycle_bundle lifecycle_warnings
   while [ $# -gt 0 ]; do
@@ -6501,6 +6501,14 @@ cmd_pack() {
     intentions_due="$(wc -l <"$intentions_file" | tr -d ' ')"
     intentions_hash="$(sha256_file "$intentions_file")"
   fi
+  # Corrections and retractions are rendered regardless of lexical match: a
+  # correction that shares no words with the task is the one agents miss.
+  notices_file="$(mktemp "$dir/context-packs/.notices.XXXXXX")"
+  local -a notice_args=(notices --project-dir "$dir" --task "$task" --limit "${LLM_BRAIN_PACK_NOTICES:-6}")
+  [ -z "$principal" ] || notice_args+=(--principal "$principal")
+  [ -z "$as_of" ] || notice_args+=(--now "$as_of")
+  memory_signals "${notice_args[@]}" 2>/dev/null >"$notices_file" || : >"$notices_file"
+  [ ! -s "$notices_file" ] || notices_hash="$(sha256_file "$notices_file")"
   retrieval_mode="$(awk -F= '$1 == "retrieval_mode" { print $2 }' "$metadata")"
   retrieval_degraded="$(awk -F= '$1 == "degraded" { print $2 }' "$metadata")"
   intent="$(awk -F= '$1 == "intent" { print $2 }' "$metadata")"; [ -n "$intent" ] || intent="legacy"
@@ -6539,12 +6547,12 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
@@ -6559,6 +6567,16 @@ cmd_pack() {
         printf '%s\n' "$line"
         bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
       done <"$intentions_file"
+      printf '\n'
+    fi
+    if [ -s "$notices_file" ]; then
+      printf '## Corrections and Retractions — newer than the documents they correct\n\n'
+      printf 'Recorded after the original documents. A local copy of a corrected or retracted document is the outdated version, not newer evidence: use the corrected value, and when citing, cite the correction or retraction notice named here together with the original.\n\n'
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf -- '- %s\n' "$line"
+        bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
+      done <"$notices_file"
       printf '\n'
     fi
     if [ -s "$warnings" ]; then
@@ -6622,7 +6640,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

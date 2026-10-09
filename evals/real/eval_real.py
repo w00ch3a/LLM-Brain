@@ -574,7 +574,14 @@ def grade_research(task: dict[str, Any], work: Path, last_message: str) -> dict[
             checks.append({"check": f"cites {spec['citations_include']}", "ok": not lacking, "detail": lacking})
         elif "citations_exclude" in spec:
             bad = sorted(set(spec["citations_exclude"]) & ids)
-            checks.append({"check": f"does not cite {spec['citations_exclude']}", "ok": not bad, "detail": bad})
+            label = f"does not cite {spec['citations_exclude']}"
+            if bad and spec.get("unless_regex"):
+                # Citing a withdrawn source is fine when the answer says it is
+                # withdrawn; the rule is "never as support", not "never name it".
+                label += f" unless answer =~ /{spec['unless_regex']}/"
+                if re.search(spec["unless_regex"], as_text(answer), re.I):
+                    bad = []
+            checks.append({"check": label, "ok": not bad, "detail": bad})
         else:
             value = field(answer, spec["field"])
             if "equals" in spec:

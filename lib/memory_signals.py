@@ -148,6 +148,43 @@ def first_sentence(body: str, limit: int = 180) -> str:
     return text
 
 
+def lead_sentences(body: str, limit: int = 200) -> str:
+    """Whole leading sentences up to ``limit`` characters.
+
+    A first sentence such as "Correction: erratum X corrects Y." carries no
+    value on its own; following sentences are kept while they fit, so the
+    corrected value or instruction is not cut from briefs and notices.
+    """
+    lines = []
+    for line in body.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or text.startswith("```"):
+            continue
+        lines.append(text.lstrip("-*+ ").strip())
+        if sum(len(item) for item in lines) > limit * 2:
+            break
+    text = " ".join(lines)
+    sentences = re.findall(r".+?[.!?](?=\s|$)|.+$", text)
+    result = ""
+    for sentence in sentences:
+        candidate = (result + " " + sentence.strip()).strip()
+        if len(candidate) > limit:
+            break
+        result = candidate
+    if not result:
+        result = first_sentence(body, limit)
+    return result
+
+
+def keyword_stem(word: str) -> str:
+    """Conservative suffix stripping so "recommend" names "recommendation"."""
+    word = word.lower()
+    for suffix in ("ations", "ation", "ments", "ment", "ings", "ing", "ers", "er", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 5:
+            return word[: -len(suffix)]
+    return word
+
+
 def utf8_len(text: str) -> int:
     return len(text.encode("utf-8"))
 
@@ -990,6 +1027,10 @@ def intention_due(vault: Vault, metadata: dict[str, Any], now: dt.datetime, task
         for word in words:
             if re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", lowered):
                 return f"keyword-named~{word}"
+        task_stems = {keyword_stem(token) for token in re.findall(r"[a-z0-9]+", lowered)}
+        for word in words:
+            if re.fullmatch(r"[a-z0-9]+", word) and len(keyword_stem(word)) >= 5 and keyword_stem(word) in task_stems:
+                return f"keyword-stem~{word}"
         return ""
     if kind == "state":
         baseline = clean(metadata.get("brain_trigger_baseline"))
@@ -1040,6 +1081,101 @@ def command_state_fingerprint(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------ lifecycle notices
+
+def _one_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def lifecycle_notices(vault: Vault, now: dt.datetime, task: str = "", limit: int = 6) -> list[dict[str, Any]]:
+    """Active corrections (records that supersede another) and retractions.
+
+    These are newer than the documents they correct, so they are surfaced on
+    their own instead of competing lexically with the task: a correction that
+    does not share words with the task is exactly the one an agent misses.
+    Hidden or unresolvable targets are skipped rather than disclosed.
+    """
+    resolver = vault.resolver
+    notices: list[dict[str, Any]] = []
+    for path in vault.semantic_files():
+        if not vault.eligible(path, now):
+            continue
+        metadata = vault.meta(path)
+        targets = []
+        for ref in ref_list(metadata.get("brain_supersedes")):
+            target = resolver.canonical_ref(ref)
+            if target is None or target == path or not resolver.visible(target, strict_principal=True):
+                continue
+            targets.append(target)
+        if not targets:
+            continue
+        when = parse_time(metadata.get("brain_observed_at")) or record_created(metadata)
+        replaced = []
+        for target in targets:
+            target_meta = vault.meta(target)
+            observed = parse_time(target_meta.get("brain_observed_at")) or record_created(target_meta)
+            replaced.append(vault.title(target) + (f" ({observed.date().isoformat()})" if observed else ""))
+        notices.append({
+            "kind": "correction", "date": iso(when) if when else "", "ref": vault.rel(path),
+            "title": vault.title(path), "text": _one_line(lead_sentences(vault.body(path), 280)),
+            "replaces": "; ".join(replaced),
+        })
+    retraction_dir = vault.root / "okf" / "retractions"
+    if retraction_dir.is_dir():
+        for path in sorted(retraction_dir.glob("*.md")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                metadata, body = okf.split_frontmatter(path)
+            except okf.OkfError:
+                continue
+            ref = clean(metadata.get("brain_retracts"))
+            target = resolver.canonical_ref(ref) if ref else None
+            if target is None or not resolver.visible(target, strict_principal=True):
+                continue
+            generated = metadata.get("generated")
+            when = parse_time(generated.get("at")) if isinstance(generated, dict) else None
+            if when is not None and when > now:
+                continue
+            notices.append({
+                "kind": "retraction", "date": iso(when) if when else "", "ref": vault.rel(target),
+                "title": vault.title(target), "text": _one_line(lead_sentences(body, 280)), "replaces": "",
+            })
+    terms = {keyword_stem(term) for term in re.findall(r"[a-z0-9]+", (task or "").lower()) if len(term) > 2}
+
+    def overlap(item: dict[str, Any]) -> int:
+        words = {keyword_stem(term) for term in re.findall(r"[a-z0-9]+", " ".join((item["title"], item["text"], item["replaces"])).lower())}
+        return len(terms & words)
+
+    # Most task-relevant first, then newest first; ties by ref for stability.
+    notices.sort(key=lambda item: item["ref"])
+    notices.sort(key=lambda item: item["date"], reverse=True)
+    notices.sort(key=overlap, reverse=True)
+    return notices[: max(limit, 0)]
+
+
+def notice_line(item: dict[str, Any]) -> str:
+    date = f" ({item['date'][:10]})" if item.get("date") else ""
+    if item["kind"] == "correction":
+        line = f"Correction{date} — {item['title']}: {item['text']}"
+        if item["replaces"]:
+            line += f" Replaces: {item['replaces']}."
+        return line + f" [{item['ref']}]"
+    return f"Retraction{date} — {item['title']} is retracted: {item['text']} [{item['ref']}]"
+
+
+def command_notices(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    now = now_from(args.now)
+    items = lifecycle_notices(vault, now, args.task or "", args.limit)
+    if args.json:
+        print(json.dumps({"status": "ok", "now": iso(now), "notices": items}, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    for item in items:
+        print(_one_line(notice_line(item)))
+    return 0
+
+
 # ----------------------------------------------------------- project brief
 
 TRUST_ORDER = {"human-reviewed": 0, "machine-confirmed": 1, "unverified": 2}
@@ -1059,7 +1195,7 @@ def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: i
             continue
         rel = vault.rel(path)
         entry = {
-            "ref": rel, "title": vault.title(path), "summary": first_sentence(vault.body(path)),
+            "ref": rel, "title": vault.title(path), "summary": lead_sentences(vault.body(path), 180),
             "trust": okf.trust_tier(metadata), "state_key": clean(metadata.get("brain_state_key")),
             "type": clean(metadata.get("type")),
         }
@@ -1075,13 +1211,20 @@ def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: i
     if retraction_dir.is_dir():
         for path in sorted(retraction_dir.glob("*.md")):
             try:
-                metadata, _ = okf.split_frontmatter(path)
+                metadata, retraction_body = okf.split_frontmatter(path)
             except okf.OkfError:
                 continue
             generated = metadata.get("generated")
             when = parse_time(generated.get("at")) if isinstance(generated, dict) else None
             if when is not None and when <= now and (now - when).days < recent_days:
-                retractions.append({"ref": clean(metadata.get("brain_retracts")), "changed_at": iso(when)})
+                ref = clean(metadata.get("brain_retracts"))
+                target = vault.resolver.canonical_ref(ref) if ref else None
+                visible = target is not None and vault.resolver.visible(target, strict_principal=True)
+                retractions.append({
+                    "ref": ref, "changed_at": iso(when),
+                    "title": vault.title(target) if visible else "",
+                    "reason": _one_line(lead_sentences(retraction_body, 160)) if visible else "",
+                })
     durable.sort(key=lambda item: (TRUST_ORDER.get(item["trust"], 3), 0 if item["state_key"] else 1, item["title"].lower(), item["ref"]))
     recent.sort(key=lambda item: (item["changed_at"], item["ref"]), reverse=True)
     retractions.sort(key=lambda item: (item["changed_at"], item["ref"]), reverse=True)
@@ -1093,13 +1236,16 @@ def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: i
             continue
         if clean(metadata.get("brain_trigger_kind")) == "date" and intention_due(vault, metadata, now, "", []):
             due.append(clean(metadata.get("brain_intention_action")) or clean(metadata.get("title")))
-    return {"durable": durable, "recent": recent, "retractions": retractions, "stale_omitted": stale, "due_intentions": sorted(due)}
+    notices = lifecycle_notices(vault, now, "", 6)
+    noticed = {item["ref"] for item in notices if item["kind"] == "correction"}
+    durable = [item for item in durable if item["ref"] not in noticed]
+    return {"durable": durable, "recent": recent, "retractions": retractions, "stale_omitted": stale, "due_intentions": sorted(due), "notices": notices}
 
 
 def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recent_days: int, now: dt.datetime) -> tuple[str, int]:
     header = [
         f"LLM-BRAIN PROJECT BRIEF ({project_id}, derived {now.date().isoformat()}, cap {max_bytes} bytes)",
-        "Approved memory only; current source, user direction and live proof outrank it. Search or build a pack before relying on details.",
+        "Approved memory only; current source, user direction and live proof outrank it, except where memory records a later correction or retraction of that same source. Search or build a pack before relying on details.",
     ]
     lines = list(header)
     budget = max_bytes
@@ -1118,12 +1264,19 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
     sections: list[tuple[str, list[str]]] = []
     if payload["due_intentions"]:
         sections.append(("Due intentions:", [f"- {item}" for item in payload["due_intentions"]]))
+    if payload.get("notices"):
+        sections.append(("Corrections and retractions (newer than the documents they correct; a local copy of a corrected or retracted document is the outdated version):",
+                         [f"- {notice_line(item)}" for item in payload["notices"]]))
     sections.append(("Durable facts:", [
         f"- {item['title']}: {item['summary']} [{item['trust']}; {item['ref']}]" if item["summary"] else f"- {item['title']} [{item['trust']}; {item['ref']}]"
         for item in payload["durable"]
     ] or ["- none approved yet"]))
     changes = [f"- {item['changed_at'][:10]} {item['title']} ({item['ref']})" for item in payload["recent"]]
-    changes += [f"- {item['changed_at'][:10]} retracted {item['ref']}" for item in payload["retractions"]]
+    changes += [
+        f"- {item['changed_at'][:10]} retracted {item['title'] + ' (' + item['ref'] + ')' if item.get('title') else item['ref']}"
+        + (f": {item['reason']}" if item.get("reason") else "")
+        for item in payload["retractions"]
+    ]
     sections.append((f"Recent changes (last {recent_days} days):", changes or ["- none"]))
     # Reserve roughly 40% of the cap for recent changes so a large durable
     # set cannot crowd them out entirely.
@@ -1313,6 +1466,11 @@ def parser() -> argparse.ArgumentParser:
     brief.add_argument("--max-bytes", type=int, default=4000)
     brief.add_argument("--recent-days", type=int, default=14)
     brief.add_argument("--json", action="store_true")
+
+    notices = base("notices", command_notices)
+    notices.add_argument("--task", default="")
+    notices.add_argument("--limit", type=int, default=6)
+    notices.add_argument("--json", action="store_true")
 
     rerank = base("rerank", command_rerank)
     rerank.add_argument("--ranked", required=True)

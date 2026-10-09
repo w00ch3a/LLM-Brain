@@ -224,7 +224,7 @@ TASKS = [
         "checks": [
             {"field": "key_numbers.bream_baseline_2024", "equals": 1610},
             {"field": "brief", "not_regex": "3\\.8|27\\.4|silver"},
-            {"citations_exclude": ["MF-S03"]},
+            {"citations_exclude": ["MF-S03"], "unless_regex": "withdrawn|withdrawal|retract|calibration drift|drift|recalibrat"},
         ],
         "reference": {"queries": ["bream status habitat"], "needs": ["MF-S09"],
                       "answer_on": {"brief": "Baseline 1,610 juvenile bream (2024, MF-S02). Salinity trend withdrawn pending logger recalibration (MF-S09). Summer water 19.8 C (MF-S06).", "key_numbers": {"bream_baseline_2024": 1610}, "citations": ["MF-S02", "MF-S06", "MF-S09"]},

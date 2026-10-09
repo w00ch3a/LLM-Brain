@@ -10,7 +10,10 @@ Each task runs twice:
 
 Grading never uses a model. Coding tasks are scored by hidden executable
 tests, which are copied in only after the agent finishes. Research tasks are
-scored by a deterministic answer key over `answer.json`.
+scored by a deterministic answer key over `answer.json`. A "does not cite"
+check may carry `unless_regex`: naming a withdrawn source is allowed when the
+answer says it is withdrawn (r10; r09's own reference answer cites the
+withdrawn dataset next to its withdrawal notice).
 
 All content is synthetic.
 

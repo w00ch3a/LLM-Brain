@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Packs and briefs now carry a "Corrections and Retractions" section: active
+  records that supersede another record, and retractions with their reason,
+  are surfaced regardless of lexical match with the task (most task-relevant
+  first, capped by `LLM_BRAIN_PACK_NOTICES`, default 6), with guidance that a
+  local copy of a corrected or retracted document is the outdated version.
+  Superseded/retracted content and principal-hidden targets are not shown.
+- Brief summaries keep whole leading sentences up to the cap instead of only
+  the first sentence, so "Correction: X corrects Y." keeps the corrected
+  value; brief retraction lines name the retracted record and the reason.
+- Brief header: current sources outrank memory except where memory records a
+  later correction or retraction of that same source.
+- Keyword intentions also match simple inflections ("recommend" fires a
+  `keyword:recommendation` trigger; reported as `keyword-stem~`).
+- Real eval: r10's "does not cite MF-S03" check now allows citing the
+  withdrawn dataset when the answer says it is withdrawn (it penalised
+  correct answers; r09's reference answer does the same).
 - Development continues after the v0.7.1 release; no live-vault mutation is
   implied.
 - Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
