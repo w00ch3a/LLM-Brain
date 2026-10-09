@@ -279,7 +279,7 @@ llm-brain bridge capture
 
 ### Install and activate memory
 
-Build the package from this repository and place it in the active Hermes profile:
+Build the package from this repository, or extract the release's `llm-brain-VERSION-hermes.tar.gz` (built by `scripts/package-hermes-archive.sh`), and place it in the active Hermes profile:
 
 ```bash
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -303,7 +303,7 @@ Store the six supported settings in `$HERMES_HOME/llm-brain.json`:
 }
 ```
 
-An empty `project_id` lets the plugin resolve the registered Hermes workspace or create a project for it. Multiple Hermes sessions can capture into the same project. They share short commit leases while provider calls and retrieval work continue outside those leases.
+An empty `project_id` lets the plugin resolve the registered Hermes workspace or create a project for it. Optional settings, such as the local Laya recall filter and `context_engine_registration`, are off unless you add them; see the [Hermes plugin guide](integrations/hermes/llm-brain/README.md#opt-in-settings). Multiple Hermes sessions can capture into the same project. They share short commit leases while provider calls and retrieval work continue outside those leases.
 
 ### Optional ContextEngine
 
@@ -570,13 +570,13 @@ that file. Core commands still work on the partial tree. To finish the
 install, run the new CLI once against the same release source:
 
 ```bash
-llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.0
+llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.1
 ```
 
 It checks that the source matches the installed CLI byte for byte, then adds
 only the missing helpers and Neural Expansion. Plugin and extension hosts
 install the full package and don't need this step.
-`tests/upgrade-from-previous-self-check.sh` runs the real 0.7.6 to 0.8.0
+`tests/upgrade-from-previous-self-check.sh` runs the real 0.7.6 to current
 upgrade on a populated synthetic vault.
 
 ## Development
@@ -586,4 +586,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.0 release notes](docs/releases/v0.8.0.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.1 release notes](docs/releases/v0.8.1.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.

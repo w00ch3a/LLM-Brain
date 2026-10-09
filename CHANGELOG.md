@@ -8,6 +8,21 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.8.1 - Unreleased
+
+- Fixed stale-lock recovery on GNU/Linux: `lock_mtime` mixed `stat -f`
+  filesystem output into the timestamp, so ownerless locks were never stale.
+- Fixed `pack build` failing with "File name too long" for long `--task` text.
+- Hermes plugin: opt-in local Laya recall filter (`laya_url`, fail-open,
+  local/private endpoints only); bridge timeouts now stop the whole process
+  group, and lock waits are capped at 2 seconds by default;
+  `context_engine_registration: when-selected`; setup keeps other
+  integrations' keys in `llm-brain.json`; AWS key redaction. The six selector
+  keys are unchanged.
+- Added `scripts/package-hermes-archive.sh` for a reproducible Hermes release
+  archive, checked by the release gate.
+- Added the repository-only real-agent evaluation suite in `evals/real/`.
+
 ## 0.8.0 - 2026-10-09
 
 - Added deterministic stdlib BM25F lexical scoring (legacy scorer kept behind

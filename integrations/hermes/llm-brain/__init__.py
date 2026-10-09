@@ -10,13 +10,19 @@ from __future__ import annotations
 import copy
 import contextvars
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -74,6 +80,27 @@ CONFIG_KEYS = {
     "vault_root", "cli_path", "project_id", "strategy",
     "recall_budget_tokens", "timeout_seconds",
 }
+# Opt-in keys. They are read and preserved when present in llm-brain.json but
+# never written as defaults, so the six-key selector configuration above is
+# unchanged for installations that do not use them.
+LOCAL_LAYA_DEFAULT_MODEL = "laya-typed-decisions"
+LOCAL_LAYA_MAX_CANDIDATES = 4
+LOCAL_LAYA_MAX_QUERY_CHARS = 384
+LOCAL_LAYA_MAX_PATH_CHARS = 128
+LOCAL_LAYA_MAX_TITLE_CHARS = 128
+LOCAL_LAYA_MAX_EXCERPT_CHARS = 240
+CONTEXT_ENGINE_REGISTRATION_MODES = ("always", "when-selected")
+OPTIONAL_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "laya_url": "",
+    "laya_model": LOCAL_LAYA_DEFAULT_MODEL,
+    "laya_timeout_seconds": 4,
+    "laya_max_candidates": LOCAL_LAYA_MAX_CANDIDATES,
+    "laya_min_relevance": 0.55,
+    "laya_min_margin": 0.1,
+    "context_engine_registration": "always",
+}
+OPTIONAL_CONFIG_KEYS = set(OPTIONAL_CONFIG_DEFAULTS)
+_LayaOptionalFields = {"confidence", "action", "probability", "probabilities"}
 SEARCH_INTENTS = {"factual", "current_state", "historical", "procedure", "evidence", "exploratory"}
 _RECALL_FIELDS = {"context", "context_markdown", "results", "evidence_refs", "evidence_bundles"}
 _REGISTRATION_LOCK = threading.RLock()
@@ -81,7 +108,9 @@ _SCOPED_REGISTRATION_CLAIMS: set[tuple[str, str]] = set()
 _WEAK_REGISTRATION_CLAIMS: "weakref.WeakKeyDictionary[Any, set[str]]" = weakref.WeakKeyDictionary()
 SENSITIVE_RE = re.compile(
     r"(?i)(?:api[_ -]?key|secret|password|token|authorization|bearer|private key)\s*[:=]\s*\S+"
+    r"|\b(?:aws[_ -]?access[_ -]?key[_ -]?id|aws[_ -]?secret[_ -]?access[_ -]?key)\s*[:=]\s*\S+"
     r"|\bbearer\s+\S+"
+    r"|\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA)[A-Z0-9]{16}\b"
     r"|\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
@@ -112,7 +141,7 @@ def _load_config(hermes_home: Optional[Path]) -> Dict[str, Any]:
         try:
             loaded = json.loads((hermes_home / "llm-brain.json").read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                config.update({key: value for key, value in loaded.items() if key in CONFIG_KEYS})
+                config.update({key: value for key, value in loaded.items() if key in CONFIG_KEYS | OPTIONAL_CONFIG_KEYS})
         except (OSError, ValueError, TypeError):
             pass
     config["vault_root"] = str(Path(str(config["vault_root"])).expanduser())
@@ -125,17 +154,63 @@ def _load_config(hermes_home: Optional[Path]) -> Dict[str, Any]:
             value = default
         config[key] = value if value > 0 else default
     config["project_id"] = str(config.get("project_id") or "")
+    _normalise_optional_config(config)
     return config
+
+
+def _normalise_optional_config(config: Dict[str, Any]) -> None:
+    """Normalise opt-in keys in place; absent keys stay absent."""
+    for key in ("laya_timeout_seconds", "laya_max_candidates"):
+        if key in config:
+            default = OPTIONAL_CONFIG_DEFAULTS[key]
+            try:
+                value = int(config[key])
+            except (TypeError, ValueError):
+                value = default
+            value = value if value > 0 else default
+            if key == "laya_max_candidates":
+                value = min(LOCAL_LAYA_MAX_CANDIDATES, value)
+            config[key] = value
+    for key in ("laya_min_relevance", "laya_min_margin"):
+        if key in config:
+            try:
+                number = float(config[key])
+            except (TypeError, ValueError):
+                number = OPTIONAL_CONFIG_DEFAULTS[key]
+            if not math.isfinite(number):
+                number = OPTIONAL_CONFIG_DEFAULTS[key]
+            config[key] = min(1.0, max(0.0, number))
+    if "laya_url" in config:
+        config["laya_url"] = str(config.get("laya_url") or "").strip()
+    if "laya_model" in config:
+        config["laya_model"] = str(config.get("laya_model") or LOCAL_LAYA_DEFAULT_MODEL).strip() or LOCAL_LAYA_DEFAULT_MODEL
+    if "context_engine_registration" in config:
+        mode = str(config.get("context_engine_registration") or "").strip().lower().replace("_", "-")
+        config["context_engine_registration"] = mode if mode in CONTEXT_ENGINE_REGISTRATION_MODES else "always"
+
+
+def _option(config: Dict[str, Any], key: str) -> Any:
+    return config.get(key, OPTIONAL_CONFIG_DEFAULTS[key])
 
 
 def _write_config(values: Dict[str, Any], hermes_home: Path) -> None:
     # Read-modify-write the selected Hermes profile. Loading defaults here would
-    # silently erase unrelated configured keys on a partial setup update.
-    config = _load_config(hermes_home)
-    config.update({key: value for key, value in values.items() if key in CONFIG_KEYS and value is not None})
+    # silently erase unrelated configured keys on a partial setup update, and
+    # keys owned by companion integrations in the same file are preserved.
+    config_path = hermes_home / "llm-brain.json"
+    try:
+        stored = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        stored = {}
+    config = dict(stored) if isinstance(stored, dict) else {}
+    config.update(_load_config(hermes_home))
+    config.update({
+        key: value for key, value in values.items()
+        if key in CONFIG_KEYS | OPTIONAL_CONFIG_KEYS and value is not None
+    })
+    _normalise_optional_config(config)
     config["vault_root"] = str(Path(str(config["vault_root"])).expanduser())
     hermes_home.mkdir(parents=True, exist_ok=True)
-    config_path = hermes_home / "llm-brain.json"
     temp_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.tmp")
     temp_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.chmod(temp_path, 0o600)
@@ -635,22 +710,295 @@ def _context_engine_selected() -> bool:
         return False
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise urllib.error.HTTPError(req.full_url, code, "redirects disabled", headers, fp)
+
+
+def _local_laya_endpoint(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(url).strip())
+        hostname = parsed.hostname
+        parsed.port  # Validate malformed ports before any transport is attempted.
+    except (TypeError, ValueError):
+        raise ValueError("local endpoint required")
+    if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
+        raise ValueError("local endpoint required")
+    hostname = hostname.lower()
+    if hostname != "localhost":
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError as exc:
+            raise ValueError("private IP endpoint required") from exc
+        if not (address.is_private or address.is_loopback or address.is_link_local):
+            raise ValueError("private IP endpoint required")
+    return parsed.geturl()
+
+
+def _laya_http_transport(url: str, request_body: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    )
+    with opener.open(request, timeout=timeout) as response:
+        body = response.read(2 * 1024 * 1024)
+    decoded = json.loads(body.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("invalid local decision response")
+    return decoded
+
+
+def _laya_request_body(query: str, rows: List[Dict[str, Any]], model: str, max_candidates: int) -> Dict[str, Any]:
+    max_candidates = min(LOCAL_LAYA_MAX_CANDIDATES, max(1, int(max_candidates)))
+    candidates = []
+    for index, row in enumerate(rows[:max_candidates]):
+        candidates.append({
+            "id": f"candidate_{index}",
+            "path": _safe_text(str(row.get("path") or ""))[:LOCAL_LAYA_MAX_PATH_CHARS],
+            "title": _safe_text(str(row.get("title") or ""))[:LOCAL_LAYA_MAX_TITLE_CHARS],
+            "excerpt": _safe_text(str(row.get("excerpt") or row.get("snippet") or ""))[:LOCAL_LAYA_MAX_EXCERPT_CHARS],
+            "recall_score": row.get("score"),
+        })
+    questions: Dict[str, Any] = {
+        "triage": {
+            "type": "choice",
+            "criteria": ["answer", "procedure", "reference", "current_state", "other"],
+            "instructions": "Classify the user's request using the supplied query and recalled evidence.",
+        },
+    }
+    for index, _candidate in enumerate(candidates):
+        questions[f"relevance_{index}"] = {
+            "type": "noul",
+            "instructions": f"Estimate the probability that candidate_{index} is directly relevant to the query.",
+        }
+    return {
+        "model": _safe_text(model),
+        "state": {"task": _safe_text(query)[:LOCAL_LAYA_MAX_QUERY_CHARS], "candidates": candidates},
+        "questions": questions,
+    }
+
+
+def _laya_context_selection(context: str, selected_paths: set[str]) -> str:
+    if not context:
+        return context
+    sections = re.split(r"(?m)(?=^#{2,3} )", context)
+    if len(sections) == 1:
+        return context
+    retained: List[str] = []
+    saw_heading = False
+    kept_level_two = False
+    for section in sections:
+        heading = re.match(r"(?m)^(#{2,3})\s+(.+?)\s*$", section)
+        if not heading:
+            if not saw_heading:
+                retained.append(section)
+            continue
+        saw_heading = True
+        level = len(heading.group(1))
+        title = heading.group(2).casefold()
+        references = set(re.findall(r"(?:Reference|Evidence(?: ref)?):\s*(?:`|<code>)([^`<]+)", section, re.IGNORECASE))
+        is_support = "supporting evidence" in title or (title.startswith("evidence:") and bool(references))
+        is_warning = title == "state warnings"
+        if level == 2:
+            # The first level-two block is the recall header/metadata. Keep it,
+            # and keep custody evidence and unresolved-state warnings verbatim.
+            keep = not kept_level_two or is_support or is_warning
+            kept_level_two = True
+        else:
+            keep = is_support or bool(references & selected_paths)
+        if keep:
+            retained.append(section)
+    return "".join(retained).rstrip()
+
+
+def _bounded_probability(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("invalid probability shape")
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError("invalid probability")
+    return number
+
+
+def _validate_laya_decision(answer: Any, expected_type: str, value_field: str, choices: set[str] | None = None) -> Any:
+    if not isinstance(answer, dict):
+        raise ValueError("invalid typed decision")
+    allowed = {"type", value_field} | _LayaOptionalFields
+    if set(answer) - allowed or answer.get("type") != expected_type or value_field not in answer:
+        raise ValueError("invalid typed decision fields")
+    if choices is not None:
+        value = answer[value_field]
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError("invalid choice decision")
+    else:
+        value = _bounded_probability(answer[value_field])
+    if "confidence" in answer:
+        _bounded_probability(answer["confidence"])
+    if "probability" in answer:
+        _bounded_probability(answer["probability"])
+    if "probabilities" in answer:
+        probabilities = answer["probabilities"]
+        if not isinstance(probabilities, dict) or not probabilities:
+            raise ValueError("invalid probabilities shape")
+        for name, probability in probabilities.items():
+            if not isinstance(name, str) or (choices is not None and name not in choices):
+                raise ValueError("invalid probability choice")
+            _bounded_probability(probability)
+    if "action" in answer:
+        action = answer["action"]
+        if not isinstance(action, dict) or set(action) != {"act_probability"}:
+            raise ValueError("invalid action shape")
+        _bounded_probability(action["act_probability"])
+    return value
+
+
+def _validate_laya_answers(response: Dict[str, Any], questions: Dict[str, Any], candidate_count: int) -> tuple[str, List[float]]:
+    answers = response.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError("missing typed decisions")
+    expected_keys = {"triage", *(f"relevance_{index}" for index in range(candidate_count))}
+    if set(answers) != expected_keys:
+        raise ValueError("typed decision keys do not match questions")
+    triage_question = questions.get("triage")
+    criteria = triage_question.get("criteria") if isinstance(triage_question, dict) else None
+    if not isinstance(criteria, list) or not criteria or any(not isinstance(item, str) for item in criteria):
+        raise ValueError("invalid triage enum")
+    triage = _validate_laya_decision(answers["triage"], "choice", "choice", set(criteria))
+    relevance = [
+        _validate_laya_decision(answers[f"relevance_{index}"], "noul", "noul")
+        for index in range(candidate_count)
+    ]
+    return triage, relevance
+
+
+def _apply_laya_selection(
+    config: Dict[str, Any],
+    query: str,
+    payload: Dict[str, Any],
+    transport: Any = None,
+) -> Dict[str, Any]:
+    endpoint = str(config.get("laya_url") or "").strip()
+    if not endpoint:
+        return payload
+    rows = payload.get("results")
+    if not isinstance(rows, list) or not rows:
+        return payload
+    model = _safe_text(str(_option(config, "laya_model") or LOCAL_LAYA_DEFAULT_MODEL))
+    try:
+        endpoint = _local_laya_endpoint(endpoint)
+        max_candidates = min(LOCAL_LAYA_MAX_CANDIDATES, max(1, int(_option(config, "laya_max_candidates"))))
+        timeout = max(1, int(_option(config, "laya_timeout_seconds")))
+        threshold = min(1.0, max(0.0, float(_option(config, "laya_min_relevance"))))
+        minimum_margin = min(1.0, max(0.0, float(_option(config, "laya_min_margin"))))
+        candidate_rows = [row for row in rows if isinstance(row, dict)]
+        if len(candidate_rows) > max_candidates:
+            payload["local_laya"] = {
+                "status": "candidate_limit",
+                "provider": "local-laya",
+                "candidate_count": len(candidate_rows),
+            }
+            return payload
+        body = _laya_request_body(query, candidate_rows, model, max_candidates)
+        response = (transport or _laya_http_transport)(endpoint, body, timeout)
+        if not isinstance(response, dict):
+            raise ValueError("invalid local decision response")
+        triage, relevance_values = _validate_laya_answers(response, body["questions"], len(candidate_rows))
+        decisions = []
+        selected_paths: set[str] = set()
+        selected_rows = []
+        for index, row in enumerate(candidate_rows):
+            relevance = relevance_values[index]
+            decisions.append({"candidate_index": index, "relevance": relevance})
+            if relevance >= threshold:
+                selected = dict(row)
+                selected["laya_relevance"] = relevance
+                selected_rows.append(selected)
+                if row.get("path"):
+                    selected_paths.add(str(row["path"]))
+        rejected_scores = [value for value in relevance_values if value < threshold]
+        selected_scores = [value for value in relevance_values if value >= threshold]
+        if (
+            not selected_scores
+            or not rejected_scores
+            or min(selected_scores) - max(rejected_scores) < minimum_margin
+        ):
+            payload["local_laya"] = {
+                "status": "ambiguous",
+                "provider": "local-laya",
+                "triage": triage,
+                "candidate_count": len(candidate_rows),
+            }
+            return payload
+        selected_context = _laya_context_selection(str(payload.get("context_markdown") or ""), selected_paths)
+        payload["results"] = selected_rows
+        payload["context_markdown"] = selected_context
+        payload["local_laya"] = {
+            "status": "ok",
+            "provider": "local-laya",
+            "model": model,
+            "triage": triage,
+            "candidate_count": len(candidate_rows),
+            "selected_count": len(selected_rows),
+            "decisions": decisions,
+        }
+    except Exception:
+        payload["local_laya"] = {
+            "status": "unavailable",
+            "provider": "local-laya",
+        }
+    return payload
+
+
 def _bridge_call(config: Dict[str, Any], source_root: Path, args: List[str]) -> Optional[Dict[str, Any]]:
     cli = _find_cli(config)
     if not cli:
         return None
     command = [cli, "--root", str(config["vault_root"]), "bridge"] + args
+    env = os.environ.copy()
+    # Fail a contended vault lock quickly instead of waiting out the whole
+    # bridge deadline; an explicit environment setting still wins.
+    env.setdefault("LLM_BRAIN_LOCK_WAIT_SECONDS", "2")
+    env.setdefault("LLM_BRAIN_LOCK_POLL_SECONDS", "2")
+    result = None
     try:
-        result = subprocess.run(
-            command, cwd=str(source_root), text=True, capture_output=True,
-            timeout=int(config.get("timeout_seconds", DEFAULT_TIMEOUT)), check=False,
+        result = subprocess.Popen(
+            command, cwd=str(source_root), text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env, start_new_session=(os.name == "posix"),
         )
+        stdout, _ = result.communicate(timeout=int(config.get("timeout_seconds", DEFAULT_TIMEOUT)))
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        if result is not None:
+            # The deadline covers the whole process group. Killing only the
+            # CLI shell left its descendants running after a timeout, still
+            # holding (or queueing for) the vault lock on slow NAS storage.
+            for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+                try:
+                    if os.name == "posix":
+                        os.killpg(result.pid, sig)
+                    elif sig == signal.SIGTERM:
+                        result.terminate()
+                    else:
+                        result.kill()
+                except OSError:
+                    pass
+                try:
+                    result.communicate(timeout=1)
+                except (OSError, UnicodeError, subprocess.TimeoutExpired):
+                    pass
+            for stream in (result.stdout, result.stderr):
+                if stream is not None:
+                    stream.close()
         return None
     try:
-        if len(result.stdout.encode("utf-8", "replace")) > MAX_BRIDGE_OUTPUT_BYTES:
+        if len(stdout.encode("utf-8", "replace")) > MAX_BRIDGE_OUTPUT_BYTES:
             return None
-        payload = json.loads(result.stdout)
+        payload = json.loads(stdout)
     except (TypeError, ValueError):
         return None
     kind = args[0] if args and args[0] in {"recall", "capture"} else ""
@@ -716,7 +1064,9 @@ def _recall(
             payload, kind="recall",
             budget_tokens=budget_tokens,
         )
-        return payload if payload and payload.get("status") == "ok" else None
+        if payload is None or payload.get("status") != "ok":
+            return None
+        return _apply_laya_selection(config, query, payload)
     finally:
         if query_file is not None:
             try:
@@ -1185,12 +1535,35 @@ def register(ctx: Any) -> None:
             _release_registration(ctx, "memory")
             raise
     register_context = getattr(ctx, "register_context_engine", None)
-    if callable(register_context) and _CONTEXT_ENGINE_AVAILABLE and _claim_registration(ctx, "context"):
+    if (
+        callable(register_context) and _CONTEXT_ENGINE_AVAILABLE
+        and _should_register_context_engine() and _claim_registration(ctx, "context")
+    ):
         try:
             register_context(LLMBrainContextEngine())
         except Exception:
             _release_registration(ctx, "context")
             raise
+
+
+def _registration_hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).expanduser()
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+
+
+def _should_register_context_engine() -> bool:
+    """Hermes keeps a single plugin context-engine slot.
+
+    ``always`` (the default) registers the engine so it can be selected with
+    ``context.engine: llm-brain``. ``when-selected`` registers it only while
+    that setting is active, leaving the slot free for another context-engine
+    plugin; the memory provider keeps recalling either way.
+    """
+    mode = _option(_load_config(_registration_hermes_home()), "context_engine_registration")
+    return mode != "when-selected" or _context_engine_selected()
 
 
 def _claim_registration(ctx: Any, surface: str) -> bool:

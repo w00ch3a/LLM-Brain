@@ -103,6 +103,7 @@ core_checks() {
 compatibility_checks() {
   run_steps \
     bash "$repo_root/tests/compatibility-self-check.sh" -- \
+    bash "$repo_root/tests/hermes-plugin-options-self-check.sh" -- \
     bash "$repo_root/tests/hermes-integration-self-check.sh"
 }
 
@@ -118,7 +119,22 @@ packaging_checks() {
   run_steps \
     bash "$repo_root/scripts/package-ai-skill.sh" -- \
     verify_ai_packages -- \
+    bash "$repo_root/scripts/package-hermes-archive.sh" -- \
+    verify_hermes_archive -- \
     bash "$repo_root/tests/automatic-use-self-check.sh"
+}
+
+verify_hermes_archive() {
+  local version archive rebuilt
+  version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
+  archive="$repo_root/dist/llm-brain-${version}-hermes.tar.gz"
+  [ -f "$archive" ] && [ -f "${archive}.sha256" ] || { printf 'missing Hermes archive or checksum: %s\n' "$archive" >&2; return 1; }
+  (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256" >/dev/null) || return 1
+  rebuilt="$fixture/hermes-archive-rebuild"
+  bash "$repo_root/scripts/package-hermes-archive.sh" "$rebuilt" >/dev/null || return 1
+  cmp -s "$archive" "$rebuilt/llm-brain-${version}-hermes.tar.gz" || { printf 'Hermes archive changed across rebuilds\n' >&2; return 1; }
+  [ "$(tar -xzOf "$archive" llm-brain/plugin.yaml | awk '$1 == "version:" { print $2; exit }')" = "$version" ] || return 1
+  printf 'hermes-archive=verified version=%s reproducibility=verified\n' "$version"
 }
 
 verify_ai_packages() {

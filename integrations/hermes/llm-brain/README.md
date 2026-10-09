@@ -81,7 +81,30 @@ Create `$HERMES_HOME/llm-brain.json` when the vault or CLI is outside the normal
 }
 ```
 
-The plugin accepts only those six keys. An empty project ID resolves the registered Hermes workspace or creates a project for it.
+These six keys are the selector configuration that `hermes memory setup` writes. An empty project ID resolves the registered Hermes workspace or creates a project for it. Other keys are ignored unless they are one of the opt-in settings below; setup rewrites keep any other keys already in the file (for example ones owned by a companion integration) and never write the opt-in settings as defaults.
+
+### Opt-in settings
+
+Add these to `llm-brain.json` by hand only when you need them. Absent keys keep the default behaviour.
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `laya_url` | `""` (off) | Local Laya typed-decisions endpoint used to filter recall. Blank disables the filter. |
+| `laya_model` | `laya-typed-decisions` | Model name sent to that endpoint. |
+| `laya_timeout_seconds` | `4` | Per-request timeout for the endpoint. |
+| `laya_max_candidates` | `4` (maximum 4) | Recall results larger than this are passed through unfiltered. |
+| `laya_min_relevance` | `0.55` | Minimum relevance probability for a result to be kept. |
+| `laya_min_margin` | `0.1` | Minimum gap between the weakest kept and strongest dropped result; smaller gaps keep the original recall. |
+| `context_engine_registration` | `always` | `always` registers the ContextEngine so it can be selected; `when-selected` registers it only while `context.engine` is `llm-brain`. |
+
+**Laya recall filter.** When `laya_url` is set, each recall with between one and
+`laya_max_candidates` results is sent to the endpoint as a bounded typed-decision request: the query (384 characters) and, per candidate, path, title, a 240-character excerpt and the recall score, with sensitive-looking text redacted first. The endpoint answers one `choice` triage question and one `noul` relevance probability per candidate. Results at or above `laya_min_relevance` are kept and the recall context is trimmed to them, preserving the recall header, supporting evidence and state warnings. The decision is recorded in an additive `local_laya` field.
+
+The filter is fail-open. Recall is returned unfiltered, with `local_laya.status` set to `unavailable`, `ambiguous` or `candidate_limit`, when the endpoint times out, refuses the connection, redirects or returns a malformed or out-of-range answer, when no clear margin separates kept and dropped results, or when there are too many candidates. The endpoint must be `localhost` or a loopback, private or link-local IP literal (for example `http://localhost:8080/decide`); public addresses, other hostnames, embedded credentials, proxies and redirects are refused. The filter applies to automatic recall and to the `llm_brain_search` tool, and can add up to `laya_timeout_seconds` to a recall.
+
+**Context-engine registration.** Hermes holds a single plugin context-engine slot and only uses a registered engine when `context.engine` names it. With the default `always`, LLM-Brain claims that slot whenever Hermes supports it, so a second context-engine plugin is rejected even though LLM-Brain's engine is not selected. Set `when-selected` to register only while `context.engine` is `llm-brain` (restart Hermes after changing `context.engine`). Recall and capture through the memory provider are unaffected either way.
+
+**Bridge timeouts.** Each bridge call runs in its own process group. When `timeout_seconds` expires the whole group is stopped, so a timed-out recall or capture leaves no CLI processes behind holding or waiting for the vault lock on slow (for example NAS) storage. Bridge calls also set `LLM_BRAIN_LOCK_WAIT_SECONDS=2` unless the environment already sets it, so lock contention fails quickly and capture retries from the outbox.
 
 ## Capture lifecycle
 
@@ -119,6 +142,6 @@ When a caller requests `intent: evidence`, the bridge includes bounded lifecycle
 
 ## Runtime footprint
 
-The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service, zvec engine or Python dependency. LLM-Brain's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
+The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service, zvec engine or Python dependency; the opt-in Laya filter is a standard-library client for a local endpoint you run yourself. LLM-Brain's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
 
 Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. LLM-Brain is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.
