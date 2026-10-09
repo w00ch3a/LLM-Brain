@@ -33,6 +33,7 @@ FRONTMATTER_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 RESERVED = {"index.md", "log.md"}
+CODE_ANCHOR_RE = re.compile(r"^[^@\s][^@]*@[0-9a-fA-F]{7,40}$")
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -273,6 +274,25 @@ def concept_issues(metadata: dict[str, Any], body: str) -> list[str]:
                 isinstance(item, str) and item.strip() for item in values
             ):
                 issues.append(f"{field} must contain non-empty references")
+    brain_paths = metadata.get("brain_paths")
+    if brain_paths is not None:
+        values = brain_paths if isinstance(brain_paths, list) else [brain_paths]
+        if not values or not all(
+            isinstance(item, str) and item.strip() and not item.strip().startswith("/")
+            and ".." not in PurePosixPath(item.strip()).parts
+            for item in values
+        ):
+            issues.append("brain_paths must contain non-empty relative path globs")
+    anchors = metadata.get("brain_code_anchors")
+    if anchors is not None:
+        values = anchors if isinstance(anchors, list) else [anchors]
+        if not values or not all(
+            isinstance(item, str) and CODE_ANCHOR_RE.fullmatch(item.strip())
+            and not item.strip().startswith("/")
+            and ".." not in PurePosixPath(item.strip().rsplit("@", 1)[0]).parts
+            for item in values
+        ):
+            issues.append("brain_code_anchors must contain relative path@commit anchors")
     required_bindings = metadata.get("brain_required_bindings")
     if required_bindings is not None and (
         not isinstance(required_bindings, str) or not required_bindings.strip()
