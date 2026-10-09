@@ -9,7 +9,7 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
-## 0.8.2 - 2026-10-09
+## 0.8.2 - 2026-10-10
 
 - Packs and briefs now carry a "Corrections and Retractions" section: active
   records that supersede another record, and retractions with their reason,
