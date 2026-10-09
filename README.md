@@ -396,7 +396,7 @@ custody, an episode and a *proposed* review item. `mcp serve --read-only`
 removes capture. Example host configuration:
 
 ```json
-{"mcpServers": {"llm-brain": {"command": "llm-brain", "args": ["mcp", "serve", "--brain", "/home/alex/brain"]}}}
+{"mcpServers": {"llm-brain": {"command": "llm-brain", "args": ["mcp", "serve", "--brain", "/path/to/brain"]}}}
 ```
 
 Each server process serves exactly one brain (vault root): `--brain PATH`,
@@ -423,18 +423,19 @@ MCP process per person per brain.** Nothing listens on a port.
    ```
 
 2. Each person's MCP client starts its own server over SSH as that person, so
-   SSH authenticates the person and OS permissions enforce the boundary:
+   SSH authenticates the person and OS permissions enforce the boundary. The
+   remote shell expands `~` to that person's home directory:
 
    ```json
    {"mcpServers": {"llm-brain": {"command": "ssh",
-     "args": ["-T", "alex@server", "/home/alex/.local/bin/llm-brain", "mcp", "serve", "--brain", "/home/alex/brain"]}}}
+     "args": ["-T", "alex@server", "~/.local/bin/llm-brain", "mcp", "serve", "--brain", "~/brain"]}}}
    ```
 
 3. Optional: tie an SSH key to exactly one brain. Put this in
    `~alex/.ssh/authorized_keys` so the key can run nothing else:
 
    ```text
-   command="/home/alex/.local/bin/llm-brain mcp serve --brain /home/alex/brain",restrict ssh-ed25519 AAAA... alex-laptop
+   command="~/.local/bin/llm-brain mcp serve --brain ~/brain",restrict ssh-ed25519 AAAA... alex-laptop
    ```
 
 Each brain keeps its own locks (`BRAIN/.locks`), registry, hash-chained audit
