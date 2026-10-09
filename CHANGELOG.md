@@ -8,7 +8,7 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
-## 0.8.1 - Unreleased
+## 0.8.1 - 2026-10-09
 
 - Fixed stale-lock recovery on GNU/Linux: `lock_mtime` mixed `stat -f`
   filesystem output into the timestamp, so ownerless locks were never stale.
