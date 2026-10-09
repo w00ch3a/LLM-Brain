@@ -98,7 +98,7 @@ Commands:
   usage PROJECT_ID [--principal ID] [--json]
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
-  mcp serve [--read-only]
+  mcp serve [--brain PATH] [--project-id ID] [--read-only]   One process = one brain (vault root)
   neural-expansion demo [--output FILE.html] [--open] | neural-expansion path
   neural-expansion export PROJECT_ID --principal ID --output FILE.html [--open]   Experimental; LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1
   maintenance schedule declare PROJECT_ID --name TEXT --cadence TEXT [--runner hermes|codex|cron|other] [--max-age-days N]
@@ -7288,9 +7288,28 @@ cmd_mcp() {
   [ "$action" = serve ] || die 64 "mcp requires serve"
   resolve_okf_runtime
   helper="$(sibling_helper mcp_server.py)" || die 69 "MCP server helper is unavailable"
-  local -a args=("$helper" --cli "$SCRIPT_SOURCE" --cwd "$CWD")
-  [ "$ROOT_EXPLICIT" = 0 ] || args+=(--root "$ROOT")
-  exec "$OKF_PYTHON" "${args[@]}" "$@"
+  local brain="" read_only=0 project=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --brain) brain="${2:-}"; [ -n "$brain" ] || die 64 "--brain requires PATH"; shift 2 ;;
+      --read-only) read_only=1; shift ;;
+      --project-id) project="${2:-}"; validate_id "$project" || die 64 "invalid --project-id"; shift 2 ;;
+      *) die 64 "unknown mcp serve option: $1" ;;
+    esac
+  done
+  # Each server process is pinned to exactly one brain (vault root): --brain,
+  # else --root, else LLM_BRAIN_ROOT, else the platform default.  Tools can
+  # never name another root, so two MCP client entries with different brains
+  # stay isolated.
+  [ -n "$brain" ] || brain="$ROOT"
+  case "$brain" in /*) ;; *) brain="$CWD/$brain" ;; esac
+  [ -d "$brain" ] || die 66 "brain root does not exist: $brain (create it with: llm-brain --root PATH project ensure SOURCE_ROOT)"
+  [ ! -L "$brain" ] || die 65 "brain root must not be a symlink: $brain"
+  brain="$(cd "$brain" && pwd -P)"
+  local -a args=("$helper" --cli "$SCRIPT_SOURCE" --cwd "$CWD" --root "$brain")
+  [ "$read_only" = 0 ] || args+=(--read-only)
+  [ -z "$project" ] || args+=(--project-id "$project")
+  exec "$OKF_PYTHON" "${args[@]}"
 }
 
 # Neural Expansion: the read-only, offline memory-graph viewer.  The CLI only

@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ sys.dont_write_bytecode = True
 SERVER_NAME = "llm-brain"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 MAX_TEXT = 65536
+PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 TOOL_TIMEOUT = 120
 
 
@@ -83,20 +86,57 @@ class ToolError(Exception):
     pass
 
 
+class BrainError(Exception):
+    pass
+
+
+def pin_brain(root: str) -> Path:
+    """Validate the one brain (vault root) this process may touch.
+
+    On a shared host the brain must be a real directory owned by the server's
+    OS user and not writable by group or others; anything else could let a
+    second person read or plant memories.
+    """
+    path = Path(root)
+    if not path.is_absolute():
+        raise BrainError("brain root must be absolute")
+    if path.is_symlink():
+        raise BrainError("brain root must not be a symlink")
+    try:
+        info = path.stat()
+    except OSError as error:
+        raise BrainError("brain root is unavailable") from error
+    if not path.is_dir():
+        raise BrainError("brain root is not a directory")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise BrainError("brain root is owned by another OS user")
+    if info.st_mode & 0o022:
+        raise BrainError("brain root is writable by group or others; run: chmod 700 BRAIN")
+    if info.st_mode & 0o077:
+        print("llm-brain mcp: warning: brain root is readable by other OS users; run: chmod 700 BRAIN", file=sys.stderr)
+    return path.resolve()
+
+
 class Server:
-    def __init__(self, cli: str, root: str | None, read_only: bool, cwd: str) -> None:
+    def __init__(self, cli: str, root: str, read_only: bool, cwd: str, project_id: str = "") -> None:
         self.cli = cli
-        self.root = root
+        self.root = str(pin_brain(root))
         self.read_only = read_only
         self.cwd = cwd
+        self.pinned_project = project_id
+        # Child processes see only this brain.  Scratch files live in a fresh
+        # owner-only (0700) directory per server process, never a shared cache.
+        self.scratch = Path(tempfile.mkdtemp(prefix="llm-brain-mcp-"))
+        os.chmod(self.scratch, 0o700)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("LLM_BRAIN_ROOT")}
+        self.env["LLM_BRAIN_ROOT"] = self.root
+        self.env["TMPDIR"] = str(self.scratch)
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     def run_cli(self, *arguments: str) -> str:
-        command = [self.cli]
-        if self.root:
-            command += ["--root", self.root]
-        command += list(arguments)
+        command = [self.cli, "--root", self.root, *arguments]
         try:
-            completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TOOL_TIMEOUT, cwd=self.cwd)
+            completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TOOL_TIMEOUT, cwd=self.cwd, env=self.env)
         except subprocess.TimeoutExpired as error:
             raise ToolError("llm-brain command timed out") from error
         if completed.returncode != 0:
@@ -151,7 +191,13 @@ class Server:
 
     def project(self, arguments: dict[str, Any]) -> str:
         project_id = self.line_arg(arguments, "project_id")
+        if self.pinned_project:
+            if project_id and project_id != self.pinned_project:
+                raise ToolError("this server is pinned to a different project")
+            return self.pinned_project
         if project_id:
+            if not PROJECT_ID_RE.fullmatch(project_id):
+                raise ToolError("invalid project_id")
             return project_id
         detected = dict(line.split("=", 1) for line in self.run_cli("--cwd", self.source_root(arguments), "detect").splitlines() if "=" in line)
         if detected.get("scope") != "existing-project" or not detected.get("project_id"):
@@ -180,7 +226,7 @@ class Server:
             return output
         if name == "brain_recall":
             query = self.text_arg(arguments, "query", True)
-            with tempfile.TemporaryDirectory(prefix="llm-brain-mcp.") as scratch:
+            with tempfile.TemporaryDirectory(prefix="llm-brain-mcp.", dir=self.scratch) as scratch:
                 query_file = Path(scratch) / "query.txt"
                 query_file.write_text(query + "\n", encoding="utf-8")
                 command = ["bridge", "recall", "--source-root", self.source_root(arguments), "--query-file", str(query_file), "--budget-tokens", str(self.int_arg(arguments, "budget_tokens", 4000, 1, 32000))]
@@ -198,7 +244,7 @@ class Server:
             text = self.text_arg(arguments, "text", True)
             title = self.line_arg(arguments, "title") or "MCP capture"
             project_id = self.project(arguments)
-            with tempfile.TemporaryDirectory(prefix="llm-brain-mcp.") as scratch:
+            with tempfile.TemporaryDirectory(prefix="llm-brain-mcp.", dir=self.scratch) as scratch:
                 record = Path(scratch) / "mcp-capture.md"
                 record.write_text(f"---\ntype: MCPCapture\ntitle: {json.dumps(title)}\n---\n# {title}\n\n{text}\n", encoding="utf-8")
                 return self.run_cli("bridge", "capture", "--source-root", self.source_root(arguments), "--project-id", project_id, "--record", str(record))
@@ -228,8 +274,13 @@ class Server:
             arguments = params.get("arguments") or {}
             if not isinstance(name, str) or not isinstance(arguments, dict):
                 return error(request_id, -32602, "invalid tools/call params")
-            if name not in {entry["name"] for entry in tool_definitions(self.read_only)}:
+            definitions = {entry["name"]: entry for entry in tool_definitions(self.read_only)}
+            if name not in definitions:
                 return error(request_id, -32602, f"unknown tool: {name}")
+            unknown = set(arguments) - set(definitions[name]["inputSchema"]["properties"])
+            if unknown:
+                # e.g. "root" or "brain": a client can never redirect this server.
+                return error(request_id, -32602, "unknown arguments: " + ", ".join(sorted(unknown)))
             try:
                 text = self.call(name, arguments)
                 return result(request_id, {"content": [{"type": "text", "text": text}], "isError": False})
@@ -256,12 +307,24 @@ def error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cli", required=True)
-    parser.add_argument("--root")
+    parser.add_argument("--root", required=True, help="the one brain (vault root) this process serves")
+    parser.add_argument("--project-id", default="", help="optionally pin every tool to one project")
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--cwd", default=os.getcwd())
     args = parser.parse_args()
     cli = str(Path(args.cli).resolve())
-    server = Server(cli, args.root, args.read_only, str(Path(args.cwd).resolve()))
+    try:
+        server = Server(cli, args.root, args.read_only, str(Path(args.cwd).resolve()), args.project_id)
+    except BrainError as failure:
+        print(f"llm-brain mcp: {failure}", file=sys.stderr)
+        return 2
+    try:
+        return serve(server)
+    finally:
+        shutil.rmtree(server.scratch, ignore_errors=True)
+
+
+def serve(server: "Server") -> int:
     for line in sys.stdin:
         line = line.strip()
         if not line:
