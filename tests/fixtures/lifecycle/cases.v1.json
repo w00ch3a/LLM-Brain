@@ -453,6 +453,39 @@
         {"operation": "capture", "id": "audience-observation", "text": "Audience rule was recorded for team-alpha and team-beta."},
         {"operation": "retrieval", "query_id": "alpha-audience-rule"}
       ]
+    },
+    {
+      "id": "interference",
+      "description": "Many rapid updates to one fact: only the newest version may reach the pack; every older version is interference.",
+      "ground_truth": {
+        "records": [
+          {"id": "pool-size-v1", "title": "Worker pool size", "text": "The worker pool size is 2.", "state_key": "worker.pool_size", "valid_from": "2026-01-01T00:00:00Z", "valid_to": "2026-02-01T00:00:00Z"}
+        ],
+        "queries": [
+          {
+            "id": "current-pool-size",
+            "text": "worker pool size",
+            "expected_paths": ["okf/claims/pool-size-v8.md"],
+            "source_expected": true,
+            "source_event_ids": ["pool-size-observation"],
+            "forbidden_paths": ["pool-size-v1", "pool-size-v2", "pool-size-v3", "pool-size-v4", "pool-size-v5", "pool-size-v6", "pool-size-v7"],
+            "expected_states": {"pool-size-v8": "current"},
+            "expected_answer": "The worker pool size is 9.",
+            "as_of": "2026-09-05T00:00:00Z"
+          }
+        ]
+      },
+      "events": [
+        {"operation": "capture", "id": "pool-size-observation", "text": "Worker pool size was retuned seven times; it is now 9."},
+        {"operation": "supersession", "target": "pool-size-v1", "record": {"id": "pool-size-v2", "title": "Worker pool size", "text": "The worker pool size is 3.", "state_key": "worker.pool_size", "valid_from": "2026-02-01T00:00:00Z", "valid_to": "2026-03-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v2", "record": {"id": "pool-size-v3", "title": "Worker pool size", "text": "The worker pool size is 4.", "state_key": "worker.pool_size", "valid_from": "2026-03-01T00:00:00Z", "valid_to": "2026-04-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v3", "record": {"id": "pool-size-v4", "title": "Worker pool size", "text": "The worker pool size is 5.", "state_key": "worker.pool_size", "valid_from": "2026-04-01T00:00:00Z", "valid_to": "2026-05-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v4", "record": {"id": "pool-size-v5", "title": "Worker pool size", "text": "The worker pool size is 6.", "state_key": "worker.pool_size", "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v5", "record": {"id": "pool-size-v6", "title": "Worker pool size", "text": "The worker pool size is 7.", "state_key": "worker.pool_size", "valid_from": "2026-06-01T00:00:00Z", "valid_to": "2026-07-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v6", "record": {"id": "pool-size-v7", "title": "Worker pool size", "text": "The worker pool size is 8.", "state_key": "worker.pool_size", "valid_from": "2026-07-01T00:00:00Z", "valid_to": "2026-08-01T00:00:00Z"}},
+        {"operation": "supersession", "target": "pool-size-v7", "record": {"id": "pool-size-v8", "title": "Worker pool size", "text": "The worker pool size is 9.", "state_key": "worker.pool_size", "valid_from": "2026-08-01T00:00:00Z", "valid_to": "2035-01-01T00:00:00Z"}},
+        {"operation": "retrieval", "query_id": "current-pool-size"}
+      ]
     }
   ]
 }

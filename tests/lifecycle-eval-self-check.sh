@@ -51,7 +51,7 @@ if python3 "$evaluator" --cases "$tmp/short-cases.json" --output "$tmp/short" --
   fail 'mismatched output identity was accepted'
 fi
 
-# Full fixture smoke: all twelve families at both requested horizons.  The
+# Full fixture smoke: all thirteen families at both requested horizons.  The
 # default is one deterministic repetition to keep this self-check bounded;
 # set LIFECYCLE_FULL_REPEATS=5 for the acceptance run.
 full_repeats="${LIFECYCLE_FULL_REPEATS:-1}"
@@ -61,13 +61,26 @@ import json, sys
 summary = json.load(open(sys.argv[1], encoding="utf-8"))
 repeats = int(sys.argv[2])
 for mode, metric in summary["modes"].items():
-    assert metric["traces"] == 48 * repeats, (mode, metric["traces"])
+    assert metric["traces"] == 52 * repeats, (mode, metric["traces"])
     assert metric["checkpoint_evaluated"]
 assert summary["operation_counts"]["capture"] >= 24
 assert summary["operation_counts"]["retrieval"] >= 24
 assert summary["actual_write_cost"] > 0
 assert summary["repetition_semantics"].startswith("deterministic")
 assert summary["model_accuracy_note"].startswith("host-scored")
+PY
+
+# Interference stress: after seven rapid supersessions of one fact only the
+# newest version may reach any memory-backed retrieval.
+python3 - "$tmp/full/trace.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+rows = [row for row in rows if row["family_id"] == "interference" and row["mode"] in {"factual", "explicit", "evidence", "historical"}]
+assert rows
+for row in rows:
+    assert row["gold_hit"], row["candidate_paths"]
+    assert row["stale_leakage"] is False or row["stale_leakage"] == 0, row["candidate_paths"]
+    assert not any(path.startswith("okf/claims/pool-size-v") and path != "okf/claims/pool-size-v8.md" for path in row["candidate_paths"]), row["candidate_paths"]
 PY
 
 # Metric controls: source presence without a host-side source event mapping

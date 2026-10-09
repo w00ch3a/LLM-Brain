@@ -1,0 +1,53 @@
+{
+  "format": "llm-brain.outcome-evaluation",
+  "version": 1,
+  "tasks": [
+    {
+      "id": "retry-limit",
+      "task": "Fix the flaky upload: make the HTTP client use the agreed retry limit.",
+      "files": {
+        "settings.py": "RETRY_LIMIT = 3\nTIMEOUT_SECONDS = 10\n",
+        "check_settings.py": "import settings\nassert settings.RETRY_LIMIT == 7, settings.RETRY_LIMIT\n"
+      },
+      "memory": [
+        {"id": "retry-limit", "title": "HTTP client retry limit", "text": "In settings.py the RETRY_LIMIT constant must be 7 because the upstream gateway drops bursts.", "paths": ["settings.py"]}
+      ],
+      "test": ["python3", "check_settings.py"]
+    },
+    {
+      "id": "api-base",
+      "task": "Point the client at the correct regional API endpoint.",
+      "files": {
+        "client.py": "API_BASE = \"https://api.example.invalid/v1\"\n",
+        "check_client.py": "import client\nassert client.API_BASE == \"https://ap-southeast.example.invalid/v2\", client.API_BASE\n"
+      },
+      "memory": [
+        {"id": "api-base", "title": "Regional API endpoint", "text": "In client.py the API_BASE constant must be \"https://ap-southeast.example.invalid/v2\" for the production region.", "paths": ["client.py"]},
+        {"id": "api-noise", "title": "Coffee machine", "text": "The office coffee machine is on level 2."}
+      ],
+      "test": ["python3", "check_client.py"]
+    },
+    {
+      "id": "feature-flag",
+      "task": "Ship the new dashboard behind the flag the team agreed on.",
+      "files": {
+        "flags.py": "DASHBOARD_V2 = False\n",
+        "check_flags.py": "import flags\nassert flags.DASHBOARD_V2 is True\n"
+      },
+      "memory": [
+        {"id": "dashboard-flag", "title": "Dashboard rollout flag", "text": "In flags.py the DASHBOARD_V2 constant must be True once the dashboard ships.", "paths": ["flags.py"]}
+      ],
+      "test": ["python3", "check_flags.py"]
+    },
+    {
+      "id": "control-self-contained",
+      "task": "In limits.py the MAX_ITEMS constant must be 50; update it.",
+      "files": {
+        "limits.py": "MAX_ITEMS = 20\n",
+        "check_limits.py": "import limits\nassert limits.MAX_ITEMS == 50\n"
+      },
+      "memory": [],
+      "test": ["python3", "check_limits.py"]
+    }
+  ]
+}
