@@ -61,7 +61,7 @@ checkpoint assertions required for that query.
 
 ## Scenarios and checkpoints
 
-The harness covers twelve scenario families at short (20-event) and long
+The harness covers thirteen scenario families at short (20-event) and long
 (200-event) checkpoints. Each family/horizon receives its own temporary vault.
 The event timeline is replayed in order, with retrieval and procedure
 checkpoints evaluated at their declared point so later updates, retractions or
@@ -166,3 +166,33 @@ state. The optional `--portability-matrix` compares explicitly supplied local
 CLI pairs only; missing or non-executable pairs keep the aggregate
 `portability.status=unmeasured`. It does not measure external KV/session-state
 portability or shipped compatibility.
+
+## v0.8 outcome harness
+
+`scripts/eval-outcome.py` answers a different question from the lifecycle
+evaluator: does memory change whether a small coding task succeeds? Each task
+in a versioned case file (`tests/fixtures/outcome/tasks.v1.json`) declares
+starting files, approved memory records (optionally with `paths` globs) and an
+argv test command whose program must be `python3`, `sh` or `bash`. Every task
+runs twice in disposable workspaces:
+
+- `off`: the runner receives only the task text;
+- `on`: a disposable vault is seeded with the task's memory, and the runner
+  also receives a context pack built with `--path` hints for the task files.
+
+The runner is a trusted local executable invoked as
+`RUNNER request.json output.json`. Its self-report is ignored; only the test
+command's exit status counts. `summary.json` records pass rates per mode,
+`uplift` (on minus off), `regressions` (tasks that pass without memory but fail
+with it), mean context bytes and the case and runner hashes. `results.jsonl`
+holds one row per task and mode. Existing output directories are rejected.
+
+The bundled `scripts/outcome-reference-runner.py` is deterministic and applies
+only edits written in a fixed sentence form. It proves that the harness detects
+memory-dependent outcomes (1/4 tasks pass with memory off, 4/4 with it on). It
+is not a model result. To measure an agent, pass `--runner` with a wrapper
+that calls that agent.
+
+The lifecycle fixture also includes an `interference` family. One fact is
+superseded seven times in quick succession, and every memory-backed mode must
+return only the newest version, with zero stale leakage.

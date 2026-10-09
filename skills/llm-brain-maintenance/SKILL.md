@@ -34,6 +34,17 @@ work, malformed receipts, index health, provenance gaps and retraction
 residuals. A finding recommends inspection or re-verification; it never
 deletes, retracts, promotes or rebuilds anything.
 
+Code drift is also a finding: a concept's `brain_code_anchors: ["path@commit"]`
+file changed in the registered source root, so re-verify that concept. A
+separate advisory section never changes health. It lists retention candidates
+from receipts and feedback (only when usage evidence exists), memory-doctor
+orphans, likely duplicates and oversized concepts, spaced re-verification
+suggestions and unverifiable anchors. Present advisories as optional review
+items. Related read-only views are `usage PROJECT_ID`, `stability show
+PROJECT_ID`, `review triage PROJECT_ID` and `association propose PROJECT_ID`.
+Only run `stability apply` or `association propose --write-review` when the
+user asks.
+
 Status reports `reminder=none`, `run-or-schedule`, `report-stale` or
 `unavailable`. The automatic contract only surfaces one concise stale-only
 reminder; missing or unavailable status remains fail-open. Use `--strict` when

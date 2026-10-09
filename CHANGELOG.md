@@ -8,6 +8,26 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.8.0 - unreleased candidate
+
+- Added deterministic stdlib BM25F lexical scoring (legacy scorer kept behind
+  `LLM_BRAIN_LEXICAL_SCORER=legacy`) and `brain_paths` glob recall via task
+  text or `--path`.
+- Added a size-capped `brief` command, injected read-only by the SessionStart
+  hook (`LLM_BRAIN_SESSION_BRIEF=0` opts out).
+- Added operational intentions with date, path, keyword and state triggers;
+  due intentions lead context packs.
+- Added `usage`, advisory maintenance signals (retention, orphans, duplicates,
+  oversized, spaced review) and `path@commit` code anchors with code-drift
+  re-verification findings.
+- Added FSRS-style `stability show` and audited `stability apply`.
+- Added co-use `association propose`, schema-fit `review triage`, and an opt-in
+  usage boost with a diversity guard.
+- Added `mcp serve` (stdio MCP, review-only capture), the outcome harness
+  `scripts/eval-outcome.py`, and a lifecycle interference family.
+- Preserved schema 3, OKF v0.2, review gates and dependencies; no vault
+  migration.
+
 ## 0.7.6 - 2026-10-02
 
 - Batched request-local OKF facts during index preparation with source-byte

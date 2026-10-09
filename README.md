@@ -41,17 +41,44 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
-## Indexing and retrieval updates
+## What's new in 0.8
 
-Index builds batch OKF parsing within a single request and bind the parsed
-facts to the admitted source bytes. Before publishing an index, the writer
-rechecks source hashes, paths and effective record inventory under the project
-lock. Visibility, provenance and lifecycle checks retain their existing rules.
+Version 0.8 adds memory signals that stay deterministic, derived and
+review-gated. Storage schema 3 and OKF v0.2 are unchanged, and no dependency
+or vault migration is added.
 
-`llm-brain search --help` lists the supported options; incomplete search
-commands report a usage error. When recalling access workflows, agents search
-exact names and remembered aliases, verify the configured root and index
-coverage, and distinguish historical recall from current tool access.
+- **BM25F lexical ranking.** Titles and frontmatter weigh more than body text.
+  Scores are recomputed from canonical files on every query, so there is no
+  index to drift. `LLM_BRAIN_LEXICAL_SCORER=legacy` restores the previous
+  scorer.
+- **File-aware recall.** Concepts may declare `brain_paths` globs (quote them:
+  `brain_paths: ["src/api/**"]`). A task that names a matching file, or
+  `--path FILE`, boosts those concepts.
+- **Session brief.** `llm-brain brief` prints a size-capped summary of durable
+  approved facts, due intentions and recent changes. The SessionStart hook
+  injects it read-only and fail-open; `LLM_BRAIN_SESSION_BRIEF=0` turns it off.
+- **Intentions.** `intention add` records "do X when Y" with a date, path,
+  keyword or state-change trigger. Due intentions appear at the top of packs.
+- **Usage, doctor and code anchors.** `usage` reports use counts and last-used
+  dates from opt-in receipts and feedback. Maintenance adds advisory retention,
+  orphan, duplicate and oversized signals; nothing is deleted. Concepts may
+  declare `brain_code_anchors: ["path@commit"]`, and maintenance flags them for
+  re-verification when git shows the file changed.
+- **Spaced re-verification.** `stability show` derives an FSRS-style stability
+  per record; `stability apply` explicitly moves `stale_after`.
+- **Co-use links and review triage.** `association propose --write-review`
+  proposes associations for records that keep appearing together in useful
+  packs. `review triage` orders the queue: conflicts first, schema fits in a
+  low-risk batch. Neither promotes anything automatically.
+- **Diversity guard.** With `--usage-boost`, popular records get a modest boost
+  and relevant, rarely used records keep reserved slots.
+- **MCP server.** `llm-brain mcp serve` exposes search, packs, recall, status,
+  brief and review-only capture over stdio.
+- **Outcome evaluation.** `scripts/eval-outcome.py` runs small coding tasks
+  with and without memory and scores them only with executable tests.
+
+Index builds still batch OKF parsing and bind parsed facts to the admitted
+source bytes. `llm-brain search --help` lists the supported options.
 
 ## Easiest install
 
@@ -326,7 +353,9 @@ LLM-Brain supports:
 - cross-episode consolidation, contradiction reviews and reversible projections;
 - governed procedure runs, outcome evidence and usefulness feedback;
 - dependency-scoped capsule validation, bounded lifecycle evidence bundles and disposable memory-integrity evaluations;
-- evaluation across raw sources, episodes and canonical retrieval under the same budget.
+- evaluation across raw sources, episodes and canonical retrieval under the same budget;
+- deterministic BM25F lexical scoring with `brain_paths` file-glob recall (`--path FILE`) and an opt-in usage boost with a diversity guard (`--usage-boost`, `LLM_BRAIN_DIVERSITY_RESERVE`, default 2);
+- prospective memory: `intention add PROJECT_ID --action TEXT --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY` records operational intentions (never canonical OKF) that appear first in packs when due.
 
 Experimental prediction-error reflection and procedure replay remain disabled until you enable their separate flags. Learned routing, latent memory and adaptive KV integration stay behind negative evidence gates until an implementation earns them.
 
@@ -352,6 +381,19 @@ Reusable procedures can be prepared for an exact target:
 Capsules bind the procedure hash, task, principal, bindings, declared dependencies, resolved evidence and verification requirements. Procedures can declare `brain_required_bindings`, `brain_applicability`, `brain_prerequisites` and `brain_verification` metadata. `run validate` is read-only and recomputes the recorded dependency closure; `run start --capsule` performs the same check immediately before creating the run. A changed, hidden, expired or unresolved dependency makes the capsule stale or blocked and requires a fresh preparation. Unrelated project changes do not invalidate it. Capsules are idempotent, non-canonical and never automatically executed or injected by Hermes.
 
 Evidence retrieval is also explicit. `search` and `pack build` with `--intent evidence` can return bounded JSON `evidence_bundles` around selected records: current or historical versions, supporting evidence, conflicts, derivation and unresolved relationships. Each entry keeps its role/state, bounded excerpt and source hash; warnings and `incomplete` report hidden, unresolved or budget-limited links. The bundle follows only declared relationships; it does not merge records, infer agreement or change canonical memory. Hidden material is filtered before rendering.
+
+### MCP server
+
+`llm-brain mcp serve` runs a stdio MCP server (JSON-RPC 2.0, stdlib only). Its
+tools are `brain_search`, `brain_pack_build`, `brain_recall`, `brain_status`,
+`brain_brief` and `brain_capture`. Every tool calls the CLI, so locks, audit,
+visibility and secret scanning are unchanged. Capture creates only source
+custody, an episode and a *proposed* review item. `mcp serve --read-only`
+removes capture. Example host configuration:
+
+```json
+{"mcpServers": {"llm-brain": {"command": "llm-brain", "args": ["mcp", "serve"]}}}
+```
 
 ### Governed maintenance
 
@@ -383,7 +425,23 @@ maintenance and schedule states, report state/hash, bounded counts/items,
 recommendations and the reminder (`none`, `run-or-schedule`, `report-stale` or
 `unavailable`).
 
-The repository-only lifecycle evaluator runs twelve ground-truth scenario families at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](docs/evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
+Reports also carry a separate **advisory signals** section that never changes
+maintenance health: retention candidates from usage evidence (only when
+receipts or feedback exist), memory-doctor findings (orphans, likely duplicates,
+oversized concepts), spaced re-verification suggestions and unverifiable code
+anchors. Code drift from `brain_code_anchors` is the one new real finding: it
+recommends re-verification when the project's registered source root shows the
+anchored file changed since the recorded commit. Related read-only commands
+are `usage PROJECT_ID`, `stability show PROJECT_ID`, `review triage PROJECT_ID`
+and `association propose PROJECT_ID`.
+
+The repository-only outcome harness runs small coding tasks with and without
+LLM-Brain and scores them only with executable tests:
+`scripts/eval-outcome.py --cases tests/fixtures/outcome/tasks.v1.json --output NEW_DIR [--runner EXECUTABLE]`.
+The bundled reference runner is deterministic and only proves that the harness
+measures memory-dependent outcomes; plug in a real agent with `--runner`.
+
+The repository-only lifecycle evaluator runs thirteen ground-truth scenario families (including a rapid-update interference stress family) at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](docs/evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
 
 ## Safety boundaries
 
@@ -422,4 +480,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.7.6 release notes](docs/releases/v0.7.6.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.0 release notes](docs/releases/v0.8.0.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
