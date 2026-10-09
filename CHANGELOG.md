@@ -25,6 +25,20 @@
   usage boost with a diversity guard.
 - Added `mcp serve` (stdio MCP, review-only capture), the outcome harness
   `scripts/eval-outcome.py`, and a lifecycle interference family.
+- Added Neural Expansion, an offline read-only memory-graph viewer
+  (`neural-expansion demo|path`, alias `viewer`). It ships only a synthetic
+  demo. Private, principal-filtered real-vault export is experimental and needs
+  `LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1`.
+- MCP servers are pinned to one brain: `mcp serve --brain PATH [--project-id
+  ID]`. Root-override arguments, foreign-owned or group/world-writable roots,
+  symlinked roots and traversal ids are refused. Documented the "two people,
+  one server, two brains" SSH setup.
+- Added `upgrade repair-standalone --source DIR`. It completes standalone
+  trees written by 0.7.6-or-older upgraders, which copy only `lib/okf.py`.
+  Core commands now fail open when a newer helper is missing.
+- Fixed upgrade re-staging, which minted a duplicate, double-prefixed custody
+  copy for sources already in `sources/`.
+- Fixed an unbound variable in `import replication --dry-run`.
 - Preserved schema 3, OKF v0.2, review gates and dependencies; no vault
   migration.
 

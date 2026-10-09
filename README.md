@@ -72,8 +72,12 @@ or vault migration is added.
   low-risk batch. Neither promotes anything automatically.
 - **Diversity guard.** With `--usage-boost`, popular records get a modest boost
   and relevant, rarely used records keep reserved slots.
-- **MCP server.** `llm-brain mcp serve` exposes search, packs, recall, status,
-  brief and review-only capture over stdio.
+- **MCP server.** `llm-brain mcp serve --brain PATH` exposes search, packs,
+  recall, status, brief and review-only capture over stdio. Each process
+  serves one brain. See "Two people, one server, two brains".
+- **Neural Expansion.** `llm-brain neural-expansion demo --open` opens an
+  offline, read-only memory-graph viewer. Private real-vault export is
+  experimental and opt-in.
 - **Outcome evaluation.** `scripts/eval-outcome.py` runs small coding tasks
   with and without memory and scores them only with executable tests.
 
@@ -392,8 +396,65 @@ custody, an episode and a *proposed* review item. `mcp serve --read-only`
 removes capture. Example host configuration:
 
 ```json
-{"mcpServers": {"llm-brain": {"command": "llm-brain", "args": ["mcp", "serve"]}}}
+{"mcpServers": {"llm-brain": {"command": "llm-brain", "args": ["mcp", "serve", "--brain", "/home/alex/brain"]}}}
 ```
+
+Each server process serves exactly one brain (vault root): `--brain PATH`,
+else `--root`, else `LLM_BRAIN_ROOT`, else the platform default. The root is
+resolved once at start-up and never changes. Tools have no root argument;
+unknown arguments such as `root` or `brain` are rejected. Project ids
+are validated, so `../` cannot leave the brain. `--project-id ID` narrows a
+server to one project. Start-up refuses a brain that is missing, a symlink,
+owned by another OS user, or writable by group/others, and warns if others can
+read it. Child CLI calls see only the pinned root. They use a fresh 0700 scratch
+directory per process, so there is no shared cache.
+
+#### Two people, one server, two brains
+
+Recommended setup: **one OS account and one brain per person, with one stdio
+MCP process per person per brain.** Nothing listens on a port.
+
+1. Give each person their own account on the server (`alex`, `sam`) and a
+   private brain in their home directory:
+
+   ```bash
+   sudo -u alex sh -c 'umask 077; mkdir -p ~/brain && chmod 700 ~/brain'
+   sudo -u sam  sh -c 'umask 077; mkdir -p ~/brain && chmod 700 ~/brain'
+   ```
+
+2. Each person's MCP client starts its own server over SSH as that person, so
+   SSH authenticates the person and OS permissions enforce the boundary:
+
+   ```json
+   {"mcpServers": {"llm-brain": {"command": "ssh",
+     "args": ["-T", "alex@server", "/home/alex/.local/bin/llm-brain", "mcp", "serve", "--brain", "/home/alex/brain"]}}}
+   ```
+
+3. Optional: tie an SSH key to exactly one brain. Put this in
+   `~alex/.ssh/authorized_keys` so the key can run nothing else:
+
+   ```text
+   command="/home/alex/.local/bin/llm-brain mcp serve --brain /home/alex/brain",restrict ssh-ed25519 AAAA... alex-laptop
+   ```
+
+Each brain keeps its own locks (`BRAIN/.locks`), registry, hash-chained audit
+log and receipts. Two processes never share state. Even a misconfigured client
+cannot reach the other brain: the OS denies access, and the server refuses a
+brain owned by another user. `tests/mcp-multi-brain-self-check.sh` covers these cases:
+cross-brain project ids, root-override arguments, `../` ids, `--brain`
+precedence over `LLM_BRAIN_ROOT`, project pins, unsafe or symlinked roots, and
+an unchanged neighbouring brain.
+
+If both brains must live under one OS account, list two entries with different
+`--brain` paths. Isolation then depends on configuration, not the OS: any
+process running as that account can read both brains. Use separate accounts
+when the people do not fully trust each other.
+
+There is no networked (HTTP/SSE) MCP server. A shared daemon would need its own
+authentication, TLS, token storage and per-identity root mapping, and would run
+as one OS user able to read every brain. That gives up the OS boundary that
+makes the SSH setup safe, so it is not built. A forced-command SSH key already
+maps an authenticated identity to exactly one brain.
 
 ### Governed maintenance
 
@@ -443,6 +504,33 @@ measures memory-dependent outcomes; plug in a real agent with `--runner`.
 
 The repository-only lifecycle evaluator runs thirteen ground-truth scenario families (including a rapid-update interference stress family) at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](docs/evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
 
+## Neural Expansion
+
+Neural Expansion is a read-only, offline memory-graph viewer. It shows records
+and their typed relations as an interactive graph, with search, status filters,
+a detail panel and a keyboard-accessible list view. Each page is one
+self-contained HTML file. It has no network calls, external assets, telemetry
+or dependencies.
+
+```bash
+llm-brain neural-expansion demo --open     # bundled synthetic demo (alias: llm-brain viewer)
+llm-brain neural-expansion path            # where the demo page lives
+```
+
+Real-vault pages are experimental and off by default. The export uses the
+current index, applies lifecycle and principal visibility filtering before
+serialisation, and writes one new `0600` file outside the vault:
+
+```bash
+LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 \
+  llm-brain neural-expansion export PROJECT_ID --principal ID --output /private/dir/brain.html
+```
+
+`--principal` is a visibility filter, not authentication. Don't share,
+sync or serve exported pages. See
+[`neural-expansion/README.md`](neural-expansion/README.md) and
+[`neural-expansion/PRIVACY.md`](neural-expansion/PRIVACY.md).
+
 ## Safety boundaries
 
 - Current source and explicit user instructions outrank stored memory.
@@ -472,6 +560,23 @@ Inspect the complete plan before applying it:
 ```
 
 Installation and ordinary memory use do not migrate a live vault. Keep the existing trusted marketplace or extension source during upgrades.
+
+Upgrade apply re-stages every vault, keeps a backup and a rollback tree, and
+verifies the result before cutover. Records come through with the same values,
+but YAML frontmatter may be re-serialised. A **standalone** install upgraded by
+0.7.6 or older only receives `lib/okf.py`, because the old upgrader copies just
+that file. Core commands still work on the partial tree. To finish the
+install, run the new CLI once against the same release source:
+
+```bash
+llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.0
+```
+
+It checks that the source matches the installed CLI byte for byte, then adds
+only the missing helpers and Neural Expansion. Plugin and extension hosts
+install the full package and don't need this step.
+`tests/upgrade-from-previous-self-check.sh` runs the real 0.7.6 to 0.8.0
+upgrade on a populated synthetic vault.
 
 ## Development
 

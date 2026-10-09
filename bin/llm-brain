@@ -140,6 +140,7 @@ Commands:
   upgrade apply --all --host auto --target VERSION --plan-hash HASH [--root ROOT]
   upgrade verify --receipt FILE
   upgrade rollback --receipt FILE
+  upgrade repair-standalone --source RELEASE_DIR
   help | --version
 
 The core never calls a model itself. Reflectors and embedders are explicit,
@@ -200,7 +201,12 @@ sibling_helper() {
 memory_signals() {
   local helper
   resolve_okf_runtime
-  helper="$(sibling_helper memory_signals.py)" || die 69 "memory signals helper is unavailable"
+  # Return (not die) so callers that fail open keep working on an incomplete
+  # install, e.g. a standalone tree written by an older release's upgrader.
+  if ! helper="$(sibling_helper memory_signals.py)"; then
+    printf 'llm-brain: lib/memory_signals.py is missing beside %s; run: llm-brain upgrade repair-standalone --source RELEASE_DIR\n' "$SCRIPT_SOURCE" >&2
+    return 69
+  fi
   "$OKF_PYTHON" "$helper" "$@"
 }
 
@@ -6007,9 +6013,12 @@ cmd_search() {
     if [ "${#path_hints[@]}" -gt 0 ]; then
       for term in "${path_hints[@]}"; do bm25_args+=(--hint-path "$term"); done
     fi
-    memory_signals "${bm25_args[@]}" >"$tmp_dir/bm25.tsv" || die 69 "lexical scorer failed"
-    cut -f1,2 "$tmp_dir/bm25.tsv" >"$lexical_raw"
-    path_matched="$(awk -F '\t' '$3 != "-" && $3 != "" { count++ } END { print count + 0 }' "$tmp_dir/bm25.tsv")"
+    if memory_signals "${bm25_args[@]}" >"$tmp_dir/bm25.tsv"; then
+      cut -f1,2 "$tmp_dir/bm25.tsv" >"$lexical_raw"
+      path_matched="$(awk -F '\t' '$3 != "-" && $3 != "" { count++ } END { print count + 0 }' "$tmp_dir/bm25.tsv")"
+    else
+      printf 'llm-brain: BM25F unavailable; using the legacy lexical scorer\n' >&2
+    fi
   fi
   sort -t $'\t' -k2,2gr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
 
@@ -8350,8 +8359,15 @@ migrate_project_in_place() {
     fi
     if resolve_legacy_source "$dir" "$id" "$pointer" "$hash" "$algorithm"; then
       custody_hash="$(sha256_file "$MIGRATION_SOURCE_PATH")"
-      dest="$dir/sources/${custody_hash}-$(slug "$(basename "$MIGRATION_SOURCE_PATH")").md"
-      [ -f "$dest" ] || { cp "$MIGRATION_SOURCE_PATH" "$dest"; printf '%s  %s\n' "$custody_hash" "$(basename "$dest")" >"$dest.sha256"; }
+      case "$MIGRATION_SOURCE_PATH" in
+        # Already a custody copy (schema-3 vault re-staged by upgrade): reuse
+        # it instead of minting a second, double-prefixed copy.
+        "$dir"/sources/*) dest="$MIGRATION_SOURCE_PATH" ;;
+        *)
+          dest="$dir/sources/${custody_hash}-$(slug "$(basename "$MIGRATION_SOURCE_PATH")").md"
+          [ -f "$dest" ] || { cp "$MIGRATION_SOURCE_PATH" "$dest"; printf '%s  %s\n' "$custody_hash" "$(basename "$dest")" >"$dest.sha256"; }
+          ;;
+      esac
       status="recovered"; [ "$algorithm" = sha256 ] || status="recovered-legacy-md5"
       set_frontmatter_field "$source" brain_source_hash_algorithm "$algorithm"
       set_frontmatter_field "$source" brain_source_custody_hash_sha256 "$custody_hash"
@@ -8772,6 +8788,43 @@ upgrade_replace_local_plugin_source() {
     die 73 "local plugin source cutover failed"
   fi
   rm -rf "$previous"
+}
+
+# Releases up to 0.7.6 install only lib/okf.py when they drive a standalone
+# upgrade, so the new tree lacks its newer helpers.  Complete *this* installed
+# standalone tree from the exact release source it was built from.
+cmd_upgrade_repair_standalone() {
+  local source="" install_root expected helper repaired=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) source="${2:-}"; [ -n "$source" ] || die 64 "--source requires DIR"; shift 2 ;;
+      *) die 64 "unknown upgrade repair-standalone option: $1" ;;
+    esac
+  done
+  [ -n "$source" ] || die 64 "upgrade repair-standalone requires --source RELEASE_DIR"
+  [ -d "$source" ] || die 66 "release source missing: $source"
+  source="$(cd "$source" && pwd -P)"
+  install_root="${LLM_BRAIN_STANDALONE_ROOT:-$HOME/.local/lib/llm-brain}"
+  [ -d "$install_root" ] || die 66 "no standalone install root: $install_root"
+  expected="$(cd "$install_root" && pwd -P)/$VERSION"
+  [ "$SCRIPT_DIR" = "$expected" ] || die 65 "this llm-brain is not the standalone $VERSION install ($expected)"
+  [ "$(tr -d '[:space:]' <"$source/VERSION" 2>/dev/null)" = "$VERSION" ] || die 65 "release source is not version $VERSION"
+  [ -f "$source/bin/llm-brain" ] && [ "$(sha256_file "$source/bin/llm-brain")" = "$(sha256_file "$SCRIPT_SOURCE")" ] ||
+    die 65 "release source CLI does not match the installed CLI"
+  mkdir -p "$SCRIPT_DIR/lib"
+  for helper in okf.py replication.py memory_signals.py mcp_server.py; do
+    [ -f "$source/lib/$helper" ] || continue
+    if [ ! -f "$SCRIPT_DIR/lib/$helper" ] || ! cmp -s "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; then
+      install -m 0644 "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; repaired="$repaired lib/$helper"
+    fi
+  done
+  if [ -d "$source/neural-expansion" ] && [ ! -d "$SCRIPT_DIR/neural-expansion" ]; then
+    cp -R "$source/neural-expansion" "$SCRIPT_DIR/neural-expansion"
+    find "$SCRIPT_DIR/neural-expansion" -name __pycache__ -prune -exec rm -rf {} +
+    repaired="$repaired neural-expansion/"
+  fi
+  printf 'standalone_repair=ok install=%s repaired=%s\n' "$SCRIPT_DIR" "${repaired# }"
+  [ -n "$repaired" ] || printf 'standalone_repair_note=already-complete\n'
 }
 
 upgrade_update_host() {
@@ -9233,7 +9286,8 @@ cmd_upgrade() {
     apply) cmd_upgrade_apply "$@" ;;
     verify) cmd_upgrade_verify "$@" ;;
     rollback) cmd_upgrade_rollback "$@" ;;
-    *) die 64 "upgrade requires check, apply, verify, or rollback" ;;
+    repair-standalone) cmd_upgrade_repair_standalone "$@" ;;
+    *) die 64 "upgrade requires check, apply, verify, rollback, or repair-standalone" ;;
   esac
 }
 
