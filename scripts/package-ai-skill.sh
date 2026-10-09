@@ -29,10 +29,17 @@ bash -n "$repo_root/tests/automatic-use-self-check.sh"
 bash -n "$repo_root/tests/replication-self-check.sh"
 bash -n "$repo_root/tests/openclaw-adapter-self-check.sh"
 bash -n "$repo_root/tests/core-contract-self-check.sh"
+bash -n "$repo_root/tests/memory-signals-self-check.sh"
+bash -n "$repo_root/tests/mcp-self-check.sh"
+bash -n "$repo_root/tests/outcome-eval-self-check.sh"
 bash -n "$repo_root/hooks/session-start.sh"
 python3 -m py_compile "$repo_root/lib/okf.py"
 python3 -m py_compile "$repo_root/lib/replication.py"
+python3 -m py_compile "$repo_root/lib/memory_signals.py"
+python3 -m py_compile "$repo_root/lib/mcp_server.py"
 python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
+python3 -m py_compile "$repo_root/scripts/eval-outcome.py"
+python3 -m py_compile "$repo_root/scripts/outcome-reference-runner.py"
 
 python3 - "$repo_root" "$version" <<'PY'
 import json
@@ -76,6 +83,8 @@ cp -R "$repo_root/skills/." "$plugin/skills/"
 install -m 0755 "$repo_root/bin/llm-brain" "$plugin/skills/llm-brain/scripts/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py"
 install -m 0755 "$repo_root/lib/replication.py" "$plugin/skills/llm-brain/scripts/replication.py"
+install -m 0755 "$repo_root/lib/memory_signals.py" "$plugin/skills/llm-brain/scripts/memory_signals.py"
+install -m 0755 "$repo_root/lib/mcp_server.py" "$plugin/skills/llm-brain/scripts/mcp_server.py"
 install -m 0644 "$repo_root/references/architecture.md" "$plugin/skills/llm-brain/references/architecture.md"
 install -m 0644 "$repo_root/VERSION" "$plugin/skills/llm-brain/VERSION"
 install -m 0644 "$repo_root/docs/evaluation.md" "$plugin/docs/evaluation.md"
@@ -88,6 +97,8 @@ install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/CONTRIBU
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"
+install -m 0755 "$repo_root/lib/memory_signals.py" "$standalone/lib/memory_signals.py"
+install -m 0755 "$repo_root/lib/mcp_server.py" "$standalone/lib/mcp_server.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
 install -m 0644 "$repo_root/docs/evaluation.md" "$standalone/docs/evaluation.md"
 install -m 0644 "$release_notes" "$standalone/docs/releases/v${version}.md"
@@ -163,6 +174,8 @@ def verify(path: Path, kind: str) -> None:
             else f"{name}/bin/llm-brain"
         )
         required = {f"{name}/VERSION", cli, f"{name}/requirements-okf.lock", f"{name}/CONTRIBUTING.md", f"{name}/SECURITY.md"}
+        helper_dir = f"{name}/skills/llm-brain/scripts" if kind == "plugin" else f"{name}/lib"
+        required |= {f"{helper_dir}/okf.py", f"{helper_dir}/memory_signals.py", f"{helper_dir}/mcp_server.py"}
         if kind == "plugin":
             required |= {
                 f"{name}/.codex-plugin/plugin.json",

@@ -53,7 +53,11 @@ static_checks() {
     bash -n "$repo_root/bin/llm-brain" -- \
     python3 -m py_compile "$repo_root/lib/okf.py" -- \
     python3 -m py_compile "$repo_root/lib/replication.py" -- \
-    python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
+    python3 -m py_compile "$repo_root/lib/memory_signals.py" -- \
+    python3 -m py_compile "$repo_root/lib/mcp_server.py" -- \
+    python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py" -- \
+    python3 -m py_compile "$repo_root/scripts/eval-outcome.py" -- \
+    python3 -m py_compile "$repo_root/scripts/outcome-reference-runner.py"
   while IFS= read -r -d '' test_file; do
     if ! bash -n "$test_file"; then
       return 1
@@ -81,7 +85,10 @@ core_checks() {
     bash "$repo_root/tests/v07-regression-self-check.sh" -- \
     bash "$repo_root/tests/experimental-gates-self-check.sh" -- \
     bash "$repo_root/tests/research-upgrades-self-check.sh" -- \
+    bash "$repo_root/tests/memory-signals-self-check.sh" -- \
+    bash "$repo_root/tests/mcp-self-check.sh" -- \
     bash "$repo_root/tests/lifecycle-eval-self-check.sh" -- \
+    bash "$repo_root/tests/outcome-eval-self-check.sh" -- \
     bash "$repo_root/tests/eval-self-check.sh" -- \
     bash "$repo_root/tests/replication-self-check.sh" -- \
     bash "$repo_root/tests/openclaw-adapter-self-check.sh" -- \
