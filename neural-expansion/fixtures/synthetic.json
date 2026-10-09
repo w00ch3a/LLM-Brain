@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "project": "Synthetic demo",
+    "version": "0.7.5",
+    "source": "synthetic OKF-shaped fixture",
+    "privacy": "Synthetic only"
+  },
+  "nodes": [
+    {"id":"okf/concepts/local-first.md","title":"Local-first memory","type":"Concept","status":"stable","trust":"human-reviewed","generated":"2026-08-19","provenance":"human://design-review","excerpt":"Canonical knowledge remains inspectable Markdown. Indexes and visualization stay derived and rebuildable."},
+    {"id":"okf/claims/graph-export.md","title":"Graph export contract","type":"Claim","status":"stable","trust":"human-reviewed","generated":"2026-08-21","provenance":"human://architecture-review","excerpt":"The graph index contains typed source, relation, target triples. Its edges are a retrieval aid, not authority."},
+    {"id":"okf/procedures/read-only-review.md","title":"Read-only review","type":"Procedure","status":"stable","trust":"verified","generated":"2026-08-25","provenance":"process://qa-fixture","excerpt":"Inspect the export and source hash before acting. Never write from the visualization."},
+    {"id":"okf/claims/storage-latency.md","title":"Remote filesystem latency","type":"Claim","status":"proposed","trust":"unverified","generated":"2026-09-30","provenance":"human://benchmark-fixture","excerpt":"Observed slow source reads suggest an I/O lead, not proof of retrieval algorithm cost."},
+    {"id":"okf/decisions/no-second-store.md","title":"No second memory store","type":"Decision","status":"stable","trust":"human-reviewed","generated":"2026-08-10","provenance":"human://project-owner","excerpt":"A viewer consumes the existing export and does not own memory state."},
+    {"id":"okf/projections/assoc-local-graph.md","title":"Local graph association","type":"AssociativeProjection","status":"derived","trust":"derived","generated":"2026-09-01","provenance":"process://fixture","excerpt":"Synthetic derived association; it cannot amplify source authority."},
+    {"id":"episodes/2026-08-21/index.md","title":"Graph interface discussion","type":"Episode","status":"history","trust":"historical","generated":"2026-08-21","provenance":"episode://fixture","excerpt":"Explored a browser-based visualization while retaining Markdown and review workflows."},
+    {"id":"review/rw-visualizer-001.md","title":"Visualizer review candidate","type":"ReviewItem","status":"pending","trust":"unresolved","generated":"2026-09-30","provenance":"review://fixture","excerpt":"A candidate idea stays quarantined from canonical claims until the established review flow accepts it."}
+  ],
+  "edges": [
+    {"source":"okf/concepts/local-first.md","relation":"supports","target":"okf/decisions/no-second-store.md"},
+    {"source":"okf/claims/graph-export.md","relation":"derived_from","target":"okf/concepts/local-first.md"},
+    {"source":"okf/claims/graph-export.md","relation":"supports","target":"okf/procedures/read-only-review.md"},
+    {"source":"okf/procedures/read-only-review.md","relation":"depends_on","target":"okf/decisions/no-second-store.md"},
+    {"source":"okf/claims/storage-latency.md","relation":"conflicts_with","target":"okf/claims/graph-export.md"},
+    {"source":"okf/projections/assoc-local-graph.md","relation":"associates","target":"okf/claims/graph-export.md"},
+    {"source":"episodes/2026-08-21/index.md","relation":"historical_context","target":"okf/concepts/local-first.md"},
+    {"source":"review/rw-visualizer-001.md","relation":"proposed_for_review","target":"okf/claims/graph-export.md"},
+    {"source":"okf/claims/graph-export.md","relation":"contains","target":"okf/claims/graph-export.md"}
+  ]
+}

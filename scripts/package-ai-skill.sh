@@ -32,6 +32,7 @@ bash -n "$repo_root/tests/core-contract-self-check.sh"
 bash -n "$repo_root/tests/memory-signals-self-check.sh"
 bash -n "$repo_root/tests/mcp-self-check.sh"
 bash -n "$repo_root/tests/outcome-eval-self-check.sh"
+bash -n "$repo_root/tests/neural-expansion-self-check.sh"
 bash -n "$repo_root/hooks/session-start.sh"
 python3 -m py_compile "$repo_root/lib/okf.py"
 python3 -m py_compile "$repo_root/lib/replication.py"
@@ -85,6 +86,12 @@ install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py
 install -m 0755 "$repo_root/lib/replication.py" "$plugin/skills/llm-brain/scripts/replication.py"
 install -m 0755 "$repo_root/lib/memory_signals.py" "$plugin/skills/llm-brain/scripts/memory_signals.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$plugin/skills/llm-brain/scripts/mcp_server.py"
+# Neural Expansion ships with synthetic data only; caches and OS junk never ship.
+copy_neural_expansion() {
+  cp -R "$repo_root/neural-expansion" "$1/neural-expansion"
+  find "$1/neural-expansion" \( -name __pycache__ -o -name '.DS_Store' -o -name '._*' \) -prune -exec rm -rf {} +
+}
+copy_neural_expansion "$plugin"
 install -m 0644 "$repo_root/references/architecture.md" "$plugin/skills/llm-brain/references/architecture.md"
 install -m 0644 "$repo_root/VERSION" "$plugin/skills/llm-brain/VERSION"
 install -m 0644 "$repo_root/docs/evaluation.md" "$plugin/docs/evaluation.md"
@@ -100,6 +107,7 @@ install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"
 install -m 0755 "$repo_root/lib/memory_signals.py" "$standalone/lib/memory_signals.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$standalone/lib/mcp_server.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
+copy_neural_expansion "$standalone"
 install -m 0644 "$repo_root/docs/evaluation.md" "$standalone/docs/evaluation.md"
 install -m 0644 "$release_notes" "$standalone/docs/releases/v${version}.md"
 install -m 0644 "$repo_root/docs/releases/unreleased.md" "$standalone/docs/releases/unreleased.md"
@@ -176,6 +184,7 @@ def verify(path: Path, kind: str) -> None:
         required = {f"{name}/VERSION", cli, f"{name}/requirements-okf.lock", f"{name}/CONTRIBUTING.md", f"{name}/SECURITY.md"}
         helper_dir = f"{name}/skills/llm-brain/scripts" if kind == "plugin" else f"{name}/lib"
         required |= {f"{helper_dir}/okf.py", f"{helper_dir}/memory_signals.py", f"{helper_dir}/mcp_server.py"}
+        required |= {f"{name}/neural-expansion/demo/neural-expansion-synthetic.html", f"{name}/neural-expansion/adapter/snapshot_to_html.py", f"{name}/neural-expansion/PRIVACY.md"}
         if kind == "plugin":
             required |= {
                 f"{name}/.codex-plugin/plugin.json",

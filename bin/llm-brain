@@ -99,6 +99,8 @@ Commands:
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
   mcp serve [--read-only]
+  neural-expansion demo [--output FILE.html] [--open] | neural-expansion path
+  neural-expansion export PROJECT_ID --principal ID --output FILE.html [--open]   Experimental; LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1
   maintenance schedule declare PROJECT_ID --name TEXT --cadence TEXT [--runner hermes|codex|cron|other] [--max-age-days N]
   maintenance schedule disable PROJECT_ID
   bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory] [--receipt]
@@ -7291,6 +7293,82 @@ cmd_mcp() {
   exec "$OKF_PYTHON" "${args[@]}" "$@"
 }
 
+# Neural Expansion: the read-only, offline memory-graph viewer.  The CLI only
+# builds standalone HTML files; it never starts a listener or serves a vault.
+neural_expansion_dir() {
+  local candidate
+  for candidate in \
+    "$SCRIPT_DIR/../neural-expansion" \
+    "$SCRIPT_DIR/neural-expansion" \
+    "$SCRIPT_DIR/../../../neural-expansion"; do
+    [ -f "$candidate/build_demo.py" ] && { (cd "$candidate" && pwd -P); return 0; }
+  done
+  return 1
+}
+
+cmd_neural_expansion() {
+  local action="${1:-}" home output="" project_id="" principal="" open=0
+  shift || true
+  home="$(neural_expansion_dir)" || die 69 "Neural Expansion is not installed with this CLI"
+  case "$action" in
+    path)
+      printf '%s\n' "$home/demo/neural-expansion-synthetic.html"
+      ;;
+    demo)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --output) output="${2:-}"; shift 2 ;;
+          --open) open=1; shift ;;
+          *) die 64 "unknown neural-expansion demo option: $1" ;;
+        esac
+      done
+      if [ -z "$output" ]; then
+        output="$home/demo/neural-expansion-synthetic.html"
+        [ -f "$output" ] || die 66 "synthetic demo page is missing"
+      else
+        case "$output" in *.html) ;; *) die 64 "--output must end in .html" ;; esac
+        [ ! -e "$output" ] || die 73 "output already exists: $output"
+        resolve_okf_runtime
+        PYTHONDONTWRITEBYTECODE=1 "$OKF_PYTHON" "$home/build_demo.py" --output "$output" >/dev/null || die 70 "demo build failed"
+      fi
+      printf 'neural_expansion=demo data=synthetic file=%s\n' "$output"
+      [ "$open" = 0 ] || neural_expansion_open "$output"
+      ;;
+    export)
+      project_id="${1:-}"; shift || true
+      [ -n "$project_id" ] || die 64 "neural-expansion export requires PROJECT_ID --principal ID --output FILE.html"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --principal) principal="${2:-}"; shift 2 ;;
+          --output) output="${2:-}"; shift 2 ;;
+          --open) open=1; shift ;;
+          *) die 64 "unknown neural-expansion export option: $1" ;;
+        esac
+      done
+      # Real-data pages are experimental: the principal is a visibility
+      # filter, not authentication, so the operator must opt in explicitly.
+      [ "${LLM_BRAIN_NEURAL_EXPANSION_EXPORT:-0}" = 1 ] || die 65 "neural-expansion export is experimental; set LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 to write a private, principal-filtered page"
+      [ -n "$principal" ] || die 64 "neural-expansion export requires --principal ID"
+      [ -n "$output" ] || die 64 "neural-expansion export requires --output FILE.html"
+      validate_id "$project_id" || die 64 "invalid project id"
+      validate_scalar "$principal" || die 65 "--principal must be a single line"
+      case "$output" in /*) ;; *) output="$CWD/$output" ;; esac
+      require_project "$project_id" >/dev/null
+      resolve_okf_runtime
+      PYTHONDONTWRITEBYTECODE=1 "$OKF_PYTHON" "$home/adapter/snapshot_to_html.py" --vault-root "$(cd "$ROOT" && pwd -P)" --project-id "$project_id" --principal "$principal" --output "$output" >/dev/null || die 70 "neural-expansion export failed; build the index first and retry when no writer is active"
+      printf 'neural_expansion=export project_id=%s principal=%s file=%s mode=0600\n' "$project_id" "$principal" "$output"
+      [ "$open" = 0 ] || neural_expansion_open "$output"
+      ;;
+    *) die 64 "neural-expansion requires demo, export or path" ;;
+  esac
+}
+
+neural_expansion_open() {
+  if command -v open >/dev/null 2>&1 && [ "$(uname -s)" = Darwin ]; then open "$1"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 &
+  else say_error "open $1 in a browser"; fi
+}
+
 # Maintenance is a bounded derived view. Persistent writes are limited to the
 # explicitly requested report or schedule marker.
 maintenance_semantic_files() {
@@ -8701,6 +8779,10 @@ upgrade_update_host() {
       for helper in replication.py memory_signals.py mcp_server.py; do
         [ ! -f "$source/lib/$helper" ] || install -m 0644 "$source/lib/$helper" "$target_dir/lib/$helper"
       done
+      if [ -d "$source/neural-expansion" ]; then
+        cp -R "$source/neural-expansion" "$target_dir/neural-expansion"
+        find "$target_dir/neural-expansion" -name __pycache__ -prune -exec rm -rf {} +
+      fi
       install -m 0644 "$source/VERSION" "$source/requirements-okf.lock" "$target_dir/"
       link="$HOME/.local/bin/llm-brain"
       [ ! -e "$link" ] || [ -L "$link" ] || die 73 "refusing to replace non-symlink standalone launcher: $link"
@@ -9208,6 +9290,7 @@ main() {
     stability) cmd_stability "$@" ;;
     intention) cmd_intention "$@" ;;
     mcp) cmd_mcp "$@" ;;
+    neural-expansion|viewer) cmd_neural_expansion "$@" ;;
     bridge) cmd_bridge "$@" ;;
     run) cmd_run "$@" ;;
     reconcile) cmd_reconcile "$@" ;;

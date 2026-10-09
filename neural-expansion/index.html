@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; object-src 'none'">
+  <meta name="theme-color" content="#070b12">
+  <title>LLM-Brain · Neural Expansion</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b12;
+      --panel: #0b1420;
+      --panel-raised: #111e2c;
+      --line: #1a3044;
+      --cyan: #72e7ff;
+      --blue: #82b9ff;
+      --violet: #aa94ff;
+      --muted: #899caf;
+      --ink: #e7f4fa;
+      --gold: #ffd080;
+      --red: #ff7889;
+      --green: #8ce6bd;
+      --shadow: 0 18px 48px #0008;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body {
+      overflow: hidden;
+      color: var(--ink);
+      background: radial-gradient(ellipse at 47% 41%, #102238 0, #09121d 43%, var(--bg) 82%);
+      font: 14px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+    }
+    button, input, select { font: inherit; color: var(--ink); }
+    button, select, input {
+      border: 1px solid #20364a;
+      border-radius: 7px;
+      background: #0b1724;
+    }
+    button { cursor: pointer; padding: 8px 11px; transition: border-color .16s ease, background .16s ease; }
+    button:hover, button:focus-visible, select:focus-visible, input:focus-visible { border-color: var(--cyan); outline: 2px solid #72e7ff33; }
+    input { width: min(290px, 29vw); padding: 9px 12px; }
+    select { padding: 9px 11px; }
+    header {
+      height: 70px;
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      padding: 0 19px;
+      border-bottom: 1px solid var(--line);
+      background: #080e17ed;
+      position: relative;
+      z-index: 5;
+    }
+    .mark {
+      width: 31px; height: 31px; flex: 0 0 auto;
+      display: grid; place-items: center;
+      border: 1px solid var(--cyan); border-radius: 50%; color: var(--cyan);
+      box-shadow: 0 0 18px #55dfff55, inset 0 0 10px #55dfff18;
+      font-size: 13px;
+    }
+    .brand { font-size: 14px; font-weight: 700; letter-spacing: .15em; }
+    .sub { margin-top: 2px; color: var(--muted); font-size: 10px; letter-spacing: .17em; text-transform: uppercase; }
+    .spacer { flex: 1; }
+    .source-badge {
+      color: #9cc8dc; font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+      border: 1px solid #254154; border-radius: 999px; padding: 6px 9px; white-space: nowrap;
+    }
+    main { height: calc(100% - 70px); display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
+    .stage {
+      position: relative; min-width: 0; overflow: hidden;
+      background:
+        radial-gradient(ellipse at 50% 49%, #15385250 0, #0a172455 31%, transparent 67%),
+        linear-gradient(180deg, #09152240, #07101a8a);
+    }
+    .stage::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+      background: radial-gradient(ellipse at 50% 51%, #36caff10, transparent 56%);
+    }
+    #brain, #graph { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+    #brain { z-index: 1; pointer-events: none; }
+    #graph { z-index: 2; touch-action: none; outline: none; }
+    #graph:focus-visible { box-shadow: inset 0 0 0 2px #72e7ff66; }
+    .overlay { position: absolute; z-index: 3; top: 17px; left: 18px; pointer-events: none; }
+    .eyebrow { color: var(--cyan); font-size: 10px; letter-spacing: .2em; text-transform: uppercase; }
+    .title { margin-top: 4px; font-size: 18px; font-weight: 580; }
+    .counts { margin-top: 5px; color: #91a9bc; font-size: 12px; }
+    .stage-controls {
+      position: absolute; z-index: 4; top: 14px; right: 14px;
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px; border: 1px solid #1b3145; border-radius: 9px;
+      background: #09131fd9; box-shadow: 0 8px 30px #0003;
+    }
+    .stage-controls button { font-size: 11px; padding: 7px 9px; }
+    .legend {
+      position: absolute; z-index: 4; left: 17px; bottom: 17px;
+      display: flex; flex-wrap: wrap; gap: 7px 12px; max-width: calc(100% - 34px);
+      padding: 9px 11px; border: 1px solid #1a3044; border-radius: 8px;
+      background: #09121de8; box-shadow: 0 8px 28px #0004;
+      color: #b6c9d5; font-size: 10px;
+    }
+    .legend-item { display: inline-flex; align-items: center; white-space: nowrap; }
+    .dot { width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; box-shadow: 0 0 9px currentColor; }
+    #list {
+      position: absolute; z-index: 5; top: 77px; left: 15px; bottom: 77px;
+      width: min(340px, 45%); overflow: auto; padding: 8px;
+      border: 1px solid #244057; border-radius: 9px; background: #07111df5; box-shadow: var(--shadow);
+    }
+    .listitem { width: 100%; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 9px 8px; text-align: left; border: 0; border-bottom: 1px solid #172b3d; border-radius: 0; background: transparent; }
+    .listitem:last-child { border-bottom: 0; }
+    .list-title { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+    .listitem small { display: block; flex: 0 1 auto; min-width: 0; max-width: 44%; margin-left: auto; color: var(--muted); font-size: 9px; line-height: 1.25; text-align: right; overflow-wrap: anywhere; }
+    .listitem:hover, .listitem:focus-visible { color: var(--cyan); background: #122435; }
+    .record-hud {
+      position: absolute; z-index: 4; width: min(260px, 42vw); pointer-events: none;
+      padding: 11px 13px; border: 1px solid #60dfffa0; border-radius: 8px;
+      background: linear-gradient(145deg, #0d1b29f5, #09121df5); box-shadow: 0 0 25px #49ceff25, var(--shadow);
+      backdrop-filter: blur(9px);
+    }
+    .record-hud::before { content: "RECORD LOCKED"; display: block; margin-bottom: 5px; color: var(--cyan); font-size: 8px; letter-spacing: .18em; }
+    .hud-title { font-size: 13px; font-weight: 650; line-height: 1.25; }
+    .hud-meta { margin-top: 4px; color: #aac0ce; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+    .hud-excerpt { display: -webkit-box; overflow: hidden; margin-top: 8px; color: #b5c8d5; font-size: 10px; line-height: 1.45; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+    aside {
+      min-width: 0; overflow: auto; padding: 19px 18px;
+      border-left: 1px solid var(--line); background: #09111bf2;
+    }
+    h2 { margin: 0 0 12px; color: #8fa5b7; font-size: 10px; letter-spacing: .18em; text-transform: uppercase; }
+    .card { margin-bottom: 17px; padding: 15px; border: 1px solid #1c3247; border-radius: 9px; background: linear-gradient(150deg, #111e2b, #0b131e); box-shadow: 0 10px 24px #0002; }
+    .name { font-size: 17px; line-height: 1.25; }
+    .kind { margin: 5px 0 12px; color: var(--cyan); font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
+    .desc { max-height: 150px; overflow: auto; color: #b8c9d5; font-size: 12px; white-space: pre-wrap; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid #172a3b; color: #91a5b5; font-size: 10px; }
+    .row b { overflow-wrap: anywhere; color: var(--ink); font-weight: 500; text-align: right; }
+    .relations { display: grid; gap: 6px; }
+    .rel { padding: 8px 10px; border: 1px solid #1b3044; border-radius: 7px; background: #0c1723; font-size: 11px; text-align: left; }
+    .rel:hover { border-color: var(--cyan); }
+    .rel small { display: block; margin-bottom: 3px; color: #92a9ba; font-size: 8px; letter-spacing: .1em; text-transform: uppercase; }
+    .empty { padding: 12px; border: 1px solid #1b2d40; border-radius: 8px; color: #8da2b4; font-size: 11px; }
+    .aside-hint { margin: 13px 0; color: #92a7b7; font-size: 10px; }
+    .aside-controls { display: flex; gap: 7px; }
+    .aside-controls button { font-size: 11px; }
+    .source-note { margin-top: 13px; color: #8297a9; font-size: 10px; }
+    .motion-note { color: #8ea8ba; font-size: 9px; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: minmax(0, 1fr) 290px; }
+      header { gap: 8px; padding: 0 12px; }
+      .sub { letter-spacing: .11em; }
+      input { width: min(220px, 24vw); }
+      aside { padding: 15px 13px; }
+    }
+    @media (min-width: 681px) and (max-width: 900px) {
+      .stage-controls { top: 82px; right: auto; left: 14px; }
+      #list { top: 132px; left: 14px; bottom: 70px; width: min(330px, calc(100% - 28px)); }
+    }
+    @media (max-width: 680px) {
+      header { height: 98px; flex-wrap: wrap; align-content: center; gap: 6px 8px; padding: 7px 10px; }
+      .brand { font-size: 12px; }
+      .sub { display: none; }
+      .spacer { display: none; }
+      .source-badge { margin-left: auto; }
+      header input { flex: 1 1 125px; width: auto; min-width: 110px; }
+      header select { flex: 0 0 114px; padding: 8px 6px; }
+      header #clear { padding: 8px; }
+      main { height: calc(100% - 98px); grid-template-columns: 1fr; grid-template-rows: minmax(310px, 55vh) minmax(220px, 1fr); overflow: auto; }
+      .stage { min-height: 310px; }
+      .overlay { top: 12px; left: 12px; }
+      .title { font-size: 15px; }
+      .counts { font-size: 10px; }
+      .stage-controls { top: 70px; right: 10px; }
+      .stage-controls button { padding: 6px 7px; }
+      .legend { left: 9px; bottom: 9px; gap: 5px 9px; max-width: calc(100% - 18px); padding: 7px 8px; font-size: 9px; }
+      aside { border-top: 1px solid var(--line); border-left: 0; padding: 14px 12px; }
+      #list { top: 108px; bottom: 58px; width: min(330px, calc(100% - 20px)); }
+      .record-hud { width: min(235px, 55vw); }
+    }
+    html.reduced-motion * { animation: none !important; transition: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="mark" aria-hidden="true">✳</div>
+    <div>
+      <div class="brand">NEURAL EXPANSION</div>
+      <div class="sub">LLM-Brain memory graph · local view</div>
+    </div>
+    <span id="sourceBadge" class="source-badge">Synthetic · offline</span>
+    <div class="spacer"></div>
+    <input id="search" aria-label="Search visible records" placeholder="Search nodes…" autocomplete="off">
+    <select id="filter" aria-label="Filter by record status">
+      <option value="all">All states</option>
+      <option value="stable">Stable</option>
+      <option value="proposed">Proposed</option>
+      <option value="stale">Stale</option>
+      <option value="derived">Derived</option>
+      <option value="history">History</option>
+      <option value="pending">Pending</option>
+    </select>
+    <button id="clear" type="button" title="Clear search and selection">Clear</button>
+  </header>
+  <main>
+    <section class="stage" aria-label="Interactive relationship field">
+      <canvas id="brain" aria-hidden="true"></canvas>
+      <canvas id="graph" tabindex="0" role="application" aria-label="Three-dimensional knowledge graph. Drag to orbit, use plus and minus to zoom, or open List view."></canvas>
+      <div class="overlay">
+        <div class="eyebrow">01 / Relationship field</div>
+        <div class="title">Explore connected knowledge</div>
+        <div id="counts" class="counts" aria-live="polite"></div>
+      </div>
+      <div class="stage-controls" aria-label="Graph controls">
+        <button id="toggleList" type="button" aria-controls="list" aria-expanded="false">List view</button>
+        <button id="reset" type="button">Reset</button>
+        <button id="fit" type="button">Fit graph</button>
+      </div>
+      <div id="list" role="region" aria-label="Filtered record list" hidden></div>
+      <div id="recordHud" class="record-hud" aria-live="polite" hidden></div>
+      <div id="legend" class="legend" aria-label="Record type legend"></div>
+    </section>
+    <aside>
+      <h2>Selected record</h2>
+      <div id="details" class="card"><div class="empty">Select a node to inspect its type, status, provenance and relations.</div></div>
+      <h2>Visible connections</h2>
+      <div id="relations" class="relations"><div class="empty">Select a record to see typed connections.</div></div>
+      <div class="aside-hint">Drag to orbit · scroll to zoom · click a node to inspect · Esc clears selection</div>
+      <div class="aside-controls">
+        <button id="asideReset" type="button">Reset view</button>
+        <button id="asideFit" type="button">Fit graph</button>
+      </div>
+      <div class="source-note">Canonical Markdown remains authoritative. Graph edges are derived projections.</div>
+      <div id="motionNote" class="motion-note" aria-live="polite"></div>
+    </aside>
+  </main>
+  <script type="application/json" id="synthetic-fixture">{"meta":{"project":"Synthetic demo","version":"0.7.5","source":"synthetic OKF-shaped fixture","privacy":"Synthetic only"},"nodes":[{"id":"okf/concepts/local-first.md","title":"Local-first memory","type":"Concept","status":"stable","trust":"human-reviewed","generated":"2026-08-19","provenance":"human://design-review","excerpt":"Canonical knowledge remains inspectable Markdown. Indexes and visualization stay derived and rebuildable."},{"id":"okf/claims/graph-export.md","title":"Graph export contract","type":"Claim","status":"stable","trust":"human-reviewed","generated":"2026-08-21","provenance":"human://architecture-review","excerpt":"The graph index contains typed source, relation, target triples. Its edges are a retrieval aid, not authority."},{"id":"okf/procedures/read-only-review.md","title":"Read-only review","type":"Procedure","status":"stable","trust":"verified","generated":"2026-08-25","provenance":"process://qa-fixture","excerpt":"Inspect the export and source hash before acting. Never write from the visualization."},{"id":"okf/claims/storage-latency.md","title":"Remote filesystem latency","type":"Claim","status":"proposed","trust":"unverified","generated":"2026-09-30","provenance":"human://benchmark-fixture","excerpt":"Observed slow source reads suggest an I/O lead, not proof of retrieval algorithm cost."},{"id":"okf/decisions/no-second-store.md","title":"No second memory store","type":"Decision","status":"stable","trust":"human-reviewed","generated":"2026-08-10","provenance":"human://project-owner","excerpt":"A viewer consumes the existing export and does not own memory state."},{"id":"okf/projections/assoc-local-graph.md","title":"Local graph association","type":"AssociativeProjection","status":"derived","trust":"derived","generated":"2026-09-01","provenance":"process://fixture","excerpt":"Synthetic derived association; it cannot amplify source authority."},{"id":"episodes/2026-08-21/index.md","title":"Graph interface discussion","type":"Episode","status":"history","trust":"historical","generated":"2026-08-21","provenance":"episode://fixture","excerpt":"Explored a browser-based visualization while retaining Markdown and review workflows."},{"id":"review/rw-visualizer-001.md","title":"Visualizer review candidate","type":"ReviewItem","status":"pending","trust":"unresolved","generated":"2026-09-30","provenance":"review://fixture","excerpt":"A candidate idea stays quarantined from canonical claims until the established review flow accepts it."}],"edges":[{"source":"okf/concepts/local-first.md","relation":"supports","target":"okf/decisions/no-second-store.md"},{"source":"okf/claims/graph-export.md","relation":"derived_from","target":"okf/concepts/local-first.md"},{"source":"okf/claims/graph-export.md","relation":"supports","target":"okf/procedures/read-only-review.md"},{"source":"okf/procedures/read-only-review.md","relation":"depends_on","target":"okf/decisions/no-second-store.md"},{"source":"okf/claims/storage-latency.md","relation":"conflicts_with","target":"okf/claims/graph-export.md"},{"source":"okf/projections/assoc-local-graph.md","relation":"associates","target":"okf/claims/graph-export.md"},{"source":"episodes/2026-08-21/index.md","relation":"historical_context","target":"okf/concepts/local-first.md"},{"source":"review/rw-visualizer-001.md","relation":"proposed_for_review","target":"okf/claims/graph-export.md"},{"source":"okf/claims/graph-export.md","relation":"contains","target":"okf/claims/graph-export.md"}]}</script>
+  <script src="./neural-core.js" defer></script>
+  <script src="./viewer.js" defer></script>
+</body>
+</html>
