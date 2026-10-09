@@ -1831,7 +1831,19 @@ lock_process_start() {
 }
 
 lock_mtime() {
-  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || printf '0\n'
+  # Portable mtime in epoch seconds. Each probe is captured and must be a bare
+  # integer: on GNU/Linux `stat -f` means --file-system, prints filesystem
+  # details to stdout and fails, so chaining the probes with `||` on stdout
+  # (as before 0.8.1) mixed that text into the result and stale locks were
+  # never recognised. GNU `stat -c` is tried first, then BSD/macOS `stat -f`.
+  local mtime
+  if mtime="$(stat -c '%Y' "$1" 2>/dev/null)"; then
+    case "$mtime" in ''|*[!0-9]*) ;; *) printf '%s\n' "$mtime"; return 0 ;; esac
+  fi
+  if mtime="$(stat -f '%m' "$1" 2>/dev/null)"; then
+    case "$mtime" in ''|*[!0-9]*) ;; *) printf '%s\n' "$mtime"; return 0 ;; esac
+  fi
+  printf '0\n'
 }
 
 lock_is_stale() {

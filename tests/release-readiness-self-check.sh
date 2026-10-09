@@ -95,6 +95,8 @@ core_checks() {
     bash "$repo_root/tests/eval-self-check.sh" -- \
     bash "$repo_root/tests/replication-self-check.sh" -- \
     bash "$repo_root/tests/openclaw-adapter-self-check.sh" -- \
+    bash "$repo_root/tests/lock-portability-self-check.sh" -- \
+    bash "$repo_root/tests/real-eval-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 
