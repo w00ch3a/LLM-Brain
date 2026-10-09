@@ -64,7 +64,7 @@ assert module._load_config(home) == {k: v for k, v in saved.items() if k in modu
 assert module._load_config(home)["context_engine_registration"] == "always"
 
 # --- Laya endpoint policy: local or private-network literals only -----------
-for url in ("http://localhost:8080/v1", "http://127.0.0.1:9/x", "https://10.0.0.1/x", "http://[::1]:9/x", "http://192.168.0.10/x"):
+for url in ("http://localhost:8080/v1", "http://127.0.0.1:9/x", "https://10.0.0.1/x", "http://[::1]:9/x", "http://172.16.5.5/x"):
     module._local_laya_endpoint(url)
 for url in ("http://example.com/x", "http://100.64.0.1/x", "ftp://127.0.0.1/x", "http://user:pw@127.0.0.1/x", "http://127.0.0.1:99999/x", "", "not a url"):
     try:
