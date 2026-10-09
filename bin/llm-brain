@@ -6528,7 +6528,10 @@ cmd_pack() {
     )"
   fi
   hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}")"
-  pack="$dir/context-packs/$(slug "$agent")-$(slug "$task")-${hash:0:12}.md"
+  # Bound the task slug: long task text must not exceed the 255-byte file-name
+  # limit (the hash suffix keeps names unique).
+  local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
+  pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
   if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {

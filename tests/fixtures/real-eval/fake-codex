@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Fake `codex` CLI for the real-eval self-check (no model, no network).
+
+Logs its argv and the environment it was given to the file named by
+`-c fake.log=PATH` (the harness passes no outside environment), emits
+codex-style JSONL events, writes the last message, and answers research
+tasks with an empty object so grading runs.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("codex-cli 0.159.1 (fake)")
+    sys.exit(0)
+if args[:2] == ["exec", "--help"]:
+    print("Usage: codex exec [OPTIONS] [PROMPT]\n  --sandbox <MODE>\n  --skip-git-repo-check\n  -C, --cd <DIR>\n  --json\n  -o, --output-last-message <FILE>\n  -m, --model <MODEL>\n  -c, --config <key=value>")
+    sys.exit(0)
+assert args[0] == "exec"
+prompt = args[-1]
+cd = args[args.index("--cd") + 1]
+last = args[args.index("--output-last-message") + 1]
+codex_home = os.environ.get("CODEX_HOME", "")
+record = {
+    "argv": args[:-1], "cwd": os.getcwd(), "cd": cd,
+    "env": {k: os.environ.get(k) for k in ("HOME", "PATH", "TMPDIR", "CODEX_HOME", "LLM_BRAIN_ROOT")},
+    "auth_present": os.path.isfile(os.path.join(codex_home, "auth.json")),
+    "llm_brain_on_path": shutil.which("llm-brain"),
+}
+log_path = [a.split("=", 1)[1] for a in args if a.startswith("fake.log=")][0]
+with open(log_path, "a") as log:
+    log.write(json.dumps(record) + "\n")
+events = [{"type": "thread.started"}]
+if "READY" in prompt:
+    message = "READY"
+else:
+    if shutil.which("llm-brain"):
+        project = prompt.split("project id: ")[1].split(")")[0]
+        done = subprocess.run(["llm-brain", "brief", project], capture_output=True, text=True)
+        events.append({"type": "item.completed", "item": {"type": "command_execution", "command": f"bash -lc 'llm-brain brief {project}'", "exit_code": done.returncode}})
+    if "answer.json" in prompt:
+        with open(os.path.join(cd, "answer.json"), "w") as out:
+            out.write("{}\n")
+    message = "done"
+events.append({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 200, "output_tokens": 50}})
+for event in events:
+    print(json.dumps(event), flush=True)
+with open(last, "w") as out:
+    out.write(message + "\n")

@@ -196,3 +196,33 @@ that calls that agent.
 The lifecycle fixture also includes an `interference` family. One fact is
 superseded seven times in quick succession, and every memory-backed mode must
 return only the newest version, with zero stale leakage.
+
+## Real-agent evaluation (Codex CLI)
+
+`evals/real/` runs a real coding agent with memory on and off. It contains 12
+coding tasks and 12 research tasks. Each family has 10 memory-dependent tasks,
+one control where memory is irrelevant, and one harm control where memory is
+deliberately stale. The knowledge each task needs exists only in a seeded
+LLM-Brain brain, and the harness checks that:
+
+- off and on work trees are identical before the agent starts;
+- memory-only markers are absent from the files and the base prompt.
+
+Grading never uses a model. Coding tasks are scored by hidden tests copied in
+after the agent finishes. Research tasks are scored by a deterministic key over
+`answer.json`: required facts, superseded or retracted facts absent, required
+citations, and no invented source IDs.
+
+The agent runs `codex exec --sandbox workspace-write` with network access off.
+Its HOME, PATH and TMPDIR are private, and so is its `CODEX_HOME`, which
+receives only a copy of `auth.json`.
+
+`python3 evals/real/build_bundle.py` packs the suite, the published standalone
+archive and the lock-pinned PyYAML into a single tarball whose `run.sh` handles
+`--dry-run`, `--smoke`, `--resume` and `--report-only`.
+
+`--runner reference` uses a scripted agent. It calls the real CLI and applies
+the correct change only when the needed knowledge was retrieved. It verifies
+the harness wiring, not model quality; real results depend on the model and
+are not shipped here. See `evals/real/README.md`.
+
