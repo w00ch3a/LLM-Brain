@@ -6765,12 +6765,16 @@ cmd_import_replication() {
   if [ "$mode" = stage ] && [ -z "$project_id" ]; then
     die 64 "import replication stage requires --project-id for canonical protection"
   fi
+  dir=""
   if [ "$mode" = stage ] && [ -n "$project_id" ]; then
     require_project "$project_id" dir
+  elif [ -n "$project_id" ] && [ -d "$(project_dir "$project_id")" ]; then
+    dir="$(project_dir "$project_id")"
   fi
   local args=(import --archive "$file" "--$mode")
   if [ -n "$project_id" ]; then
-    args+=(--project-id "$project_id" --project-dir "$dir")
+    args+=(--project-id "$project_id")
+    [ -z "$dir" ] || args+=(--project-dir "$dir")
   fi
   [ -z "$output" ] || args+=(--output "$output")
   replication_helper "${args[@]}"
