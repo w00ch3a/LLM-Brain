@@ -79,17 +79,26 @@ Commands:
   ingest-source PROJECT_ID FILE [ROOT]                 Compatibility custody command
   reflect list|prepare|submit|run PROJECT_ID [ARGS]
   review list|show|decide PROJECT_ID [ARGS]
+  review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost]
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
   maintenance preview|run|status PROJECT_ID [--principal ID] [--limit N] [--json] [--strict]
+  brief [PROJECT_ID] [--source-root PATH] [--max-bytes N] [--recent-days N] [--principal ID] [--json]
+  intention add PROJECT_ID --action TEXT --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY [--principal ID]
+  intention list PROJECT_ID [--status open|done|cancelled|all] [--due] [--task TEXT] [--path FILE] [--json]
+  intention done|cancel PROJECT_ID INTENTION_ID --reason TEXT
+  usage PROJECT_ID [--principal ID] [--json]
+  stability show PROJECT_ID [REF] [--json]
+  stability apply PROJECT_ID CANONICAL_ID --reason TEXT
+  mcp serve [--read-only]
   maintenance schedule declare PROJECT_ID --name TEXT --cadence TEXT [--runner hermes|codex|cron|other] [--max-age-days N]
   maintenance schedule disable PROJECT_ID
   bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory] [--receipt]
@@ -104,6 +113,7 @@ Commands:
   projection retract PROJECT_ID PROJECTION_ID --reason TEXT
   projection status PROJECT_ID
   association build PROJECT_ID REF_A REF_B [--reason TEXT]
+  association propose PROJECT_ID [--min-count N] [--write-review]
   association retract PROJECT_ID ASSOCIATION_ID --reason TEXT
   association status PROJECT_ID
   feedback record PROJECT_ID --pack REF --usefulness useful|not-useful|partial [--principal ID] [--notes TEXT]
@@ -166,6 +176,30 @@ resolve_okf_runtime() {
 okf() {
   resolve_okf_runtime
   "$OKF_PYTHON" "$OKF_HELPER" "$@"
+}
+
+# Derived, read-only signals (BM25F, brief, usage, stability, triage, intentions,
+# doctor and code-anchor findings) live in a sibling standard-library helper
+# that reuses the strict OKF parser.  It never writes the vault.
+# Locate a stdlib sibling helper (memory_signals.py, mcp_server.py) in the
+# repository, plugin or standalone layout.
+sibling_helper() {
+  local name="$1" candidate
+  for candidate in \
+    "$SCRIPT_DIR/../lib/$name" \
+    "$SCRIPT_DIR/$name" \
+    "$SCRIPT_DIR/lib/$name" \
+    "$SCRIPT_DIR/../../lib/$name"; do
+    [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+memory_signals() {
+  local helper
+  resolve_okf_runtime
+  helper="$(sibling_helper memory_signals.py)" || die 69 "memory signals helper is unavailable"
+  "$OKF_PYTHON" "$helper" "$@"
 }
 
 okf_actor() {
@@ -3943,6 +3977,7 @@ cmd_association() {
   local action="${1:-}" project_id="${2:-}"; [ -n "$project_id" ] || die 64 "association requires PROJECT_ID"; shift 2 || true
   case "$action" in
     build) [ -n "${1:-}" ] && [ -n "${2:-}" ] || die 64 "association build requires REF_A REF_B"; association_build "$project_id" "$1" "$2" "${@:3}" ;;
+    propose) association_propose "$project_id" "$@" ;;
     retract) [ -n "${1:-}" ] || die 64 "association retract requires ASSOCIATION_ID"; projection_retract "$project_id" "$1" "${@:2}" ;;
     status)
       local dir association_file
@@ -3952,7 +3987,7 @@ cmd_association() {
         printf '%s\t%s\t%s\t%s\t%s\n' "$(frontmatter_field "$association_file" brain_association_id)" "$(frontmatter_field "$association_file" brain_projection_state)" "$(frontmatter_field "$association_file" brain_association_a)" "$(frontmatter_field "$association_file" brain_association_b)" "${association_file#"$dir"/}"
       done
       ;;
-    *) die 64 "association requires build, retract, or status" ;;
+    *) die 64 "association requires build, propose, retract, or status" ;;
   esac
 }
 
@@ -4253,11 +4288,23 @@ cmd_reflect() {
 cmd_review() {
   local action="$1"; shift || true
   case "$action" in
-    list)
-      local project_id="$1" state_filter="" kind_filter="" dir
-      shift || true
-      while [ $# -gt 0 ]; do case "$1" in --state) state_filter="${2:-}"; shift 2 ;; --kind) kind_filter="${2:-}"; shift 2 ;; *) die 64 "unknown review list option" ;; esac; done
+    triage)
+      local project_id="${1:-}" dir
+      [ -n "$project_id" ] || die 64 "review triage requires PROJECT_ID"
       require_project "$project_id" dir
+      # Schema-fit ordering only: clashes first, novel next, low-risk fits
+      # last.  Nothing is promoted or decided here.
+      memory_signals triage --project-dir "$dir"
+      ;;
+    list)
+      local project_id="$1" state_filter="" kind_filter="" dir triage=0
+      shift || true
+      while [ $# -gt 0 ]; do case "$1" in --state) state_filter="${2:-}"; shift 2 ;; --kind) kind_filter="${2:-}"; shift 2 ;; --triage) triage=1; shift ;; *) die 64 "unknown review list option" ;; esac; done
+      require_project "$project_id" dir
+      if [ "$triage" = 1 ]; then
+        memory_signals triage --project-dir "$dir" | awk -F '\t' -v state="$state_filter" -v kind="$kind_filter" 'NR == 1 || ((state == "" || $2 == state) && (kind == "" || $3 == kind))'
+        return 0
+      fi
       printf 'id\tstate\tkind\tconfidence\ttitle\n'
       find "$dir/review" -maxdepth 1 -type f -name '*.md' | sort | while IFS= read -r file; do
         local id state kind
@@ -4289,6 +4336,20 @@ cmd_review() {
       acquire_lock "project-$project_id"
       if [ "$state" = "approved" ]; then
         case "$kind" in
+          association)
+            local association_a association_b
+            association_a="$(frontmatter_field "$file" brain_association_a)"; association_b="$(frontmatter_field "$file" brain_association_b)"
+            [ -n "$association_a" ] && [ -n "$association_b" ] || { release_lock; die 65 "association review is missing its references"; }
+            set_frontmatter_field "$file" brain_review_state approved
+            set_frontmatter_field "$file" brain_reviewed_by "$actor"
+            set_frontmatter_field "$file" brain_review_reason "$reason"
+            set_frontmatter_field "$file" brain_reviewed_at "$(now_utc)"
+            audit_v2 "$dir" "review-decide" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
+            release_lock
+            association_build "$project_id" "$association_a" "$association_b" --reason "approved co-use review $id"
+            printf 'review=decided review_id=%s state=approved action=derived-association\n' "$id"
+            return 0
+            ;;
           reconsolidation|conflict|procedure-replay)
             set_frontmatter_field "$file" brain_review_state approved
             set_frontmatter_field "$file" brain_reviewed_by "$actor"
@@ -4317,7 +4378,7 @@ cmd_review() {
       release_lock
       printf 'review=decided review_id=%s state=%s\n' "$id" "$state"
       ;;
-    *) die 64 "review requires list, show, or decide" ;;
+    *) die 64 "review requires list, triage, show, or decide" ;;
   esac
 }
 
@@ -5833,12 +5894,14 @@ resolve_graph_target() {
 
 cmd_search() {
   if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
-    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt]'
+    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt] [--path FILE]... [--usage-boost]'
     return 0
   fi
   [ "$#" -ge 2 ] || die 64 "search requires PROJECT_ID and QUERY (try: llm-brain search --help)"
   local project_id="$1" query="$2"; shift 2 || true
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
+  local usage_boost="${LLM_BRAIN_USAGE_BOOST:-0}" diversity_reserve="${LLM_BRAIN_DIVERSITY_RESERVE:-2}" diversity_reserved=0 path_matched=0 lexical_scorer="${LLM_BRAIN_LEXICAL_SCORER:-bm25f}"
+  local -a path_hints=()
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -5861,11 +5924,21 @@ cmd_search() {
       --include-cold) include_cold=1; shift ;;
       --metadata-file) metadata_file="${2:-}"; shift 2 ;;
       --receipt) receipt_file="__CANONICAL__"; shift ;;
+      --path) [ -n "${2:-}" ] || die 64 "--path requires PATH"; path_hints+=("$2"); shift 2 ;;
+      --usage-boost) usage_boost=1; shift ;;
       *) die 64 "unknown search option: $1" ;;
     esac
   done
   validate_scalar "$query" || die 65 "query must be a single line"
   validate_scalar "$principal" || die 65 "--principal must be a single line"
+  case "$usage_boost" in 0|1) ;; *) die 64 "LLM_BRAIN_USAGE_BOOST must be 0 or 1" ;; esac
+  case "$diversity_reserve" in ''|*[!0-9]*) die 64 "LLM_BRAIN_DIVERSITY_RESERVE must be a non-negative integer" ;; esac
+  case "$lexical_scorer" in bm25f|legacy) ;; *) die 64 "LLM_BRAIN_LEXICAL_SCORER must be bm25f or legacy" ;; esac
+  # Older or partial installs without the signals helper keep the legacy scorer.
+  [ "$lexical_scorer" != bm25f ] || sibling_helper memory_signals.py >/dev/null || lexical_scorer=legacy
+  if [ "${#path_hints[@]}" -gt 0 ]; then
+    for term in "${path_hints[@]}"; do validate_scalar "$term" || die 65 "--path must be a single line"; done
+  fi
   case "$principal" in *=*) die 65 "--principal cannot contain '='" ;; esac
   [ -z "$as_of" ] || brain_datetime_valid "$as_of" || die 65 "--as-of must be an ISO-8601 UTC datetime"
   case "$intent" in
@@ -5908,8 +5981,13 @@ cmd_search() {
   seen_titles="$tmp_dir/seen.titles"; selected_evidence="$tmp_dir/evidence.refs"
   selected_paths="$tmp_dir/selected.paths"; independence_map="$tmp_dir/independence.tsv"
   : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"; : >"$seen_titles"; : >"$selected_evidence"; : >"$selected_paths"; : >"$independence_map"
+  : >"$tmp_dir/eligible.paths"
   while IFS= read -r file; do
     search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
+    if [ "$lexical_scorer" = bm25f ]; then
+      printf '%s\n' "$file" >>"$tmp_dir/eligible.paths"
+      continue
+    fi
     rel="${file#"$dir"/}"; state="$(frontmatter_field "$file" brain_review_state review_state)"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; title="$(frontmatter_field "$file" title)"
     score=0
     if grep -Fqi -- "$query" "$file"; then score=$((score + 20)); fi
@@ -5920,7 +5998,18 @@ cmd_search() {
     done
     [ "$score" -gt 0 ] && printf '%s\t%s\n' "$rel" "$score" >>"$lexical_raw"
   done < <(canonical_files "$dir")
-  sort -t $'\t' -k2,2nr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
+  if [ "$lexical_scorer" = bm25f ] && [ -s "$tmp_dir/eligible.paths" ]; then
+    # BM25F over the eligible set: deterministic, stdlib-only and recomputed
+    # from canonical files on every query, so there is no index to drift.
+    local -a bm25_args=(bm25 --project-dir "$dir" --paths-file "$tmp_dir/eligible.paths" --query "$query")
+    if [ "${#path_hints[@]}" -gt 0 ]; then
+      for term in "${path_hints[@]}"; do bm25_args+=(--hint-path "$term"); done
+    fi
+    memory_signals "${bm25_args[@]}" >"$tmp_dir/bm25.tsv" || die 69 "lexical scorer failed"
+    cut -f1,2 "$tmp_dir/bm25.tsv" >"$lexical_raw"
+    path_matched="$(awk -F '\t' '$3 != "-" && $3 != "" { count++ } END { print count + 0 }' "$tmp_dir/bm25.tsv")"
+  fi
+  sort -t $'\t' -k2,2gr -k1,1 "$lexical_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$lexical_rank"
 
   if [ "$strategy" = "hybrid" ] || [ "$strategy" = "vector" ]; then
     if [ "$vectors_state" != "current" ] || [ -z "$query_embedder" ] || [ ! -x "$query_embedder" ]; then
@@ -6016,7 +6105,18 @@ cmd_search() {
       }
       for (path in graph_score) if (!(path in base)) print path "\t" graph_score[path] "\t\t\t" graph_source[path] "\t" graph_relation[path]
     }
-  ' "$base_records" "$graph_records" | sort -t $'\t' -k2,2nr -k1,1 >"$final_ranked"
+  ' "$base_records" "$graph_records" | sort -t $'\t' -k2,2gr -k1,1 >"$final_ranked"
+  if [ "$usage_boost" = 1 ] && [ -s "$final_ranked" ]; then
+    # Opt-in usage boosting with a diversity guard: reserve slots for relevant
+    # records that have never been used so popular memories cannot starve them.
+    if memory_signals rerank --project-dir "$dir" --principal "$principal" --ranked "$final_ranked" --limit "$limit" --reserve "$diversity_reserve" >"$final_ranked.usage"; then
+      diversity_reserved="$(awk -F '\t' '$NF == "reserved" { count++ } END { print count + 0 }' "$final_ranked.usage")"
+      cut -f1-6 "$final_ranked.usage" >"$final_ranked"
+    else
+      degraded=1
+    fi
+    rm -f "$final_ranked.usage"
+  fi
 
   head -n "$limit" "$final_ranked" | cut -f1 >"$selected_paths"
   lifecycle_bundle_record_count=0
@@ -6093,7 +6193,7 @@ cmd_search() {
     evidence_refs="none"
   fi
   if [ -n "$metadata_file" ]; then
-    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" >"$metadata_file"
+    printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\nlexical_scorer=%s\npath_hints=%s\npath_matched_count=%s\nusage_boost=%s\ndiversity_reserved=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" "$lexical_scorer" "$([ "${#path_hints[@]}" -gt 0 ] && printf '%s' "${#path_hints[@]}" || printf 0)" "$path_matched" "$([ "$usage_boost" = 1 ] && printf enabled || printf disabled)" "$diversity_reserved" >"$metadata_file"
   fi
   retrieval_receipt "$receipt_file" search "$project_id" "$query" "$metadata_file" "$(cat "$selected_paths" 2>/dev/null || true)" || say_error "retrieval receipt unavailable"
   rm -rf "$tmp_dir"
@@ -6300,6 +6400,8 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
+  local usage_boost=0 intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
+  local -a pack_path_hints=()
   local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 receipt_file="" dir results metadata warnings selected render_order source_snapshot_hash="" rendered_refs="" evidence_opened=false evidence_incomplete=false context_truncated=false verified_hash evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 lifecycle_bundle_resolution="disabled" lifecycle_bundle_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots lifecycle_bundle lifecycle_warnings
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -6319,6 +6421,8 @@ cmd_pack() {
       --include-proposed) include_proposed=1; shift ;;
       --include-cold) include_cold=1; shift ;;
       --receipt) receipt_file="__CANONICAL__"; shift ;;
+      --path) [ -n "${2:-}" ] || die 64 "--path requires PATH"; pack_path_hints+=("$2"); shift 2 ;;
+      --usage-boost) usage_boost=1; shift ;;
       *) die 64 "unknown pack option: $1" ;;
     esac
   done
@@ -6352,7 +6456,28 @@ cmd_pack() {
   [ "$exploratory" = "0" ] || search_args+=("--exploratory")
   [ "$include_proposed" = "0" ] || search_args+=("--include-proposed")
   [ "$include_cold" = "0" ] || search_args+=("--include-cold")
+  [ "$usage_boost" = "0" ] || search_args+=("--usage-boost")
+  if [ "${#pack_path_hints[@]}" -gt 0 ]; then
+    for line in "${pack_path_hints[@]}"; do search_args+=("--path" "$line"); done
+  fi
   cmd_search "${search_args[@]}" >"$results"
+  # Prospective memory: open intentions whose deterministic trigger fires for
+  # this task (date reached, named path, keyword, or a changed state key) are
+  # rendered first.  Evaluation is read-only; intentions never self-complete.
+  intentions_file="$(mktemp "$dir/context-packs/.intentions.XXXXXX")"
+  if [ -d "$dir/intentions" ]; then
+    local -a intention_args=(intentions --project-dir "$dir" --task "$task" --due-only)
+    [ -z "$principal" ] || intention_args+=(--principal "$principal")
+    [ -z "$as_of" ] || intention_args+=(--now "$as_of")
+    if [ "${#pack_path_hints[@]}" -gt 0 ]; then
+      for line in "${pack_path_hints[@]}"; do intention_args+=(--hint-path "$line"); done
+    fi
+    memory_signals "${intention_args[@]}" 2>/dev/null | tail -n +2 >"$intentions_file" || : >"$intentions_file"
+  fi
+  if [ -s "$intentions_file" ]; then
+    intentions_due="$(wc -l <"$intentions_file" | tr -d ' ')"
+    intentions_hash="$(sha256_file "$intentions_file")"
+  fi
   retrieval_mode="$(awk -F= '$1 == "retrieval_mode" { print $2 }' "$metadata")"
   retrieval_degraded="$(awk -F= '$1 == "degraded" { print $2 }' "$metadata")"
   intent="$(awk -F= '$1 == "intent" { print $2 }' "$metadata")"; [ -n "$intent" ] || intent="legacy"
@@ -6391,15 +6516,25 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}")"
   pack="$dir/context-packs/$(slug "$agent")-$(slug "$task")-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
-    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$SCHEMA_VERSION"
+    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_intentions_due: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$intentions_due" "$SCHEMA_VERSION"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
+    if [ -s "$intentions_file" ]; then
+      printf '## Due Intentions — act on these first\n\n'
+      while IFS=$'\t' read -r intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path; do
+        [ -n "$intention_id" ] || continue
+        line="- ${intention_action} (\`${intention_id}\`; trigger \`${intention_trigger}\`; ${intention_reason}). Close with \`intention done\` or \`intention cancel\`."
+        printf '%s\n' "$line"
+        bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
+      done <"$intentions_file"
+      printf '\n'
+    fi
     if [ -s "$warnings" ]; then
       printf '## State Warnings — unresolved, not current truth\n\n'
       while IFS=$'\t' read -r warning_title warning_path warning_state; do
@@ -6461,7 +6596,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 
@@ -6874,6 +7009,284 @@ cmd_doctor() {
   [ "$age" = 0 ]
 }
 
+# Read-only project lookup for hooks and briefs: never creates a registry
+# entry or project directory.
+project_lookup_readonly() {
+  local source_root="$1" count
+  [ -d "$source_root" ] || return 1
+  resolve_source_identity "$source_root" 2>/dev/null || return 1
+  [ -f "$(registry_projects)" ] || return 1
+  count="$(awk -F '\t' -v root="$SOURCE_ROOT" -v remote="$SOURCE_REMOTE" -v fp="$SOURCE_FINGERPRINT" '
+    NR > 1 && ($4 == fp || $5 == root || (remote != "" && $6 == remote)) { print $2 }
+  ' "$(registry_projects)" | sort -u | wc -l | tr -d ' ')"
+  [ "$count" = 1 ] || return 1
+  awk -F '\t' -v root="$SOURCE_ROOT" -v remote="$SOURCE_REMOTE" -v fp="$SOURCE_FINGERPRINT" '
+    NR > 1 && ($4 == fp || $5 == root || (remote != "" && $6 == remote)) { print $2; exit }
+  ' "$(registry_projects)"
+}
+
+# Size-capped, derived project brief: durable approved facts plus recent
+# changes.  Read-only; safe for SessionStart hooks.
+cmd_brief() {
+  local project_id="" source_root="" principal="" max_bytes=4000 recent_days=14 json=0 dir
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source-root) source_root="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --max-bytes) max_bytes="${2:-}"; shift 2 ;;
+      --recent-days) recent_days="${2:-}"; shift 2 ;;
+      --json) json=1; shift ;;
+      --*) die 64 "unknown brief option: $1" ;;
+      *) [ -z "$project_id" ] || die 64 "brief accepts one PROJECT_ID"; project_id="$1"; shift ;;
+    esac
+  done
+  require_positive_integer "$max_bytes" || die 64 "--max-bytes must be a positive integer"
+  require_positive_integer "$recent_days" || die 64 "--recent-days must be a positive integer"
+  validate_scalar "$principal" || die 65 "--principal must be a single line"
+  if [ -z "$project_id" ]; then
+    [ -n "$source_root" ] || source_root="$CWD"
+    project_id="$(project_lookup_readonly "$source_root" || true)"
+    if [ -z "$project_id" ]; then
+      [ "$json" = 0 ] || printf '{"status":"no-project","derived":true}\n'
+      return 0
+    fi
+  fi
+  require_project "$project_id" dir
+  local -a args=(brief --project-dir "$dir" --project-id "$project_id" --max-bytes "$max_bytes" --recent-days "$recent_days")
+  [ -z "$principal" ] || args+=(--principal "$principal")
+  [ "$json" = 0 ] || args+=(--json)
+  memory_signals "${args[@]}"
+}
+
+cmd_usage() {
+  local project_id="${1:-}" principal="" json=0 dir; shift || true
+  [ -n "$project_id" ] || die 64 "usage requires PROJECT_ID"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --principal) principal="${2:-}"; shift 2 ;;
+      --json) json=1; shift ;;
+      *) die 64 "unknown usage option: $1" ;;
+    esac
+  done
+  validate_scalar "$principal" || die 65 "--principal must be a single line"
+  require_project "$project_id" dir
+  local -a args=(usage --project-dir "$dir")
+  [ -z "$principal" ] || args+=(--principal "$principal")
+  [ "$json" = 0 ] || args+=(--json)
+  memory_signals "${args[@]}"
+}
+
+# FSRS-style spaced re-verification.  `show` is derived and read-only;
+# `apply` is an explicit, audited operator action that moves one record's
+# stale_after to the suggested date (earlier after contradictions, later
+# after successful verification/use).  Nothing is applied automatically.
+cmd_stability() {
+  local action="${1:-}" project_id="${2:-}" ref="" principal="" json=0 reason="" dir row canonical canonical_id suggested old; shift 2 || true
+  [ -n "$project_id" ] || die 64 "stability requires show|apply PROJECT_ID"
+  case "$action" in
+    show)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --principal) principal="${2:-}"; shift 2 ;;
+          --json) json=1; shift ;;
+          --*) die 64 "unknown stability option: $1" ;;
+          *) ref="$1"; shift ;;
+        esac
+      done
+      require_project "$project_id" dir
+      local -a args=(stability --project-dir "$dir")
+      [ -z "$principal" ] || args+=(--principal "$principal")
+      [ -z "$ref" ] || args+=(--ref "$ref")
+      [ "$json" = 0 ] || args+=(--json)
+      memory_signals "${args[@]}"
+      ;;
+    apply)
+      canonical_id="${1:-}"; shift || true
+      [ -n "$canonical_id" ] || die 64 "stability apply requires CANONICAL_ID --reason TEXT"
+      while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; *) die 64 "unknown stability apply option: $1" ;; esac; done
+      [ -n "$reason" ] || die 64 "stability apply requires --reason TEXT"
+      validate_scalar "$reason" || die 65 "invalid reason"
+      validate_id "$canonical_id" || die 64 "invalid canonical id"
+      require_project "$project_id" dir
+      canonical="$(canonical_ref_file "$dir" "$canonical_id" 2>/dev/null || true)"
+      [ -n "$canonical" ] || die 66 "canonical item missing: $canonical_id"
+      canonical_file_effective "$dir" "$canonical" || die 65 "canonical item is not effective approved memory: $canonical_id"
+      row="$(memory_signals stability --project-dir "$dir" --ref "${canonical#"$dir"/}" | tail -n +2 | head -n 1)"
+      [ -n "$row" ] || die 65 "no stability evidence for $canonical_id"
+      suggested="$(printf '%s\n' "$row" | cut -f7)"
+      case "$suggested" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) die 65 "invalid suggested stale_after" ;; esac
+      old="$(frontmatter_field "$canonical" stale_after)"
+      if [ "$old" = "$suggested" ]; then
+        printf 'stability=unchanged project_id=%s canonical=%s stale_after=%s\n' "$project_id" "${canonical#"$dir"/}" "$suggested"
+        return 0
+      fi
+      acquire_lock "project-$project_id"
+      set_frontmatter_field "$canonical" stale_after "$suggested"
+      audit_v2 "$dir" "stability-apply" "$canonical_id" "${old:-none}" "$suggested" "$(sha256_file "$canonical")" "reason=$(slug "$reason")"
+      release_lock
+      printf 'stability=applied project_id=%s canonical=%s previous=%s stale_after=%s\n' "$project_id" "${canonical#"$dir"/}" "${old:-none}" "$suggested"
+      ;;
+    *) die 64 "stability requires show or apply" ;;
+  esac
+}
+
+intention_trigger_valid() {
+  local kind="$1" value="$2"
+  [ -n "$value" ] || return 1
+  validate_scalar "$value" || return 1
+  case "$kind" in
+    date)
+      case "$value" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) return 0 ;;
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    path) case "$value" in /*|*..*) return 1 ;; esac ;;
+    keyword|state) : ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# Prospective memory ("remember to do X when Y").  Intentions are operational
+# records under intentions/, never canonical OKF; they surface at the top of
+# context packs when their deterministic trigger fires.
+cmd_intention() {
+  local action="${1:-}" project_id="${2:-}" dir; shift 2 || true
+  [ -n "$project_id" ] || die 64 "intention requires add|list|done|cancel PROJECT_ID"
+  require_project "$project_id" dir
+  case "$action" in
+    add)
+      local action_text="" trigger="" principal="" kind value baseline="" intention_id file scan
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --action) action_text="${2:-}"; shift 2 ;;
+          --trigger) trigger="${2:-}"; shift 2 ;;
+          --principal) principal="${2:-}"; shift 2 ;;
+          *) die 64 "unknown intention add option: $1" ;;
+        esac
+      done
+      [ -n "$action_text" ] || die 64 "intention add requires --action TEXT"
+      [ -n "$trigger" ] || die 64 "intention add requires --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY"
+      validate_scalar "$action_text" || die 65 "intention action must be a single line"
+      validate_scalar "$principal" || die 65 "--principal must be a single line"
+      kind="${trigger%%:*}"; value="${trigger#*:}"
+      [ "$kind" != "$trigger" ] || die 64 "trigger must be KIND:VALUE"
+      intention_trigger_valid "$kind" "$value" || die 65 "invalid intention trigger: $trigger"
+      scan="$(mktemp "${TMPDIR:-/tmp}/llm-brain-intention.XXXXXX")"
+      printf '%s\n%s\n' "$action_text" "$value" >"$scan"
+      if ! secret_scan_file "$scan"; then rm -f "$scan"; die 65 "intention text matched the secret scanner"; fi
+      rm -f "$scan"
+      [ "$kind" != state ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$value")"
+      intention_id="intention_$(sha256_text "$project_id|$action_text|$kind|$value|$principal" | cut -c1-16)"
+      ensure_dir "$dir/intentions"
+      file="$dir/intentions/$intention_id.md"
+      acquire_lock "project-$project_id"
+      if [ ! -f "$file" ]; then
+        {
+          printf '%s\n' '---'
+          printf 'type: Intention\ntitle: %s\nbrain_project_id: %s\nbrain_intention_id: %s\nbrain_intention_action: %s\nbrain_intention_status: open\nbrain_trigger_kind: %s\nbrain_trigger_value: %s\n' "$(yaml_quote "Intention: $action_text")" "$project_id" "$intention_id" "$(yaml_quote "$action_text")" "$kind" "$(yaml_quote "$value")"
+          [ -z "$baseline" ] || printf 'brain_trigger_baseline: %s\n' "$baseline"
+          [ -z "$principal" ] || printf 'brain_principal: %s\n' "$(yaml_quote "$principal")"
+          printf 'brain_sensitivity: internal\nbrain_artifact_state: operational\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+          printf '%s\n' '---'
+          printf '# Intention\n\nWhen `%s:%s` fires: %s\n\nThis is prospective memory, not canonical knowledge. Close it with `intention done` or `intention cancel`.\n' "$kind" "$value" "$action_text"
+        } >"${file}.tmp.$$"
+        mv "${file}.tmp.$$" "$file"
+        audit_v2 "$dir" "intention-add" "$intention_id" "" open "$(sha256_file "$file")" "trigger=$kind"
+      fi
+      release_lock
+      printf 'intention=ok project_id=%s intention_id=%s status=open trigger=%s file=%s\n' "$project_id" "$intention_id" "$kind" "$file"
+      ;;
+    list)
+      local status=open task="" principal="" due=0 json=0
+      local -a args=(intentions --project-dir "$dir")
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --status) status="${2:-}"; shift 2 ;;
+          --task) task="${2:-}"; shift 2 ;;
+          --path) args+=(--hint-path "${2:-}"); shift 2 ;;
+          --principal) principal="${2:-}"; shift 2 ;;
+          --due) due=1; shift ;;
+          --json) json=1; shift ;;
+          *) die 64 "unknown intention list option: $1" ;;
+        esac
+      done
+      case "$status" in open|done|cancelled|all) ;; *) die 64 "--status must be open, done, cancelled or all" ;; esac
+      args+=(--status "$status" --task "$task")
+      [ -z "$principal" ] || args+=(--principal "$principal")
+      [ "$due" = 0 ] || args+=(--due-only)
+      [ "$json" = 0 ] || args+=(--json)
+      memory_signals "${args[@]}"
+      ;;
+    done|cancel)
+      local intention_id="${1:-}" reason="" file old new
+      shift || true
+      while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; *) die 64 "unknown intention option: $1" ;; esac; done
+      [ -n "$intention_id" ] || die 64 "intention $action requires INTENTION_ID --reason TEXT"
+      [ -n "$reason" ] || die 64 "intention $action requires --reason TEXT"
+      validate_id "$intention_id" || die 64 "invalid intention id"
+      validate_scalar "$reason" || die 65 "invalid reason"
+      file="$dir/intentions/$intention_id.md"
+      [ -f "$file" ] && [ ! -L "$file" ] || die 66 "intention missing: $intention_id"
+      new=done; [ "$action" = done ] || new=cancelled
+      acquire_lock "project-$project_id"
+      old="$(frontmatter_field "$file" brain_intention_status)"
+      if [ "$old" != open ]; then release_lock; die 65 "intention is not open: $intention_id ($old)"; fi
+      set_frontmatter_field "$file" brain_intention_status "$new"
+      set_frontmatter_field "$file" brain_closed_at "$(yaml_quote "$(now_utc)")"
+      set_frontmatter_field "$file" brain_close_reason "$(yaml_quote "$reason")"
+      audit_v2 "$dir" "intention-$action" "$intention_id" open "$new" "$(sha256_file "$file")" "reason=$(slug "$reason")"
+      release_lock
+      printf 'intention=%s project_id=%s intention_id=%s\n' "$new" "$project_id" "$intention_id"
+      ;;
+    *) die 64 "intention requires add, list, done or cancel" ;;
+  esac
+}
+
+# Co-use links: propose AssociativeProjections for records that repeatedly
+# appear together in packs marked useful.  Proposals go to review; approval
+# builds the derived, reversible association.  Nothing is linked silently.
+association_propose() {
+  local project_id="$1" min_count=2 write_review=0 dir ref_a ref_b count feedback review_id written=0; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --min-count) min_count="${2:-}"; shift 2 ;;
+      --write-review) write_review=1; shift ;;
+      *) die 64 "unknown association propose option: $1" ;;
+    esac
+  done
+  require_positive_integer "$min_count" || die 64 "--min-count must be a positive integer"
+  require_project "$project_id" dir
+  printf 'ref_a\tref_b\tuseful_packs\treview_id\n'
+  while IFS=$'\t' read -r ref_a ref_b count feedback; do
+    [ -n "$ref_a" ] || continue
+    review_id="association_review_$(sha256_text "$project_id|$ref_a|$ref_b" | cut -c1-16)"
+    if [ "$write_review" = 1 ] && [ ! -f "$dir/review/$review_id.md" ]; then
+      acquire_lock "project-$project_id"
+      write_review_item "$dir" "$review_id" association "Associate $ref_a with $ref_b" proposed 0.0 low internal derived llm-brain "feedback://co-use" "Records \`$ref_a\` and \`$ref_b\` appeared together in $count packs marked useful ($feedback). Approval builds a derived, reversible AssociativeProjection; it never edits either record." >/dev/null
+      set_frontmatter_field "$dir/review/$review_id.md" brain_association_a "$(yaml_quote "$ref_a")"
+      set_frontmatter_field "$dir/review/$review_id.md" brain_association_b "$(yaml_quote "$ref_b")"
+      set_frontmatter_field "$dir/review/$review_id.md" brain_co_use_count "$count"
+      audit_v2 "$dir" "association-propose" "$review_id" "" proposed "$(sha256_file "$dir/review/$review_id.md")" "co_use=$count"
+      release_lock
+      written=$((written + 1))
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$ref_a" "$ref_b" "$count" "$([ "$write_review" = 1 ] && printf '%s' "$review_id" || printf -- '-')"
+  done < <(memory_signals coaccess --project-dir "$dir" --min-count "$min_count" | tail -n +2)
+}
+
+cmd_mcp() {
+  local action="${1:-}" helper; shift || true
+  [ "$action" = serve ] || die 64 "mcp requires serve"
+  resolve_okf_runtime
+  helper="$(sibling_helper mcp_server.py)" || die 69 "MCP server helper is unavailable"
+  local -a args=("$helper" --cli "$SCRIPT_SOURCE" --cwd "$CWD")
+  [ "$ROOT_EXPLICIT" = 0 ] || args+=(--root "$ROOT")
+  exec "$OKF_PYTHON" "${args[@]}" "$@"
+}
+
 # Maintenance is a bounded derived view. Persistent writes are limited to the
 # explicitly requested report or schedule marker.
 maintenance_semantic_files() {
@@ -6906,6 +7319,32 @@ maintenance_visible() {
 maintenance_count_category() {
   local category="$1"
   awk -F '\t' -v category="$category" '$1 == category { count++ } END { print count + 0 }' "$MAINT_ITEMS_FILE" 2>/dev/null
+}
+
+maintenance_count_advisory() {
+  awk -F '\t' -v category="$1" '$1 == category { count++ } END { print count + 0 }' "$MAINT_ADVISORY_FILE" 2>/dev/null
+}
+
+# Derived usage, doctor, spaced-review and code-anchor signals.  Code drift
+# (an anchored file changed since its commit) is a reverify finding; the rest
+# are advisory and never change maintenance health, delete or promote.
+maintenance_signal_scan() {
+  local dir="$1" project_id="$2" principal="${3:-}" source_root category ref title state reason recommendation
+  source_root="$(awk -F '\t' -v id="$project_id" 'NR > 1 && $2 == id { root=$5 } END { print root }' "$(registry_projects)" 2>/dev/null || true)"
+  if ! memory_signals maintenance --project-dir "$dir" --principal "$principal" --source-root "$source_root" >"$MAINT_ADVISORY_FILE.raw" 2>/dev/null; then
+    maintenance_add_item index signals:derived 'Derived memory signals' unavailable memory-signals-unavailable inspect-runtime
+    : >"$MAINT_ADVISORY_FILE.raw"
+  fi
+  while IFS=$'\t' read -r category ref title state reason recommendation; do
+    [ -n "$category" ] || continue
+    if [ "$category" = code-drift ]; then
+      maintenance_add_item "$category" "$ref" "$title" "$state" "$reason" "$recommendation"
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$category" "$ref" "$title" "$state" "$reason" "$recommendation" >>"$MAINT_ADVISORY_FILE"
+    fi
+  done <"$MAINT_ADVISORY_FILE.raw"
+  rm -f "$MAINT_ADVISORY_FILE.raw"
+  LC_ALL=C sort -o "$MAINT_ADVISORY_FILE" "$MAINT_ADVISORY_FILE"
 }
 
 maintenance_add_item() {
@@ -7092,6 +7531,7 @@ maintenance_add_dependencies() {
 maintenance_collect() {
   local project_id="$1" principal="${2:-}" output_dir="$3" dir file type title status valid_from valid_to stale_after verified conflict state_key depends version supersedes resolution reason provenance roots rel now today source_hash
   require_project "$project_id" dir
+  MAINT_ADVISORY_FILE="$output_dir/advisories.tsv"; : >"$MAINT_ADVISORY_FILE"
   MAINT_ITEMS_RAW="$output_dir/items.raw.tsv"; MAINT_ITEMS_FILE="$output_dir/items.tsv"; MAINT_ROOT_RECORDS="$output_dir/root-records.tsv"; MAINT_SCOPE_FILE="$output_dir/scope.tsv"; MAINT_RECEIPT_ISSUES="$output_dir/receipt-issues.tsv"; MAINT_FIELDS_CACHE_DIR="$output_dir/fields"; ensure_dir "$MAINT_FIELDS_CACHE_DIR"
   : >"$MAINT_ITEMS_RAW"; : >"$MAINT_ROOT_RECORDS"; : >"$MAINT_SCOPE_FILE"; : >"$MAINT_RECEIPT_ISSUES"
   MAINT_COLLECTION_STATE=ok; now="$(now_utc)"; today="$(today_utc)"
@@ -7148,12 +7588,14 @@ maintenance_collect() {
     fi
   done < <(maintenance_semantic_files "$dir")
   maintenance_work_scan "$dir" "$principal"; maintenance_receipt_scan "$dir" "$project_id"; maintenance_index_scan "$dir"; maintenance_retraction_scan "$dir" "$principal"
+  maintenance_signal_scan "$dir" "$project_id" "$principal"
   LC_ALL=C sort -u "$MAINT_SCOPE_FILE" -o "$MAINT_SCOPE_FILE" 2>/dev/null || true
   LC_ALL=C sort -u "$MAINT_ROOT_RECORDS" -o "$MAINT_ROOT_RECORDS" 2>/dev/null || true
   LC_ALL=C sort "$MAINT_ITEMS_RAW" >"$MAINT_ITEMS_FILE"
   MAINT_SCOPE_HASH="$(sha256_file "$MAINT_SCOPE_FILE")"; MAINT_TOTAL_FINDINGS="$(wc -l <"$MAINT_ITEMS_FILE" | tr -d ' ')"
   MAINT_COUNT_EXPIRED="$(maintenance_count_category expired-validity)"; MAINT_COUNT_STALE="$(maintenance_count_category stale-verification)"; MAINT_COUNT_UNKNOWN="$(maintenance_count_category unknown-validity)"; MAINT_COUNT_CONFLICT="$(maintenance_count_category unresolved-conflict)"; MAINT_COUNT_DEPENDENCY="$(maintenance_count_category unresolved-dependency)"; MAINT_COUNT_INACCESSIBLE="$(maintenance_count_category unresolved-inaccessible)"; MAINT_COUNT_CYCLE="$(maintenance_count_category invalid-cycle)"
-  MAINT_COUNT_PENDING_WORK="$(maintenance_count_category pending-work)"; MAINT_COUNT_FAILED_WORK="$(maintenance_count_category failed-work)"; MAINT_COUNT_RECOVERED_WORK="$(maintenance_count_category recovered-work)"; MAINT_COUNT_ORPHANED_WORK="$(maintenance_count_category orphaned-work)"; MAINT_COUNT_RECEIPTS="$(maintenance_count_category receipt)"; MAINT_COUNT_INDEX="$(maintenance_count_category index)"; MAINT_COUNT_PROVENANCE="$(maintenance_count_category provenance)"; MAINT_COUNT_RETRACTION="$(maintenance_count_category retraction)"
+  MAINT_COUNT_PENDING_WORK="$(maintenance_count_category pending-work)"; MAINT_COUNT_FAILED_WORK="$(maintenance_count_category failed-work)"; MAINT_COUNT_RECOVERED_WORK="$(maintenance_count_category recovered-work)"; MAINT_COUNT_ORPHANED_WORK="$(maintenance_count_category orphaned-work)"; MAINT_COUNT_RECEIPTS="$(maintenance_count_category receipt)"; MAINT_COUNT_INDEX="$(maintenance_count_category index)"; MAINT_COUNT_PROVENANCE="$(maintenance_count_category provenance)"; MAINT_COUNT_RETRACTION="$(maintenance_count_category retraction)"; MAINT_COUNT_CODE_DRIFT="$(maintenance_count_category code-drift)"
+  MAINT_ADVISORY_TOTAL="$(wc -l <"$MAINT_ADVISORY_FILE" | tr -d ' ')"; MAINT_ADVISORY_RETENTION="$(maintenance_count_advisory retention-signal)"; MAINT_ADVISORY_DOCTOR="$(maintenance_count_advisory memory-doctor)"; MAINT_ADVISORY_SPACED="$(maintenance_count_advisory spaced-review)"; MAINT_ADVISORY_ANCHOR="$(maintenance_count_advisory code-anchor)"
   MAINT_COUNT_UNRESOLVED_STATE=$((MAINT_COUNT_CONFLICT + MAINT_COUNT_DEPENDENCY + MAINT_COUNT_INACCESSIBLE + MAINT_COUNT_CYCLE)); MAINT_ROOT_COUNT="$(awk -F '\t' 'NF { seen[$1]=1 } END { for (item in seen) count++; print count + 0 }' "$MAINT_ROOT_RECORDS")"; MAINT_CORRELATED_RECORD_COUNT="$(awk -F '\t' 'NF { count[$1]++ } END { for (item in count) if (count[item] > 1) total += count[item]; print total + 0 }' "$MAINT_ROOT_RECORDS")"
   MAINT_RECOMMENDATIONS_FILE="$output_dir/recommendations.txt"; : >"$MAINT_RECOMMENDATIONS_FILE"; awk -F '\t' '{ print $6 }' "$MAINT_ITEMS_FILE" | awk 'NF && !seen[$0]++' >"$MAINT_RECOMMENDATIONS_FILE"
   if [ "$MAINT_COLLECTION_STATE" != ok ]; then MAINT_HEALTH=blocked; elif [ "$MAINT_TOTAL_FINDINGS" -gt 0 ]; then MAINT_HEALTH=attention; else MAINT_HEALTH=healthy; fi
@@ -7183,8 +7625,8 @@ maintenance_render_body() {
     printf 'This is a bounded derived diagnostic report, not canonical memory. It never deletes, retracts or promotes records.\n\n'
     printf 'Visible scope: `%s`; visible evidence roots: `%s`; correlated records: `%s`.\n\n' "${MAINT_PRINCIPAL:-shared}" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
     printf '## Diagnostic summary\n\n| Finding | Count |\n|---|---:|\n'
-    printf '| Expired validity | %s |\n| Stale verification | %s |\n| Unknown validity | %s |\n| Unresolved conflicts | %s |\n| Unresolved dependencies | %s |\n| Unresolved inaccessible | %s |\n| Invalid cycles | %s |\n| Pending work | %s |\n| Failed work | %s |\n| Recovered work | %s |\n| Orphaned work | %s |\n| Receipt issues | %s |\n| Index issues | %s |\n| Provenance issues | %s |\n| Retraction residuals | %s |\n\n' \
-      "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION"
+    printf '| Expired validity | %s |\n| Stale verification | %s |\n| Unknown validity | %s |\n| Unresolved conflicts | %s |\n| Unresolved dependencies | %s |\n| Unresolved inaccessible | %s |\n| Invalid cycles | %s |\n| Pending work | %s |\n| Failed work | %s |\n| Recovered work | %s |\n| Orphaned work | %s |\n| Receipt issues | %s |\n| Index issues | %s |\n| Provenance issues | %s |\n| Retraction residuals | %s |\n| Code drift (reverify) | %s |\n\n' \
+      "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_COUNT_CODE_DRIFT"
   } >"$snapshot/report.body"
   maintenance_render_category expired-validity 'Retention review candidates (no automatic deletion)' "$selected" >>"$snapshot/report.body"
   maintenance_render_category stale-verification 'Freshness review candidates' "$selected" >>"$snapshot/report.body"
@@ -7201,6 +7643,17 @@ maintenance_render_body() {
   maintenance_render_category index 'Index health diagnostics' "$selected" >>"$snapshot/report.body"
   maintenance_render_category provenance 'Provenance diagnostics' "$selected" >>"$snapshot/report.body"
   maintenance_render_category retraction 'Retraction residuals' "$selected" >>"$snapshot/report.body"
+  maintenance_render_category code-drift 'Code drift: anchored files changed since their commit' "$selected" >>"$snapshot/report.body"
+  {
+    printf '## Advisory signals (no health impact)\n\n'
+    printf 'Derived from receipts, feedback, links, verification history and git. Nothing is deleted, retracted or promoted automatically.\n\n'
+    printf '| Signal | Count |\n|---|---:|\n| Retention candidates (usage) | %s |\n| Memory doctor (orphans, duplicates, oversized) | %s |\n| Spaced re-verification | %s |\n| Code anchor checks | %s |\n\n' "$MAINT_ADVISORY_RETENTION" "$MAINT_ADVISORY_DOCTOR" "$MAINT_ADVISORY_SPACED" "$MAINT_ADVISORY_ANCHOR"
+    head -n "$limit" "$MAINT_ADVISORY_FILE" >"$snapshot/advisories.selected.tsv"
+  } >>"$snapshot/report.body"
+  maintenance_render_category retention-signal 'Retention candidates from usage (review only)' "$snapshot/advisories.selected.tsv" >>"$snapshot/report.body"
+  maintenance_render_category memory-doctor 'Memory doctor findings' "$snapshot/advisories.selected.tsv" >>"$snapshot/report.body"
+  maintenance_render_category spaced-review 'Spaced re-verification schedule' "$snapshot/advisories.selected.tsv" >>"$snapshot/report.body"
+  maintenance_render_category code-anchor 'Code anchor checks' "$snapshot/advisories.selected.tsv" >>"$snapshot/report.body"
   {
     printf '## Recommendations\n\n'
     if [ -s "$MAINT_RECOMMENDATIONS_FILE" ]; then
@@ -7210,6 +7663,7 @@ maintenance_render_body() {
     fi
     printf '\n'
     [ "$MAINT_TOTAL_FINDINGS" -le "$limit" ] || printf 'Additional findings omitted by --limit %s.\n\n' "$limit"
+    [ "$MAINT_ADVISORY_TOTAL" -le "$limit" ] || printf 'Additional advisory signals omitted by --limit %s.\n\n' "$limit"
   } >>"$snapshot/report.body"
 }
 
@@ -7269,6 +7723,7 @@ maintenance_write_report() {
     printf 'brain_count_expired_validity: %s\nbrain_count_stale_verification: %s\nbrain_count_unknown_validity: %s\nbrain_count_unresolved_conflict: %s\nbrain_count_unresolved_dependency: %s\nbrain_count_unresolved_inaccessible: %s\nbrain_count_invalid_cycle: %s\nbrain_count_pending_work: %s\nbrain_count_failed_work: %s\nbrain_count_recovered_work: %s\nbrain_count_orphaned_work: %s\nbrain_count_receipt_issues: %s\nbrain_count_index_issues: %s\nbrain_count_provenance_issues: %s\nbrain_count_retraction_residuals: %s\nbrain_count_total_findings: %s\n' \
       "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_TOTAL_FINDINGS"
     printf 'brain_independent_source_count: %s\nbrain_correlated_record_count: %s\n' "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
+    printf 'brain_count_code_drift: %s\nbrain_count_advisory_signals: %s\n' "$MAINT_COUNT_CODE_DRIFT" "$MAINT_ADVISORY_TOTAL"
     printf '%s\n' 'brain_schema_version: '"$SCHEMA_VERSION" '---'
     cat "$snapshot/report.body"
   } >"$base"
@@ -7279,7 +7734,8 @@ maintenance_write_report() {
       "$(yaml_quote 'LLM-Brain maintenance report')" "$project_id" "$hash" "$MAINT_HEALTH" "$(yaml_quote "${principal:-shared}")" "$MAINT_SCOPE_HASH" "$limit"
     printf 'brain_count_expired_validity: %s\nbrain_count_stale_verification: %s\nbrain_count_unknown_validity: %s\nbrain_count_unresolved_conflict: %s\nbrain_count_unresolved_dependency: %s\nbrain_count_unresolved_inaccessible: %s\nbrain_count_invalid_cycle: %s\nbrain_count_pending_work: %s\nbrain_count_failed_work: %s\nbrain_count_recovered_work: %s\nbrain_count_orphaned_work: %s\nbrain_count_receipt_issues: %s\nbrain_count_index_issues: %s\nbrain_count_provenance_issues: %s\nbrain_count_retraction_residuals: %s\nbrain_count_total_findings: %s\n' \
       "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_TOTAL_FINDINGS"
-    printf 'brain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_schema_version: %s\n---\n' "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT" "$SCHEMA_VERSION"
+    printf 'brain_independent_source_count: %s\nbrain_correlated_record_count: %s\n' "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT"
+    printf 'brain_count_code_drift: %s\nbrain_count_advisory_signals: %s\nbrain_schema_version: %s\n---\n' "$MAINT_COUNT_CODE_DRIFT" "$MAINT_ADVISORY_TOTAL" "$SCHEMA_VERSION"
     cat "$snapshot/report.body"
   } >"$tmp"
   mv -f "$tmp" "$report"; MAINT_REPORT_HASH="$(sha256_file "$report")"
@@ -7289,7 +7745,7 @@ maintenance_write_report() {
 maintenance_json_output() {
   local command="$1" project_id="$2" report_state="$3" report_hash="$4" reminder="$5" report_path="$6" schedule_file="$7" py
   py="$(bridge_python 2>/dev/null || true)"; [ -n "$py" ] && [ -x "$py" ] || die 69 'Python 3 is unavailable for maintenance JSON output'
-  "$py" - "$command" "$project_id" "$MAINT_STATUS_HEALTH" "$MAINT_SCHEDULE_STATE" "$report_state" "$report_hash" "$reminder" "$report_path" "$schedule_file" "$MAINT_PRINCIPAL" "$MAINT_SCOPE_HASH" "$MAINT_ITEMS_FILE" "$MAINT_RECOMMENDATIONS_FILE" "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT" "$MAINT_SCHEDULE_NAME" "$MAINT_SCHEDULE_CADENCE" "$MAINT_SCHEDULE_RUNNER" "$MAINT_SCHEDULE_MAX_AGE" "$MAINT_LIMIT" <<'PY'
+  "$py" - "$command" "$project_id" "$MAINT_STATUS_HEALTH" "$MAINT_SCHEDULE_STATE" "$report_state" "$report_hash" "$reminder" "$report_path" "$schedule_file" "$MAINT_PRINCIPAL" "$MAINT_SCOPE_HASH" "$MAINT_ITEMS_FILE" "$MAINT_RECOMMENDATIONS_FILE" "$MAINT_COUNT_EXPIRED" "$MAINT_COUNT_STALE" "$MAINT_COUNT_UNKNOWN" "$MAINT_COUNT_CONFLICT" "$MAINT_COUNT_DEPENDENCY" "$MAINT_COUNT_INACCESSIBLE" "$MAINT_COUNT_CYCLE" "$MAINT_COUNT_PENDING_WORK" "$MAINT_COUNT_FAILED_WORK" "$MAINT_COUNT_RECOVERED_WORK" "$MAINT_COUNT_ORPHANED_WORK" "$MAINT_COUNT_RECEIPTS" "$MAINT_COUNT_INDEX" "$MAINT_COUNT_PROVENANCE" "$MAINT_COUNT_RETRACTION" "$MAINT_ROOT_COUNT" "$MAINT_CORRELATED_RECORD_COUNT" "$MAINT_SCHEDULE_NAME" "$MAINT_SCHEDULE_CADENCE" "$MAINT_SCHEDULE_RUNNER" "$MAINT_SCHEDULE_MAX_AGE" "$MAINT_LIMIT" "$MAINT_COUNT_CODE_DRIFT" "$MAINT_ADVISORY_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -7299,7 +7755,7 @@ from pathlib import Path
  recommendations_path, expired, stale, unknown, conflict, dependency,
  inaccessible, cycle, pending, failed, recovered, orphaned, receipts, index,
  provenance, retraction, roots, correlated, schedule_name, schedule_cadence,
- schedule_runner, schedule_max_age, items_limit) = sys.argv[1:]
+ schedule_runner, schedule_max_age, items_limit, code_drift, advisory_path) = sys.argv[1:]
 def number(value):
     try:
         return int(value)
@@ -7314,7 +7770,7 @@ counts = {
     "orphaned_work": number(orphaned), "receipt_issues": number(receipts),
     "index_issues": number(index), "provenance_issues": number(provenance),
     "retraction_residuals": number(retraction), "independent_source_count": number(roots),
-    "correlated_record_count": number(correlated),
+    "correlated_record_count": number(correlated), "code_drift": number(code_drift),
 }
 counts["unresolved_state"] = counts["unresolved_conflict"] + counts["unresolved_dependency"] + counts["unresolved_inaccessible"] + counts["invalid_cycle"]
 counts["total_findings"] = sum(value for key, value in counts.items() if key not in ("independent_source_count", "correlated_record_count", "unresolved_state", "total_findings"))
@@ -7330,6 +7786,19 @@ try:
     recommendations = [line.strip() for line in Path(recommendations_path).read_text(encoding="utf-8").splitlines() if line.strip()]
 except OSError:
     recommendations = []
+advisories = []
+advisory_counts = {"retention_signal": 0, "memory_doctor": 0, "spaced_review": 0, "code_anchor": 0}
+try:
+    for line in Path(advisory_path).read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 6:
+            continue
+        key = fields[0].replace("-", "_")
+        advisory_counts[key] = advisory_counts.get(key, 0) + 1
+        if len(advisories) < max(number(items_limit), 0):
+            advisories.append({"category": fields[0], "ref": fields[1], "title": fields[2], "state": fields[3], "reason": fields[4], "recommendation": fields[5]})
+except OSError:
+    pass
 schedule = {"name": schedule_name or None, "cadence": schedule_cadence or None, "runner": schedule_runner if schedule_state in ("declared-unverified", "disabled") else None}
 try:
     schedule["max_age_days"] = int(schedule_max_age)
@@ -7344,6 +7813,7 @@ payload = {
     "scope_snapshot_hash": scope_hash or None, "counts": counts,
     "bounded_items": items, "recommendations": recommendations,
     "reminder": reminder, "schedule": schedule,
+    "advisories": advisories, "advisory_counts": advisory_counts,
 }
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 PY
@@ -7361,6 +7831,11 @@ maintenance_human_output() {
     printf 'finding=%s category=%s state=%s reason=%s recommendation=%s\n' "$item" "$category" "$state" "$reason" "$recommendation"
  done < <(head -n "$MAINT_LIMIT" "$MAINT_ITEMS_FILE")
   [ "$MAINT_TOTAL_FINDINGS" -le "$MAINT_LIMIT" ] || printf 'findings_omitted=%s\n' "$((MAINT_TOTAL_FINDINGS - MAINT_LIMIT))"
+  printf 'code_drift=%s advisories=retention:%s doctor:%s spaced:%s anchors:%s\n' "$MAINT_COUNT_CODE_DRIFT" "$MAINT_ADVISORY_RETENTION" "$MAINT_ADVISORY_DOCTOR" "$MAINT_ADVISORY_SPACED" "$MAINT_ADVISORY_ANCHOR"
+  while IFS=$'\t' read -r category item title state reason recommendation; do
+    [ -n "$item" ] || continue
+    printf 'advisory=%s category=%s state=%s reason=%s recommendation=%s\n' "$item" "$category" "$state" "$reason" "$recommendation"
+  done < <(head -n "$MAINT_LIMIT" "$MAINT_ADVISORY_FILE")
 }
 
 maintenance_schedule_write() {
@@ -8199,7 +8674,7 @@ upgrade_replace_local_plugin_source() {
 }
 
 upgrade_update_host() {
-  local host="$1" marketplace="$2" source="$3" target="$4" package_root="$5" package_source_type="$6" install_root link target_dir
+  local host="$1" marketplace="$2" source="$3" target="$4" package_root="$5" package_source_type="$6" install_root link target_dir helper
   case "$host" in
     codex)
       case "$package_source_type" in
@@ -8219,6 +8694,9 @@ upgrade_update_host() {
       install -m 0755 "$(upgrade_target_cli "$source")" "$target_dir/llm-brain"
       mkdir -p "$target_dir/lib"
       install -m 0644 "$source/lib/okf.py" "$target_dir/lib/okf.py"
+      for helper in replication.py memory_signals.py mcp_server.py; do
+        [ ! -f "$source/lib/$helper" ] || install -m 0644 "$source/lib/$helper" "$target_dir/lib/$helper"
+      done
       install -m 0644 "$source/VERSION" "$source/requirements-okf.lock" "$target_dir/"
       link="$HOME/.local/bin/llm-brain"
       [ ! -e "$link" ] || [ -L "$link" ] || die 73 "refusing to replace non-symlink standalone launcher: $link"
@@ -8721,6 +9199,11 @@ main() {
     reflect) cmd_reflect "$@" ;;
     work) cmd_work "$@" ;;
     maintenance) cmd_maintenance "$@" ;;
+    brief) cmd_brief "$@" ;;
+    usage) cmd_usage "$@" ;;
+    stability) cmd_stability "$@" ;;
+    intention) cmd_intention "$@" ;;
+    mcp) cmd_mcp "$@" ;;
     bridge) cmd_bridge "$@" ;;
     run) cmd_run "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
