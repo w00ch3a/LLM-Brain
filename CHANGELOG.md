@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Evidence recall without an embedder-built evidence index no longer opens
+  every source file on every recall: source metadata is read in one pass and
+  cached in the derived `indexes/evidence-sources-meta.tsv`, refreshed only
+  for new or modified sources. On a 1,305-source project on a CIFS NAS,
+  bridge recall fell from 19-33 s to 3-5 s with identical output.
 - Fixed `index build` on filesystems without symlink support (CIFS/SMB
   mounts without `mfsymlinks`): compatibility aliases fall back to copies
   instead of aborting after publication and leaving rebuild state stuck at
