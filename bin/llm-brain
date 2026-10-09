@@ -2163,7 +2163,8 @@ audit_v2() {
   validate_scalar "$details" || die 65 "invalid audit details"
   audit="$dir/audit.v2.tsv"
   timestamp="$(now_utc)"
-  prev="$(tail -1 "$audit" 2>/dev/null | awk -F '\t' 'NR == 1 && $11 !~ /^event_hash$/ { print $11 }')"
+  # A legacy (pre-v2) project has no audit file yet; start a new chain.
+  prev="$({ tail -1 "$audit" 2>/dev/null || true; } | awk -F '\t' 'NR == 1 && $11 !~ /^event_hash$/ { print $11 }')"
   payload="$timestamp|$ACTOR|$action|$(basename "$dir")|$object_id|$old_state|$new_state|$content_hash|$details|$prev"
   event="$(sha256_text "$payload")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -4805,7 +4806,12 @@ index_publish_compat() {
     if [ -f "$root/$name" ]; then
       tmp="$indexes/.${name}.compat.$$"
       rm -f "$tmp"
-      ln -s "generations/$generation/$name" "$tmp"
+      # Some network filesystems (CIFS/SMB without mfsymlinks) cannot hold
+      # symlinks; fall back to a copied alias so publication still completes.
+      if ! ln -s "generations/$generation/$name" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        cp "$root/$name" "$tmp"
+      fi
       mv -f "$tmp" "$indexes/$name"
     else
       rm -f "$indexes/$name"

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed `index build` on filesystems without symlink support (CIFS/SMB
+  mounts without `mfsymlinks`): compatibility aliases fall back to copies
+  instead of aborting after publication and leaving rebuild state stuck at
+  `building`.
+- Fixed `index build` (and other audited writes) aborting on legacy projects
+  that have no `audit.v2.tsv` yet; the hash chain now starts fresh.
 - Development continues after the v0.7.1 release; no live-vault mutation is
   implied.
 - Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
