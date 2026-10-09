@@ -8,7 +8,7 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
-## 0.8.0 - unreleased candidate
+## 0.8.0 - 2026-10-09
 
 - Added deterministic stdlib BM25F lexical scoring (legacy scorer kept behind
   `LLM_BRAIN_LEXICAL_SCORER=legacy`) and `brain_paths` glob recall via task
