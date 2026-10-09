@@ -1099,6 +1099,91 @@ Path(output_path).write_text("".join(rows), encoding="utf-8")
 PY
 }
 
+# Without an evidence index, collect source metadata (principal, observed-at,
+# title, evidence view) in one awk pass instead of three processes per file;
+# on network filesystems the per-file spawns dominated recall latency.
+# Field semantics match frontmatter_field.
+bridge_sources_meta() {
+  local dir="$1" list="$2"
+  [ -s "$list" ] || return 0
+  tr '\n' '\000' <"$list" | xargs -0 awk -v dir="$dir" -v ver="$EVIDENCE_VIEW_VERSION" '
+    function clean(line,   value) {
+      value = substr(line, index(line, ":") + 1)
+      sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value)
+      gsub(/^"|"$/, "", value)
+      return value
+    }
+    function row(file,   rel, hash, view, probe) {
+      rel = substr(file, length(dir) + 2)
+      hash = rel; sub(/.*\//, "", hash); sub(/-.*/, "", hash)
+      view = "indexes/evidence-text/" hash "-" ver ".txt"
+      if ((getline probe < (dir "/" view)) >= 0) close(dir "/" view); else view = ""
+      return rel "\t" principal[file] "\t" observed[file] "\t" title[file] "\t" view "\t" hash
+    }
+    FNR == 1 {
+      in_header = ($0 == "---")
+      delete seen
+      if (in_header) next
+      nextfile
+    }
+    in_header && $0 == "---" { nextfile }
+    in_header {
+      split($0, parts, ":"); field = parts[1]
+      if (field == "brain_principal" && !seen[field]++) principal[FILENAME] = clean($0)
+      else if (field == "brain_observed_at" && !seen[field]++) observed[FILENAME] = clean($0)
+      else if (field == "title" && !seen[field]++) title[FILENAME] = clean($0)
+    }
+    END { for (i = 1; i < ARGC; i++) if (ARGV[i] != "") print row(ARGV[i]) }
+  '
+}
+
+# Source files are opened only when new or modified since the derived cache
+# indexes/evidence-sources-meta.tsv was written; on network filesystems one
+# open per source per recall cost tens of seconds.  The cache is derived and
+# replaced atomically; a missing or foreign-format cache is rebuilt.
+EVIDENCE_SOURCES_META_HEADER="# llm-brain evidence-sources-meta v1"
+bridge_cached_sources_meta() {
+  local dir="$1" list="$2" cache work
+  cache="$dir/indexes/evidence-sources-meta.tsv"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-srcmeta.XXXXXX")"
+  : >"$work/changed"; : >"$work/cached"
+  if [ -f "$cache" ] && [ ! -L "$cache" ] && [ "$(head -1 "$cache" 2>/dev/null)" = "$EVIDENCE_SOURCES_META_HEADER" ]; then
+    find "$dir/sources" -maxdepth 1 -type f -name '*.md' -newer "$cache" 2>/dev/null >"$work/changed" || : >"$work/changed"
+    tail -n +2 "$cache" >"$work/cached"
+  fi
+  awk -v dir="$dir" -v changed="$work/changed" -v cached="$work/cached" '
+    BEGIN {
+      while ((getline line < changed) > 0) stale[line] = 1
+      while ((getline line < cached) > 0) { split(line, f, "\t"); have[dir "/" f[1]] = 1 }
+    }
+    !have[$0] || stale[$0]
+  ' "$list" >"$work/need"
+  bridge_sources_meta "$dir" "$work/need" | awk -F '\t' 'BEGIN { OFS = "\t" } { print $1, $2, $3, $4, $6 }' >"$work/fresh"
+  find "$dir/indexes/evidence-text" -maxdepth 1 -type f 2>/dev/null | sed "s#^$dir/##" >"$work/views" || : >"$work/views"
+  awk -F '\t' -v dir="$dir" -v ver="$EVIDENCE_VIEW_VERSION" -v cached="$work/cached" -v fresh="$work/fresh" -v views="$work/views" -v out="$work/cache" '
+    BEGIN {
+      OFS = "\t"
+      while ((getline line < cached) > 0) { split(line, f, "\t"); row[f[1]] = line }
+      while ((getline line < fresh) > 0) { split(line, f, "\t"); row[f[1]] = line }
+      while ((getline line < views) > 0) view[line] = 1
+    }
+    {
+      rel = substr($0, length(dir) + 2)
+      if (!(rel in row)) next
+      split(row[rel], f, "\t")
+      v = "indexes/evidence-text/" f[5] "-" ver ".txt"
+      print f[1], f[2], f[3], f[4], ((v in view) ? v : ""), f[5]
+      print row[rel] >out
+    }
+  ' "$list"
+  if [ -s "$work/need" ] || [ "$(wc -l <"$work/cache" 2>/dev/null | tr -d ' ')" != "$(wc -l <"$work/cached" | tr -d ' ')" ]; then
+    if [ -d "$dir/indexes" ] && { printf '%s\n' "$EVIDENCE_SOURCES_META_HEADER"; cat "$work/cache" 2>/dev/null; } >"$dir/indexes/.evidence-sources-meta.$$" 2>/dev/null; then
+      mv -f "$dir/indexes/.evidence-sources-meta.$$" "$cache" 2>/dev/null || rm -f "$dir/indexes/.evidence-sources-meta.$$"
+    fi
+  fi
+  rm -rf "$work"
+}
+
 bridge_search_evidence() {
   local project_id="$1" query="$2" principal="$3" strategy="$4" output="$5" metadata="$6" dir index file rel term mode index_current=0
   local tmp sources_meta query_terms lexical_hits lexical_raw lexical_rank lexical_index semantic_raw semantic_rank final reranked query_input query_vector query_model query_dimensions query_lc semantic_ok=0 degraded=0 evidence_mode="lexical-evidence"
@@ -1111,11 +1196,8 @@ bridge_search_evidence() {
     index_current=1
     awk -F '\t' 'NR > 1 { print $1 "\t" $8 "\t" $9 "\t" $10 "\t" $5 "\t" $2 }' "$index" >"$sources_meta"
   else
-    while IFS= read -r file; do
-      rel="${file#"$dir"/}"; source_hash="${rel##*/}"; source_hash="${source_hash%%-*}"
-      view="$dir/indexes/evidence-text/${source_hash}-${EVIDENCE_VIEW_VERSION}.txt"; [ -f "$view" ] && view="${view#"$dir"/}" || view=""
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$(frontmatter_field "$file" brain_principal)" "$(frontmatter_field "$file" brain_observed_at)" "$(frontmatter_field "$file" title)" "$view" "$source_hash"
-    done < <(find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort) >"$sources_meta"
+    find "$dir/sources" -maxdepth 1 -type f -name '*.md' 2>/dev/null | LC_ALL=C sort >"$tmp/source.files"
+    bridge_cached_sources_meta "$dir" "$tmp/source.files" >"$sources_meta"
   fi
   mode="$(bridge_query_mode "$query")"
   query_lc="$(printf '%s\n' "$query" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
@@ -2163,7 +2245,8 @@ audit_v2() {
   validate_scalar "$details" || die 65 "invalid audit details"
   audit="$dir/audit.v2.tsv"
   timestamp="$(now_utc)"
-  prev="$(tail -1 "$audit" 2>/dev/null | awk -F '\t' 'NR == 1 && $11 !~ /^event_hash$/ { print $11 }')"
+  # A legacy (pre-v2) project has no audit file yet; start a new chain.
+  prev="$({ tail -1 "$audit" 2>/dev/null || true; } | awk -F '\t' 'NR == 1 && $11 !~ /^event_hash$/ { print $11 }')"
   payload="$timestamp|$ACTOR|$action|$(basename "$dir")|$object_id|$old_state|$new_state|$content_hash|$details|$prev"
   event="$(sha256_text "$payload")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -4805,7 +4888,12 @@ index_publish_compat() {
     if [ -f "$root/$name" ]; then
       tmp="$indexes/.${name}.compat.$$"
       rm -f "$tmp"
-      ln -s "generations/$generation/$name" "$tmp"
+      # Some network filesystems (CIFS/SMB without mfsymlinks) cannot hold
+      # symlinks; fall back to a copied alias so publication still completes.
+      if ! ln -s "generations/$generation/$name" "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        cp "$root/$name" "$tmp"
+      fi
       mv -f "$tmp" "$indexes/$name"
     else
       rm -f "$indexes/$name"

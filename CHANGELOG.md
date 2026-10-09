@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Development continues after the v0.7.1 release; no live-vault mutation is
+  implied.
+- Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
+- Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
+- Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
+
+
+## 0.8.2 - 2026-10-09
+
 - Packs and briefs now carry a "Corrections and Retractions" section: active
   records that supersede another record, and retractions with their reason,
   are surfaced regardless of lexical match with the task (most task-relevant
@@ -18,12 +27,17 @@
 - Real eval: r10's "does not cite MF-S03" check now allows citing the
   withdrawn dataset when the answer says it is withdrawn (it penalised
   correct answers; r09's reference answer does the same).
-- Development continues after the v0.7.1 release; no live-vault mutation is
-  implied.
-- Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
-- Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
-- Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
-
+- Evidence recall without an embedder-built evidence index no longer opens
+  every source file on every recall: source metadata is read in one pass and
+  cached in the derived `indexes/evidence-sources-meta.tsv`, refreshed only
+  for new or modified sources. On a 1,305-source project on a CIFS NAS,
+  bridge recall fell from 19-33 s to 3-5 s with identical output.
+- Fixed `index build` on filesystems without symlink support (CIFS/SMB
+  mounts without `mfsymlinks`): compatibility aliases fall back to copies
+  instead of aborting after publication and leaving rebuild state stuck at
+  `building`.
+- Fixed `index build` (and other audited writes) aborting on legacy projects
+  that have no `audit.v2.tsv` yet; the hash chain now starts fresh.
 ## 0.8.1 - 2026-10-09
 
 - Fixed stale-lock recovery on GNU/Linux: `lock_mtime` mixed `stat -f`

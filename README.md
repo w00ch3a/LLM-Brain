@@ -570,7 +570,7 @@ that file. Core commands still work on the partial tree. To finish the
 install, run the new CLI once against the same release source:
 
 ```bash
-llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.1
+llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.2
 ```
 
 It checks that the source matches the installed CLI byte for byte, then adds
@@ -586,4 +586,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.1 release notes](docs/releases/v0.8.1.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.2 release notes](docs/releases/v0.8.2.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
