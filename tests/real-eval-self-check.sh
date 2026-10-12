@@ -6,7 +6,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-real-eval.XXXXXX")"
-trap 'rm -rf "$fixture"' EXIT
+trap '[ "${KEEP:-0}" = 1 ] || rm -rf "$fixture"' EXIT
 fail() { printf 'real-eval self-check: %s\n' "$*" >&2; exit 1; }
 
 version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
@@ -15,7 +15,7 @@ archive="$repo_root/dist/llm-brain-${version}-standalone.tar.gz"
 bundle="$fixture/bundle"
 mkdir -p "$bundle/dist" "$bundle/vendor" "$bundle/tasks"
 cp "$repo_root"/evals/real/{run.sh,eval_real.py,reference_agent.py} "$bundle/"
-cp "$repo_root"/evals/real/tasks/{coding.py,research.py} "$bundle/tasks/"
+cp "$repo_root"/evals/real/tasks/{coding.py,research.py,memorygym.py} "$bundle/tasks/"
 cp "$archive" "$archive.sha256" "$bundle/dist/"
 yaml_dir="$(python3 -c 'import os, yaml; print(os.path.dirname(yaml.__file__))')"
 mkdir "$bundle/vendor/yaml" && cp "$yaml_dir"/*.py "$bundle/vendor/yaml/"
@@ -31,8 +31,11 @@ for family in ("coding", "research"):
     assert (m["on"], m["off"]) == (1.0, 0.0), (family, m)
     assert (c["on"], c["off"]) == (1.0, 1.0), (family, c)
     assert m["tasks"] == 10 and c["tasks"] == 2, (family, m, c)
+m, c = s["families"]["memorygym"]["memory"], s["families"]["memorygym"]["controls"]
+assert (m["on"], m["off"]) == (1.0, 0.0) and m["tasks"] == 8, m
+assert (c["on"], c["off"]) == (1.0, 1.0) and c["tasks"] == 1, c
 assert not s["errors"] and not s["contamination_flagged_runs"] and not s["unequal_work_trees"], s
-assert s["memory_use"]["runs_using_llm_brain"] == s["memory_use"]["on_runs"] == 24, s["memory_use"]
+assert s["memory_use"]["runs_using_llm_brain"] == s["memory_use"]["on_runs"] == 33, s["memory_use"]
 assert s["memory_use"]["failed_llm_brain_calls"] == 0, s["memory_use"]
 PY
 ! grep -Rqs -E 'LEAK|MISSING' "$fixture/ref/runs" || fail 'reference agent saw leaked or missing memory'

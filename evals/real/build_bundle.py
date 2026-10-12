@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the self-contained real-eval bundle (deterministic .tgz).
 
-    python3 evals/real/build_bundle.py --archive dist/llm-brain-0.8.0-standalone.tar.gz \
+    python3 evals/real/build_bundle.py --archive dist/llm-brain-VERSION-standalone.tar.gz \
         --pyyaml-sdist pyyaml-6.0.3.tar.gz --output /path/llm-brain-real-eval.tgz
 
 The PyYAML sdist must match the hash pinned in requirements-okf.lock; only its
@@ -20,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 TOP = "llm-brain-real-eval"
-FILES = ["run.sh", "README.md", "eval_real.py", "reference_agent.py", "tasks/coding.py", "tasks/research.py"]
+FILES = ["run.sh", "README.md", "eval_real.py", "reference_agent.py", "tasks/coding.py", "tasks/research.py", "tasks/memorygym.py"]
 
 
 def sha256(data: bytes) -> str:

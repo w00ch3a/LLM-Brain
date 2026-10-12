@@ -67,7 +67,9 @@ class EvalError(Exception):
 
 def load_tasks(tasks_dir: Path) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
-    for name in ("coding", "research"):
+    for name in ("coding", "research", "memorygym"):
+        if not (tasks_dir / f"{name}.py").is_file():
+            continue  # older bundles ship only coding and research
         spec = importlib.util.spec_from_file_location(f"real_eval_{name}", tasks_dir / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
@@ -115,7 +117,11 @@ def memory_block(task: dict[str, Any], mode: str, injected: str | None) -> str:
         f"  llm-brain brief {pid}\n"
         f"  llm-brain pack build {pid} --task \"<your task in a few words>\"   (prints file=PATH; read that file)\n"
         f"and use `llm-brain search {pid} \"<query>\"` for anything specific. "
-        "Memory can be out of date: if the current files contradict it, the files win."
+        + (f"For how a decision changed use `llm-brain lineage show {pid} --topic \"<topic>\"` (or `--decision NAME`); "
+           f"`llm-brain state index {pid}` lists current state, `llm-brain browse show {pid} okf/claims` summarises a folder, "
+           f"and `llm-brain recall-check {pid} \"<question>\"` reports which query terms memory still lacks. "
+           if task.get("family") == "memorygym" else "")
+        + "Memory can be out of date: if the current files contradict it, the files win."
     )
 
 
@@ -240,6 +246,11 @@ def seed_brain(cli: Path, root: Path, task: dict[str, Any], env: dict[str, str])
             lines.append(f"brain_observed_at: {json.dumps(record['observed_at'])}")
         if record.get("supersedes"):
             lines.append(f"brain_supersedes: {record['supersedes']}")
+        if record.get("state_key"):
+            lines.append(f"brain_state_key: {json.dumps(record['state_key'])}")
+        for key in ("derived_from", "depends_on"):
+            if record.get(key):
+                lines.append(f"brain_{key}: [" + ", ".join(json.dumps(f"okf/claims/{r}.md") for r in record[key]) + "]")
         lines += ["brain_schema_version: 3", "---", f"# {record['title']}", "", record["text"], ""]
         (claims / f"{record['id']}.md").write_text("\n".join(lines), encoding="utf-8")
     for record in task["memory"]:
@@ -251,6 +262,13 @@ def seed_brain(cli: Path, root: Path, task: dict[str, Any], env: dict[str, str])
             cli_run("retract", pid, record["id"], "--reason", record["retract"], "--confirm", token.group(1))
     for intention in task.get("intentions", []):
         cli_run("intention", "add", pid, "--action", intention["action"], "--trigger", intention["trigger"])
+    for record in task["memory"]:
+        for label, reason in record.get("labels", []):
+            cli_run("label", "add", pid, f"okf/claims/{record['id']}.md", label, "--reason", reason)
+    for trigger in task.get("invalidate", []):
+        cli_run("invalidate", "apply", pid, "--from", f"okf/claims/{trigger}.md", "--reason", "later observation")
+    if task.get("build_summaries"):
+        cli_run("browse", "build", pid)
     cli_run("index", "build", pid)
 
 
@@ -729,7 +747,9 @@ def summarise(rows: list[dict[str, Any]], tasks: list[dict[str, Any]], meta: dic
             entry["delta"] = round(entry["on"]["rate"] - entry["off"]["rate"], 4)
         by_task[task["id"]] = entry
     families: dict[str, Any] = {}
-    for family in ("coding", "research"):
+    for family in ("coding", "research", "memorygym"):
+        if family == "memorygym" and not any(r["family"] == family for r in rows):
+            continue
         fam = {}
         for group, kinds in (("memory", ("memory",)), ("controls", ("control", "harm-control"))):
             group_rows = [r for r in rows if r["family"] == family and r["kind"] in kinds]
@@ -819,7 +839,7 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=900, help="seconds per agent run")
     parser.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
-    parser.add_argument("--family", choices=("coding", "research"), default=None)
+    parser.add_argument("--family", choices=("coding", "research", "memorygym"), default=None)
     parser.add_argument("--smoke", action="store_true", help="one task per family, one repeat")
     parser.add_argument("--dry-run", action="store_true", help="prepare and seed everything, write prompts/commands, call no agent")
     parser.add_argument("--resume", action="store_true")

@@ -11,7 +11,7 @@
 # --tasks id1,id2, --family coding|research, --memory-mode cli|inject,
 # --codex PATH, --codex-home isolated|shared, --codex-config KEY=VALUE, --runner reference.
 #
-# Installs LLM-Brain 0.8.0 (standalone archive, checksum-verified) under this
+# Installs LLM-Brain (standalone archive, checksum-verified) under this
 # bundle's .local/ only. Never touches ~/.codex config, your PATH or any real brain.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd -P)"

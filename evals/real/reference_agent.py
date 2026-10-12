@@ -48,6 +48,8 @@ def main():
         retrieved += llm_brain(*pack_args)
         for query in ref.get("queries", []):
             retrieved += llm_brain("search", pid, query)
+        for command in ref.get("commands", []):
+            retrieved += llm_brain(*command)
     leaked = [m for m in ref.get("must_not_retrieve", []) if m in retrieved]
     if leaked:
         print(f"LEAK: superseded/retracted memory surfaced: {leaked}", file=sys.stderr)

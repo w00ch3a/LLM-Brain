@@ -1,6 +1,6 @@
 # LLM-Brain real evaluation: memory on vs off (Codex CLI)
 
-This suite measures whether LLM-Brain 0.8.0 memory changes real agent outcomes.
+This suite measures whether LLM-Brain memory changes real agent outcomes.
 Each task runs twice:
 
 - **off**: the agent gets only the repository or question.
@@ -24,7 +24,7 @@ tar -xzf llm-brain-real-eval.tgz
 cd llm-brain-real-eval
 ./run.sh ~/llm-brain-eval/dry --dry-run       # no model calls: install, seed, fairness checks, prompts
 ./run.sh ~/llm-brain-eval/smoke --smoke       # 1 preflight + 4 codex runs
-./run.sh ~/llm-brain-eval/full                # 1 preflight + 144 codex runs (24 tasks x 2 x 3)
+./run.sh ~/llm-brain-eval/full                # 1 preflight + 198 codex runs (33 tasks x 2 x 3)
 ./run.sh ~/llm-brain-eval/full --resume       # continue after an interruption
 ```
 
@@ -35,7 +35,7 @@ to `OUTPUT/summary.md`, `summary.json`, `results.jsonl` and `runs/<run-id>/`
 
 Requirements: `python3` >= 3.9, `git`, and Codex CLI. The default Codex path is
 `~/.local/bin/codex`; override it with `--codex PATH`. The tarball also
-contains the checksum-verified LLM-Brain 0.8.0 standalone archive and a
+contains the checksum-verified LLM-Brain standalone (the checkout's VERSION) archive and a
 vendored pure-Python PyYAML 6.0.3 that matches the release lock hash.
 Nothing is installed globally.
 
@@ -44,6 +44,7 @@ Nothing is installed globally.
 | Family | Tasks | What memory carries |
 |---|---|---|
 | Coding (`tasks/coding.py`) | 10 memory + 2 controls | Conventions, past decisions, gotchas, a superseded fact, a renamed flag (correction), a deprecated API, a path-scoped rule (`brain_paths`) |
+| Memory-Gym (`tasks/memorygym.py`) | 8 memory + 1 control | Single-hop, multi-hop and multi-session summary; folder summaries (`browse`), thin state (`state index`), implicit invalidation (`invalidate`), sufficiency (`recall-check`) and label lineage (`lineage show`) |
 | Research (`tasks/research.py`) | 10 memory + 2 controls | Two synthetic projects with sourced findings, conflicting sources, a correction (supersession), a retraction (`llm-brain retract`), a decision and open intentions |
 
 Controls:
