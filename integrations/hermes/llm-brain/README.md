@@ -159,3 +159,9 @@ Retraction and receipts remain CLI-controlled: preview a canonical target with `
   mounts `/api/plugins/llm-brain/` only when `llm-brain` is in
   `plugins.enabled`. The API answers loopback clients only and returns the
   page for a sandboxed iframe with a no-network CSP.
+- Profiles: the dashboard serves tab assets (`/dashboard-plugins/llm-brain/...`)
+  using the dashboard process's own home, normally the root `~/.hermes`, even
+  when the UI is scoped to a profile. If llm-brain lives in a named profile
+  (for example `~/.hermes/profiles/<name>`), add `llm-brain` to
+  `plugins.enabled` in both that profile's `config.yaml` and the root
+  `~/.hermes/config.yaml`; otherwise the tab is hidden or its script 404s.
