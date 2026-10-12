@@ -81,7 +81,7 @@ PY
 # 3. Dry run: every run prepared, no agent invoked.
 : >"$FAKE_CODEX_LOG"
 HOME="$fake_home" "$bundle/run.sh" "$fixture/dry" --dry-run --repeats 1 --codex "$repo_root/tests/fixtures/real-eval/fake-codex" --codex-config "fake.log=$FAKE_CODEX_LOG" >"$fixture/dry.log" 2>&1 || { cat "$fixture/dry.log" >&2; fail 'dry run failed'; }
-[ "$(find "$fixture/dry/runs" -name command.txt | wc -l | tr -d ' ')" = 48 ] || fail 'dry run did not prepare 48 runs'
+[ "$(find "$fixture/dry/runs" -name command.txt | wc -l | tr -d ' ')" = 66 ] || fail 'dry run did not prepare 66 runs'
 [ ! -s "$FAKE_CODEX_LOG" ] || fail 'dry run invoked the agent'
 grep -Fq 'llm-brain brief proj_shop' "$fixture/dry/runs/c01-receipt-price-format--on--r1/prompt.txt" || fail 'memory-on prompt lacks instructions'
 ! grep -Fq 'llm-brain' "$fixture/dry/runs/c01-receipt-price-format--off--r1/prompt.txt" || fail 'memory-off prompt mentions llm-brain'
