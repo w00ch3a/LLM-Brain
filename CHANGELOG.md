@@ -9,6 +9,12 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
+## 0.9.1 - 2026-10-12
+
+- Hermes Neural Expansion writes to a private local `$HERMES_HOME/neural-expansion/`
+  and refuses output inside the vault or on filesystems that ignore 0700/0600
+  modes. No vault migration.
+
 ## 0.9.0 - 2026-10-12
 
 - Label lineage: append-only, hash-chained label ledger (`label add|remove|list`),

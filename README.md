@@ -616,4 +616,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.9.0 release notes](docs/releases/v0.9.0.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.9.1 release notes](docs/releases/v0.9.1.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
