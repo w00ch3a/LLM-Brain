@@ -9,7 +9,7 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
-## 0.9.0 - unreleased
+## 0.9.0 - 2026-10-12
 
 - Label lineage: append-only, hash-chained label ledger (`label add|remove|list`),
   derived lifecycle labels, `lineage show` decision tree/timeline with change
