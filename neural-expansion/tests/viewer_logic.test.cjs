@@ -109,3 +109,22 @@ test("reduced-motion preference is honored", () => {
   assert.equal(Core.usesReducedMotion({ matches: false }), false);
   assert.equal(Core.usesReducedMotion(null), false);
 });
+
+test("unreviewed nodes get their own state and can be hidden with their edges", () => {
+  const withPending = {
+    nodes: [
+      ...graph.nodes,
+      { id: "review/x.md", title: "Pending X", type: "ReviewItem", status: "unreviewed", unreviewed: true },
+      { id: "review-day/2026-08-22", title: "Unreviewed · day", type: "UnreviewedBatch", status: "unreviewed", unreviewed: true },
+    ],
+    edges: [...graph.edges, { source: "review/x.md", relation: "captured_on", target: "review-day/2026-08-22" }],
+  };
+  const only = Core.visibleGraph(withPending, "", "unreviewed");
+  assert.deepEqual(only.nodes.map((node) => node.id), ["review/x.md", "review-day/2026-08-22"]);
+  assert.equal(only.edges.length, 1);
+  const hidden = Core.visibleGraph(withPending, "", "all", true);
+  assert.equal(hidden.nodes.length, 3);
+  assert.ok(hidden.nodes.every((node) => !Core.isUnreviewed(node)));
+  assert.equal(hidden.edges.length, 2);
+  assert.equal(Core.recordLayer(withPending.nodes[4]), "Review queue · day cluster (unreviewed)");
+});

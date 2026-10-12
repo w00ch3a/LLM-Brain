@@ -179,7 +179,9 @@
       .record-hud { width: min(235px, 55vw); }
     }
     html.reduced-motion * { animation: none !important; transition: none !important; }
-  </style>
+        .pending-note { font-size: 11px; color: #ffc6cf; opacity: .85; margin: 4px 0; }
+      .badge-unreviewed { display: inline-block; font-size: 10px; padding: 1px 6px; border: 1px dashed #ff9aa8; border-radius: 9px; color: #ffc6cf; margin-left: 6px; }
+</style>
 </head>
 <body>
   <header>
@@ -199,6 +201,7 @@
       <option value="derived">Derived</option>
       <option value="history">History</option>
       <option value="pending">Pending</option>
+      <option value="unreviewed">Unreviewed</option>
     </select>
     <button id="clear" type="button" title="Clear search and selection">Clear</button>
   </header>
@@ -215,7 +218,9 @@
         <button id="toggleList" type="button" aria-controls="list" aria-expanded="false">List view</button>
         <button id="reset" type="button">Reset</button>
         <button id="fit" type="button">Fit graph</button>
+        <button id="toggleUnreviewed" type="button" aria-pressed="false" hidden>Hide unreviewed</button>
       </div>
+      <div id="pendingNote" class="pending-note" role="status" hidden></div>
       <div id="list" role="region" aria-label="Filtered record list" hidden></div>
       <div id="recordHud" class="record-hud" aria-live="polite" hidden></div>
       <div id="legend" class="legend" aria-label="Record type legend"></div>

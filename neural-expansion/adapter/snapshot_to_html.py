@@ -22,7 +22,7 @@ VISUALIZER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(VISUALIZER))
 
 from build_demo import render_html  # noqa: E402
-from export_graph import ExportError, build_export  # noqa: E402
+from export_graph import ExportError, _frontmatter, _refs, build_export  # noqa: E402
 from snapshot_producer import build_snapshot  # noqa: E402
 
 
@@ -143,11 +143,159 @@ def attach_lineage(payload: dict, project_root: Path) -> None:
                 payload.setdefault("edges", []).append({"source": ref, "relation": "label:" + label.split(":", 1)[0], "target": target})
 
 
+PENDING_SHOWN_CAP = 300
+PENDING_SCAN_LIMIT = 20000
+PENDING_HEAD_BYTES = 16384
+PENDING_STATES = {"proposed", "pending", "needs-review", "unreviewed"}
+DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _pending_visible(meta: dict, principal: str) -> bool:
+    """Same principal/audience/sensitivity rules as canonical records, minus approval."""
+    if meta.get("type") != "ReviewItem":
+        return False
+    kind = meta.get("brain_review_kind", "")
+    state = meta.get("brain_review_state", "")
+    if not isinstance(kind, str) or not isinstance(state, str):
+        return False
+    if kind.strip().lower() == "redaction" or state.strip().lower() not in PENDING_STATES:
+        return False
+    sensitivity = meta.get("brain_sensitivity", meta.get("sensitivity", "internal"))
+    if sensitivity is None:
+        sensitivity = "internal"
+    if sensitivity != "internal":
+        return False
+    scoped = _refs(meta.get("brain_principal"))
+    audience = _refs(meta.get("brain_audience"))
+    if scoped is None or audience is None:
+        return False
+    identities = scoped + audience
+    return not identities or principal in identities
+
+
+def _read_frontmatter_head(path: Path) -> dict | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, PENDING_HEAD_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    if end is None:
+        return None
+    try:
+        meta, _ = _frontmatter("".join(lines[: end + 1]).encode("utf-8") + b"\n")
+    except (ExportError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def attach_pending(payload: dict, project_root: Path, principal: str, cap: int = PENDING_SHOWN_CAP) -> None:
+    """Add unreviewed review-queue items as clearly marked, principal-filtered nodes.
+
+    Only frontmatter is read; bodies and source refs are never exported.  The
+    newest ``cap`` items are shown individually; the rest are summarised into
+    per-day cluster nodes with exact counts, and totals go into
+    ``meta.pending`` so nothing is dropped silently.  Every shown item is
+    linked to its capture-day node (derived relation ``captured_on``).
+    """
+    review = project_root / "review"
+    summary = {"total": 0, "shown": 0, "clustered": 0, "clusters": 0, "excluded": 0, "cap": cap}
+    payload.setdefault("meta", {})["pending"] = summary
+    if review.is_symlink() or not review.is_dir():
+        return
+    items = []
+    try:
+        entries = sorted(review.iterdir())
+    except OSError:
+        return
+    for path in entries[:PENDING_SCAN_LIMIT]:
+        if path.suffix != ".md" or path.is_symlink():
+            continue
+        meta = _read_frontmatter_head(path)
+        if meta is None or meta.get("type") != "ReviewItem":
+            continue
+        if not _pending_visible(meta, principal):
+            summary["excluded"] += 1
+            continue
+        stamp = meta.get("timestamp", "")
+        stamp = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp or "")
+        title = meta.get("title")
+        title = " ".join(str(title).split())[:120] if isinstance(title, (str, int, float)) and str(title).strip() else path.stem
+        kind = meta.get("brain_review_kind")
+        items.append({
+            "id": "review/" + path.name,
+            "title": title,
+            "stamp": stamp,
+            "day": (DAY_RE.match(stamp).group(1) if DAY_RE.match(stamp) else "undated"),
+            "kind": kind if isinstance(kind, str) else "",
+        })
+    summary["truncated_scan"] = len(entries) > PENDING_SCAN_LIMIT
+    summary["total"] = len(items)
+    items.sort(key=lambda item: (item["stamp"], item["id"]), reverse=True)
+    shown, rest = items[: max(0, cap)], items[max(0, cap):]
+    nodes = payload.setdefault("nodes", [])
+    edges = payload.setdefault("edges", [])
+    days: dict[str, dict] = {}
+    for item in items:
+        days.setdefault(item["day"], {"shown": 0, "clustered": 0})
+    for item in shown:
+        days[item["day"]]["shown"] += 1
+    for item in rest:
+        days[item["day"]]["clustered"] += 1
+    for day, bucket in sorted(days.items()):
+        total = bucket["shown"] + bucket["clustered"]
+        label = f"Unreviewed · {day} · {total} item{'s' if total != 1 else ''}"
+        if bucket["clustered"]:
+            label += f" ({bucket['clustered']} grouped)"
+        nodes.append({
+            "id": f"review-day/{day}",
+            "title": label,
+            "type": "UnreviewedBatch",
+            "status": "unreviewed",
+            "unreviewed": True,
+            "trust": "unreviewed",
+            "generated": day if day != "undated" else "",
+            "provenance": "Review queue (pending)",
+            "excerpt": f"{total} unreviewed review-queue items captured {day}; {bucket['shown']} shown individually, {bucket['clustered']} grouped here. Content is not exported until reviewed.",
+            "count": total,
+            "grouped": bucket["clustered"],
+        })
+    for item in shown:
+        nodes.append({
+            "id": item["id"],
+            "title": item["title"],
+            "type": "ReviewItem",
+            "status": "unreviewed",
+            "unreviewed": True,
+            "trust": "unreviewed",
+            "generated": item["stamp"],
+            "provenance": "Review queue (pending" + (", " + item["kind"] if item["kind"] else "") + ")",
+            "excerpt": "Unreviewed review-queue item. Body not exported until reviewed.",
+        })
+        edges.append({"source": item["id"], "relation": "captured_on", "target": f"review-day/{item['day']}"})
+    ordered_days = sorted(d for d in days if d != "undated")
+    for earlier, later in zip(ordered_days, ordered_days[1:]):
+        edges.append({"source": f"review-day/{later}", "relation": "follows", "target": f"review-day/{earlier}"})
+    summary.update(shown=len(shown), clustered=len(rest), clusters=len(days))
+
+
 def build_local_snapshot_html(
     vault_root_arg: Path,
     project_id: str,
     principal: str,
     output_arg: Path,
+    include_pending: bool = True,
 ) -> Path:
     """Read one explicit project snapshot, filter it, and write owner-only HTML."""
     if not PROJECT_ID_RE.fullmatch(project_id) or project_id in {".", ".."}:
@@ -184,6 +332,8 @@ def build_local_snapshot_html(
             build_snapshot(project_root, package)
             payload = build_export(package, principal)
             attach_lineage(payload, project_root)
+            if include_pending:
+                attach_pending(payload, project_root, principal)
             _assert_no_writer(vault_root, project_id)
             page = render_html(
                 payload,

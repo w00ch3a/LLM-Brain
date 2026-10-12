@@ -87,7 +87,7 @@ class StandaloneDemoTests(unittest.TestCase):
     def test_visible_render_records_keep_layout_coordinates(self):
         _html, app = self.app_scripts()
         self.assertIn("const graph = { ...data, nodes };", app)
-        self.assertIn("Core.visibleGraph(graph, search.value, filter.value)", app)
+        self.assertIn("Core.visibleGraph(graph, search.value, filter.value, hideUnreviewed)", app)
 
     def test_clear_resets_selection_and_resize_rebases_camera_to_fit(self):
         _html, app = self.app_scripts()

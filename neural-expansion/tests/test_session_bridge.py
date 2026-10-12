@@ -277,6 +277,67 @@ class LocalSnapshotHtmlTests(unittest.TestCase):
         }
         self.assertEqual(before, after)
 
+    def _review(self, name, **meta):
+        review = self.project / "review"
+        review.mkdir(exist_ok=True)
+        fields = {"type": "ReviewItem", "brain_review_kind": "source-ingest", "brain_review_state": "proposed",
+                  "brain_sensitivity": "internal", "title": name, "timestamp": "2026-08-22T10:00:00Z"}
+        fields.update(meta)
+        lines = ["---"] + [f"{key}: {json.dumps(value)}" for key, value in fields.items()] + ["---", "SECRET BODY " + name, ""]
+        (review / f"{name}.md").write_text("\n".join(lines), encoding="utf-8")
+
+    def _fixture(self, path):
+        html = path.read_text(encoding="utf-8")
+        return html, json.loads(re.search(
+            r'<script type="application/json" id="synthetic-fixture">(.*?)</script>', html, re.DOTALL).group(1))
+
+    def test_pending_review_items_are_filtered_marked_and_bodyless(self):
+        self._review("pending-open")
+        self._review("pending-alice", brain_principal="alice", timestamp="2026-08-23T09:00:00Z")
+        self._review("pending-bob", brain_principal="bob")
+        self._review("pending-restricted", brain_sensitivity="restricted")
+        self._review("pending-redaction", brain_review_kind="redaction", brain_review_state="needs-validation")
+        self._review("pending-approved", brain_review_state="approved")
+        result = build_local_snapshot_html(self.vault, "demo", "alice", self.output)
+        html, fixture = self._fixture(result)
+        pending = {node["id"]: node for node in fixture["nodes"] if node.get("unreviewed")}
+        self.assertEqual(set(pending), {
+            "review/pending-open.md", "review/pending-alice.md",
+            "review-day/2026-08-22", "review-day/2026-08-23",
+        })
+        self.assertTrue(all(node["status"] == "unreviewed" for node in pending.values()))
+        for hidden in ("pending-bob", "pending-restricted", "pending-redaction", "pending-approved", "SECRET BODY"):
+            self.assertNotIn(hidden, html)
+        self.assertIn({"source": "review/pending-open.md", "relation": "captured_on", "target": "review-day/2026-08-22"}, fixture["edges"])
+        self.assertIn({"source": "review-day/2026-08-23", "relation": "follows", "target": "review-day/2026-08-22"}, fixture["edges"])
+        meta = fixture["meta"]["pending"]
+        self.assertEqual((meta["total"], meta["shown"], meta["clustered"], meta["excluded"]), (2, 2, 0, 4))
+        self.assertEqual(stat.S_IMODE(result.stat().st_mode), 0o600)
+        # reviewed records unchanged
+        self.assertTrue({"okf/claims/alice.md", "okf/claims/open.md"} <= {node["id"] for node in fixture["nodes"]})
+
+    def test_large_pending_queue_is_capped_and_clustered_with_counts(self):
+        from snapshot_to_html import attach_pending
+        for index in range(25):
+            self._review(f"bulk-{index:02d}", timestamp=f"2026-08-{10 + index % 5:02d}T{index % 24:02d}:00:00Z")
+        payload = {"meta": {}, "nodes": [], "edges": []}
+        attach_pending(payload, self.project, "alice", cap=10)
+        meta = payload["meta"]["pending"]
+        self.assertEqual((meta["total"], meta["shown"], meta["clustered"], meta["clusters"]), (25, 10, 15, 5))
+        items = [node for node in payload["nodes"] if node["type"] == "ReviewItem"]
+        clusters = [node for node in payload["nodes"] if node["type"] == "UnreviewedBatch"]
+        self.assertEqual(len(items), 10)
+        self.assertEqual(sum(node["count"] for node in clusters), 25)
+        self.assertEqual(sum(node["grouped"] for node in clusters), 15)
+        newest = sorted(items, key=lambda node: node["generated"])[0]["generated"]
+        self.assertGreaterEqual(newest, "2026-08-12")
+
+    def test_pending_can_be_disabled(self):
+        self._review("pending-open")
+        result = build_local_snapshot_html(self.vault, "demo", "alice", self.output, include_pending=False)
+        _, fixture = self._fixture(result)
+        self.assertFalse(any(node.get("unreviewed") for node in fixture["nodes"]))
+
     def test_output_must_be_new_and_outside_vault(self):
         with self.assertRaisesRegex(LocalSnapshotError, "outside the vault"):
             build_local_snapshot_html(self.vault, "demo", "alice", self.vault / "neural-expansion.html")

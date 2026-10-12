@@ -8,9 +8,14 @@
   const MIN_ZOOM = 0.45;
   const MAX_ZOOM = 2.5;
 
-  function visibleGraph(data, query = "", status = "all") {
+  function isUnreviewed(node) {
+    return node?.unreviewed === true || node?.status === "unreviewed";
+  }
+
+  function visibleGraph(data, query = "", status = "all", hideUnreviewed = false) {
     const needle = String(query || "").trim().toLocaleLowerCase();
     const nodes = (data?.nodes || []).filter((node) => {
+      if (hideUnreviewed && isUnreviewed(node)) return false;
       if (status !== "all" && node.status !== status) return false;
       if (!needle) return true;
       return [node.id, node.title, node.type, node.status, node.provenance, node.excerpt]
@@ -150,6 +155,7 @@
   }
 
   function recordLayer(node) {
+    if (String(node?.id || "").startsWith("review-day/")) return "Review queue · day cluster (unreviewed)";
     if (node?.type === "AssociativeProjection") return "Derived projection";
     if (String(node?.id || "").startsWith("review/")) return "Review / quarantine";
     if (String(node?.id || "").startsWith("episodes/")) return "Append-only history";
@@ -174,6 +180,7 @@
     recordLayer,
     usesReducedMotion,
     visibleGraph,
+    isUnreviewed,
     zoomForResize,
     zoomBy,
   };

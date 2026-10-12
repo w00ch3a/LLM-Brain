@@ -10,6 +10,7 @@
     Fact: "#a99cff",
     Episode: "#a8bdcd",
     ReviewItem: "#ff7889",
+    UnreviewedBatch: "#ff9aa8",
     AssociativeProjection: "#e58cff",
     default: "#82b9ff",
   };
@@ -69,7 +70,13 @@
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   })[character]);
   const nodeColor = (node) => palette[node.type] || palette.default;
-  const visible = () => Core.visibleGraph(graph, search.value, filter.value);
+  const unreviewedToggle = byId("toggleUnreviewed");
+  const pendingNote = byId("pendingNote");
+  const unreviewedTotal = nodes.filter((node) => Core.isUnreviewed(node)).length;
+  let hideUnreviewed = false;
+  const pendingRelations = new Set(["captured_on", "follows"]);
+  const visible = () => Core.visibleGraph(graph, search.value, filter.value, hideUnreviewed);
+  const unreviewedBadge = '<span class="badge-unreviewed">Unreviewed</span>';
   const project = (point) => Core.projectPoint(point, camera, width, height);
   function measureLabel(title, fontSize) {
     ctx.font = `650 ${fontSize}px system-ui, sans-serif`;
@@ -408,7 +415,21 @@
     const a = positions.get(edge.source);
     const b = positions.get(edge.target);
     if (!a || !b) return;
-    const focused = !selected || selected.id === edge.source || selected.id === edge.target;
+    const touches = selected && (selected.id === edge.source || selected.id === edge.target);
+    if (pendingRelations.has(edge.relation) && !touches) {
+      // Cheap path for the (potentially hundreds of) derived unreviewed links.
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = "#ff9aa8" + (selected ? "10" : "2a");
+      ctx.lineWidth = 0.6;
+      ctx.setLineDash([2, 4]);
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
+    const focused = !selected || touches;
     const color = relationColor(edge.relation);
     const alpha = focused ? "a8" : "20";
     ctx.save();
@@ -426,7 +447,7 @@
     ctx.strokeStyle = color + alpha;
     ctx.lineWidth = focused ? 1.05 : 0.7;
     ctx.shadowBlur = 0;
-    if (edge.relation === "derived_from" || edge.relation === "historical_context") ctx.setLineDash([4, 5]);
+    if (edge.relation === "derived_from" || edge.relation === "historical_context" || pendingRelations.has(edge.relation)) ctx.setLineDash([4, 5]);
     ctx.stroke();
     ctx.setLineDash([]);
     if (!prefersReducedMotion && focused) {
@@ -505,13 +526,15 @@
     const shown = visible();
     const positions = new Map(shown.nodes.map((node) => [node.id, project(node.p)]));
     shown.edges.forEach((edge, index) => drawEdge(edge, index, positions, time));
+    const denseLabels = shown.nodes.length > 80;
     const ordered = [...shown.nodes].sort((a, b) => positions.get(b.id).z - positions.get(a.id).z);
     for (const node of ordered) {
       const point = positions.get(node.id);
       const radius = Math.max(4.6, 6.2 * point.scale);
       const isSelected = selected === node;
       const isHovered = hover === node;
-      const glow = isSelected ? 22 : isHovered ? 15 : 10;
+      const pendingNode = Core.isUnreviewed(node);
+      const glow = pendingNode ? 0 : isSelected ? 22 : isHovered ? 15 : 10;
       const gradient = ctx.createRadialGradient(point.x - radius * 0.25, point.y - radius * 0.3, 0, point.x, point.y, radius + (isSelected ? 4 : 2));
       gradient.addColorStop(0, "#f5fdff");
       gradient.addColorStop(0.2, nodeColor(node));
@@ -519,15 +542,19 @@
       ctx.beginPath();
       ctx.arc(point.x, point.y, radius + (isSelected ? 3 : isHovered ? 1.5 : 0), 0, Math.PI * 2);
       ctx.fillStyle = gradient;
-      ctx.globalAlpha = isSelected || isHovered ? 1 : 0.9;
+      ctx.globalAlpha = isSelected || isHovered ? 1 : pendingNode ? 0.42 : 0.9;
       ctx.shadowColor = nodeColor(node);
       ctx.shadowBlur = glow;
       ctx.fill();
       ctx.shadowBlur = 0;
       ctx.globalAlpha = 1;
       ctx.lineWidth = isSelected ? 1.8 : 0.8;
-      ctx.strokeStyle = isSelected ? "#f4fdff" : "#d8f3ff9c";
+      ctx.strokeStyle = isSelected ? "#f4fdff" : pendingNode ? "#ffb3bdcc" : "#d8f3ff9c";
+      if (pendingNode) ctx.setLineDash([2.5, 2.5]);
       ctx.stroke();
+      ctx.setLineDash([]);
+      // Large unreviewed sets: label only reviewed nodes, clusters, and the focused node.
+      if (pendingNode && !isSelected && !isHovered && denseLabels && node.type !== "UnreviewedBatch") continue;
 
       const dx = point.x - width / 2;
       const dy = point.y - height / 2;
@@ -537,7 +564,7 @@
       const label = Core.labelPosition(point.x, width, ctx.measureText(node.title).width);
       ctx.textAlign = label.align;
       ctx.textBaseline = dy > 35 ? "top" : "alphabetic";
-      ctx.fillStyle = isSelected ? "#ffffff" : "#d8e8f1";
+      ctx.fillStyle = isSelected ? "#ffffff" : pendingNode ? "#d8e8f180" : "#d8e8f1";
       ctx.shadowColor = "#06101b";
       ctx.shadowBlur = 6;
       if (label.maxWidth === undefined) {
@@ -559,7 +586,9 @@
   function updateCounts() {
     const current = visible();
     const projectName = data.meta?.project || "Local graph";
-    counts.textContent = `${current.nodes.length} visible records · ${current.edges.length} typed relations · ${projectName}`;
+    const pendingShown = current.nodes.filter((node) => Core.isUnreviewed(node)).length;
+    const reviewedShown = current.nodes.length - pendingShown;
+    counts.textContent = `${current.nodes.length} visible records (${reviewedShown} reviewed · ${pendingShown} unreviewed) · ${current.edges.length} typed relations · ${projectName}`;
   }
 
   function renderLegend() {
@@ -578,7 +607,7 @@
     }
     const node = selected;
     const layer = Core.recordLayer(node);
-    details.innerHTML = `<div class="name">${escapeHTML(node.title)}</div>`
+    details.innerHTML = `<div class="name">${escapeHTML(node.title)}${Core.isUnreviewed(node) ? unreviewedBadge : ""}</div>`
       + `<div class="kind">${escapeHTML(node.type)} · ${escapeHTML(node.status)} · ${escapeHTML(node.trust || "unspecified")}</div>`
       + `<div class="desc">${escapeHTML(node.excerpt || "No excerpt in export.")}</div>`
       + `<div class="row"><span>Canonical ref</span><b>${escapeHTML(node.id)}</b></div>`
@@ -607,7 +636,7 @@
     listElement.innerHTML = current.nodes.map((node) => {
       const color = nodeColor(node);
       return `<button class="listitem" type="button" data-id="${escapeHTML(node.id)}" aria-label="Inspect ${escapeHTML(node.title)}">`
-        + `<i class="dot" style="color:${color};background:${color}"></i><span class="list-title">${escapeHTML(node.title)}</span>`
+        + `<i class="dot" style="color:${color};background:${color}"></i><span class="list-title">${escapeHTML(node.title)}${Core.isUnreviewed(node) ? unreviewedBadge : ""}</span>`
         + `<small>${escapeHTML(node.type)} · ${escapeHTML(node.status)}</small></button>`;
     }).join("");
     listElement.querySelectorAll(".listitem").forEach((button) => {
@@ -743,6 +772,26 @@
   });
   search.addEventListener("input", applyFilters);
   filter.addEventListener("change", applyFilters);
+  const pendingMeta = data.meta && typeof data.meta.pending === "object" ? data.meta.pending : null;
+  if (unreviewedTotal > 0 || (pendingMeta && pendingMeta.total > 0)) {
+    unreviewedToggle.hidden = false;
+    unreviewedToggle.addEventListener("click", () => {
+      hideUnreviewed = !hideUnreviewed;
+      unreviewedToggle.setAttribute("aria-pressed", String(hideUnreviewed));
+      unreviewedToggle.textContent = hideUnreviewed ? "Show unreviewed" : "Hide unreviewed";
+      applyFilters();
+    });
+  }
+  if (pendingMeta && Number(pendingMeta.total) > 0) {
+    const n = (value) => Number(value) || 0;
+    let note = `Unreviewed review queue: ${n(pendingMeta.total)} items · ${n(pendingMeta.shown)} shown individually (newest)`;
+    if (n(pendingMeta.clustered)) note += ` · ${n(pendingMeta.clustered)} grouped into day clusters`;
+    note += ` · ${n(pendingMeta.clusters)} day nodes`;
+    if (n(pendingMeta.excluded)) note += ` · ${n(pendingMeta.excluded)} other items not shown (restricted, redaction, other principals or resolved)`;
+    if (pendingMeta.truncated_scan) note += " · review folder exceeded scan limit";
+    pendingNote.textContent = note;
+    pendingNote.hidden = false;
+  }
   byId("clear").addEventListener("click", clearSearchAndSelection);
   byId("reset").addEventListener("click", resetView);
   byId("asideReset").addEventListener("click", resetView);
