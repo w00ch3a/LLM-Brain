@@ -9,6 +9,12 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
+## 0.9.2 - 2026-10-12
+
+- Documentation only: short new README with measured results and Hermes
+  screenshots; the full reference moves to `docs/guide.md`; real-agent results in
+  `docs/real-eval-results.md`; Hermes profile note for the Neural Expansion tab.
+
 ## 0.9.1 - 2026-10-12
 
 - Hermes Neural Expansion writes to a private local `$HERMES_HOME/neural-expansion/`
