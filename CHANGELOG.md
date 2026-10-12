@@ -9,6 +9,32 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
+## 0.9.0 - unreleased
+
+- Label lineage: append-only, hash-chained label ledger (`label add|remove|list`),
+  derived lifecycle labels, `lineage show` decision tree/timeline with change
+  points, and `--label`/`--without-label` filters on search and packs.
+- Cascading invalidation (`invalidate preview|apply`): KEEP/STALE/REPLACE/UNKNOWN
+  adjudication over supersession, shared state keys and dependency topology,
+  recorded as `outcome:*` labels; nothing is retracted or edited.
+- Named-gate abstention (`gates`, `abstain_gate=` metadata, pack "Recall Gates").
+- Sufficiency-gated recall (`recall-check`, `pack build --sufficiency`).
+- Opt-in access-recency re-rank (`--recency-boost`, `LLM_BRAIN_RECENCY_BOOST`).
+- Brief compact-on-limit (default on only when items would be dropped; `--no-compact`).
+- Standing-constraint re-injection (`brain_constraint`, `constraint:*` labels,
+  `pack build --turn N`, `LLM_BRAIN_CONSTRAINT_EVERY`, `constraints`).
+- Intentions: `--once` aftereffect quieting, `quiet`, `revise` typed patches,
+  `board`, `observe`; packs name completed intentions ("do not repeat").
+- Working memory (`working add|list|done|drop`), in briefs and packs.
+- Derived folder summaries (`browse build|show`) and progressive state
+  (`state index|open`, `--since`, `pack build --state-index`).
+- Real eval: Memory-Gym family (`evals/real/tasks/memorygym.py`, 9 tasks).
+- Hermes: `/neural-expansion` slash command and a Neural Expansion dashboard
+  page; real-brain export opt-in via `neural_expansion_export`. Exports carry
+  lineage labels.
+- New helper `lib/memory_lineage.py`; standalone installs upgraded by a 0.8.x
+  CLI need `upgrade repair-standalone` once. Upgrade from 0.7.6 and 0.8.2 tested.
+
 ## 0.8.2 - 2026-10-10
 
 - Packs and briefs now carry a "Corrections and Retractions" section: active

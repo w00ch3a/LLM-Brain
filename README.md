@@ -41,6 +41,29 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## What's new in 0.9
+
+Version 0.9 makes memory change traceable without deleting anything, and adds
+recall controls. Schema 3 and OKF v0.2 are unchanged; no canonical record is
+rewritten. See the [v0.9.0 notes](docs/releases/v0.9.0.md) for details and
+defaults.
+
+- **Label lineage.** `llm-brain label add PROJECT REF decision-point:NAME --reason TEXT`
+  appends to a hash-chained ledger; `llm-brain lineage show PROJECT --decision NAME`
+  (or `--topic`, `--ref`) prints the decision tree, the current head and a
+  timeline marking where it changed. Supersession, revisions and retractions
+  appear as derived labels. Search and packs take `--label`/`--without-label`.
+- **Cascading invalidation.** `llm-brain invalidate preview|apply --from REF`
+  marks related records KEEP, STALE, REPLACE or UNKNOWN (as labels).
+- **Recall controls.** `gates` names which gate refused a query;
+  `recall-check` and `pack build --sufficiency` stop when evidence covers the
+  question; `--recency-boost` is an opt-in access-recency re-rank.
+- **Working state.** `working add|list|done` for short-horizon items,
+  `state index|open` for thin current state, `browse build|show` for derived
+  folder summaries, standing constraints re-injected with `pack build --turn N`.
+- **Intentions.** `--once`, `quiet`, `revise`, `board` and `observe`.
+- **Hermes.** `/neural-expansion` and a Neural Expansion dashboard page.
+
 ## What's new in 0.8
 
 Version 0.8 adds memory signals that stay deterministic, derived and
@@ -528,7 +551,14 @@ LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 \
 ```
 
 `--principal` is a visibility filter, not authentication. Don't share,
-sync or serve exported pages. See
+sync or serve exported pages. Exports include active lineage labels.
+
+In Hermes, `/neural-expansion` builds the synthetic demo and replies with a
+`file://` link to a new `0600` page under `$HERMES_HOME/llm-brain/neural-expansion/`;
+`/neural-expansion export` builds this profile's principal-filtered brain once
+`"neural_expansion_export": true` is set in `llm-brain.json`. The plugin also
+adds a **Neural Expansion** dashboard tab (loopback clients only, sandboxed
+iframe, no network) when `llm-brain` is in `plugins.enabled`. See
 [`neural-expansion/README.md`](neural-expansion/README.md) and
 [`neural-expansion/PRIVACY.md`](neural-expansion/PRIVACY.md).
 
@@ -570,7 +600,7 @@ that file. Core commands still work on the partial tree. To finish the
 install, run the new CLI once against the same release source:
 
 ```bash
-llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.8.2
+llm-brain upgrade repair-standalone --source /path/to/llm-brain-0.9.0
 ```
 
 It checks that the source matches the installed CLI byte for byte, then adds
@@ -586,4 +616,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.8.2 release notes](docs/releases/v0.8.2.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](install_prompt.md) for agent-guided setup, [the architecture reference](references/architecture.md) for storage and authority boundaries, [the release guide](RELEASING.md) for publication gates, and the [v0.9.0 release notes](docs/releases/v0.9.0.md) for this version. The [evidence-first host comparison](docs/research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.

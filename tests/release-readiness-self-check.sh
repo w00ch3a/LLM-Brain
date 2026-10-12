@@ -54,6 +54,7 @@ static_checks() {
     python3 -m py_compile "$repo_root/lib/okf.py" -- \
     python3 -m py_compile "$repo_root/lib/replication.py" -- \
     python3 -m py_compile "$repo_root/lib/memory_signals.py" -- \
+    python3 -m py_compile "$repo_root/lib/memory_lineage.py" -- \
     python3 -m py_compile "$repo_root/lib/mcp_server.py" -- \
     python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py" -- \
     python3 -m py_compile "$repo_root/scripts/eval-outcome.py" -- \
@@ -86,9 +87,11 @@ core_checks() {
     bash "$repo_root/tests/experimental-gates-self-check.sh" -- \
     bash "$repo_root/tests/research-upgrades-self-check.sh" -- \
     bash "$repo_root/tests/memory-signals-self-check.sh" -- \
+    bash "$repo_root/tests/lineage-ideas-self-check.sh" -- \
     bash "$repo_root/tests/mcp-self-check.sh" -- \
     bash "$repo_root/tests/mcp-multi-brain-self-check.sh" -- \
     bash "$repo_root/tests/upgrade-from-previous-self-check.sh" -- \
+    env LLM_BRAIN_PREVIOUS_REF=v0.8.2 bash "$repo_root/tests/upgrade-from-previous-self-check.sh" -- \
     bash "$repo_root/tests/lifecycle-eval-self-check.sh" -- \
     bash "$repo_root/tests/outcome-eval-self-check.sh" -- \
     bash "$repo_root/tests/neural-expansion-self-check.sh" -- \
@@ -107,7 +110,8 @@ compatibility_checks() {
   run_steps \
     bash "$repo_root/tests/compatibility-self-check.sh" -- \
     bash "$repo_root/tests/hermes-plugin-options-self-check.sh" -- \
-    bash "$repo_root/tests/hermes-integration-self-check.sh"
+    bash "$repo_root/tests/hermes-integration-self-check.sh" -- \
+    bash "$repo_root/tests/hermes-neural-expansion-self-check.sh"
 }
 
 maintenance_checks() {
