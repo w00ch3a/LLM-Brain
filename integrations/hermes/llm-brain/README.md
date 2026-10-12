@@ -159,6 +159,13 @@ Retraction and receipts remain CLI-controlled: preview a canonical target with `
   mounts `/api/plugins/llm-brain/` only when `llm-brain` is in
   `plugins.enabled`. The API answers loopback clients only and returns the
   page for a sandboxed iframe with a no-network CSP.
+- Hermes Desktop does not show dashboard plugin tabs. The package ships a
+  desktop half, `desktop/plugin.js`, which Desktop copies into
+  `~/.hermes/desktop-plugins/llm-brain/` on the machine running the app. Turn
+  it on in **Capabilities ▸ Plugins**; a **Neural Expansion** item then
+  appears in the sidebar and command palette. It fetches the page from the
+  connected backend's `/api/plugins/llm-brain/view` (so llm-brain must be in
+  that backend's `plugins.enabled`) and shows it in a sandboxed iframe.
 - Profiles: the dashboard serves tab assets (`/dashboard-plugins/llm-brain/...`)
   using the dashboard process's own home, normally the root `~/.hermes`, even
   when the UI is scoped to a profile. If llm-brain lives in a named profile
