@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -1534,7 +1535,7 @@ class LLMBrainContextEngine(ContextCompressor):
 # A Hermes-native way to open the LLM-Brain viewer: the ``/neural-expansion``
 # slash command and the dashboard page both call this builder.  It writes a
 # new self-contained, owner-only (0600) HTML file under
-# ``$HERMES_HOME/llm-brain/neural-expansion/`` and returns its local path.
+# ``$HERMES_HOME/neural-expansion/`` and returns its local path.
 # ``demo`` uses synthetic data only.  ``export`` reads the real brain and is
 # gated twice: ``neural_expansion_export: true`` in llm-brain.json, and the
 # CLI's own LLM_BRAIN_NEURAL_EXPANSION_EXPORT gate, with the profile's
@@ -1544,11 +1545,31 @@ NEURAL_EXPANSION_TIMEOUT = 120
 _NE_MODES = ("demo", "export")
 
 
-def _neural_expansion_dir(hermes_home: Path) -> Path:
-    target = hermes_home / "llm-brain" / "neural-expansion"
+class _NEOutputError(Exception):
+    pass
+
+
+def _neural_expansion_dir(hermes_home: Path, vault_root: str = "") -> Path:
+    """A private, local output directory that is never inside the vault.
+
+    ``$HERMES_HOME/neural-expansion`` (``$HERMES_HOME/llm-brain`` can be a
+    symlink to the vault itself).  The directory must really be 0700 after
+    chmod: filesystems that ignore modes (CIFS/SMB, some FUSE mounts) are
+    refused instead of silently producing a shared-readable page.
+    """
+    target = hermes_home / "neural-expansion"
     target.mkdir(parents=True, exist_ok=True)
     os.chmod(target, 0o700)
-    return target
+    real = target.resolve()
+    if vault_root:
+        try:
+            real.relative_to(Path(vault_root).expanduser().resolve())
+            raise _NEOutputError("output directory resolves inside the vault")
+        except ValueError:
+            pass
+    if stat.S_IMODE(real.stat().st_mode) != 0o700:
+        raise _NEOutputError(f"{real} does not keep private permissions (network or FUSE share?)")
+    return real
 
 
 def _neural_expansion_project(config: Dict[str, Any], cli: str, source_root: Path) -> str:
@@ -1577,7 +1598,10 @@ def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = Non
     if not cli:
         return {"status": "error", "error": "llm-brain CLI not found (set cli_path in llm-brain.json)"}
     stamp = _sha(f"{mode}|{os.getpid()}|{threading.get_ident()}|{__import__('time').time_ns()}")[:12]
-    out_dir = _neural_expansion_dir(home)
+    try:
+        out_dir = _neural_expansion_dir(home, str(config.get("vault_root") or ""))
+    except (OSError, _NEOutputError) as exc:
+        return {"status": "error", "error": f"no private output directory: {exc}"}
     env = os.environ.copy()
     if mode == "demo":
         output = out_dir / f"neural-expansion-demo-{stamp}.html"
@@ -1608,6 +1632,9 @@ def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = Non
         detail = _safe_text((done.stderr or "").strip().splitlines()[-1:][0] if (done.stderr or "").strip() else "")
         return {"status": "error", "error": "Neural Expansion build failed" + (f": {detail}" if detail else "")}
     os.chmod(output, 0o600)
+    if stat.S_IMODE(output.stat().st_mode) != 0o600:
+        output.unlink()
+        return {"status": "error", "error": "output file did not keep 0600 permissions; refused"}
     return {"status": "ok", "mode": mode, "data": data, "path": str(output), "url": output.as_uri(), "mode_bits": "0600"}
 
 

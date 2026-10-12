@@ -554,7 +554,7 @@ LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 \
 sync or serve exported pages. Exports include active lineage labels.
 
 In Hermes, `/neural-expansion` builds the synthetic demo and replies with a
-`file://` link to a new `0600` page under `$HERMES_HOME/llm-brain/neural-expansion/`;
+`file://` link to a new `0600` page under `$HERMES_HOME/neural-expansion/`;
 `/neural-expansion export` builds this profile's principal-filtered brain once
 `"neural_expansion_export": true` is set in `llm-brain.json`. The plugin also
 adds a **Neural Expansion** dashboard tab (loopback clients only, sandboxed

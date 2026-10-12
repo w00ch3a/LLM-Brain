@@ -89,10 +89,16 @@ reply = handler("")
 assert "synthetic demo data" in reply and "file://" in reply, reply
 demo = Path(reply.split("Private file (0600): ", 1)[1].strip())
 assert demo.is_file() and mode_bits(demo) == 0o600 and mode_bits(demo.parent) == 0o700, (demo, oct(mode_bits(demo)))
-assert str(demo).startswith(str(home / "llm-brain" / "neural-expansion")), demo
+assert str(demo).startswith(str((home / "neural-expansion").resolve())), demo
 
 reply = handler("export")
 assert "real-brain export is off" in reply, reply
+# $HERMES_HOME/neural-expansion pointing into the vault is refused.
+import shutil
+shutil.rmtree(home / "neural-expansion"); (home / "neural-expansion").symlink_to(Path(json.loads((home / "llm-brain.json").read_text())["vault_root"]))
+reply = handler("")
+assert "inside the vault" in reply, reply
+(home / "neural-expansion").unlink()
 reply = handler("bogus")
 assert "mode must be demo or export" in reply, reply
 

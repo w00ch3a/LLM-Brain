@@ -150,7 +150,7 @@ Retraction and receipts remain CLI-controlled: preview a canonical target with `
 
 - `/neural-expansion` builds the synthetic demo and replies with a `file://`
   link to a new owner-only (`0600`) page in
-  `$HERMES_HOME/llm-brain/neural-expansion/` (directory `0700`).
+  `$HERMES_HOME/neural-expansion/` (directory `0700`).
 - `/neural-expansion export` builds this profile's brain, principal-filtered
   and read-only, with lineage labels. It is off until `llm-brain.json` sets
   `"neural_expansion_export": true`; the CLI's own export gate still applies.
