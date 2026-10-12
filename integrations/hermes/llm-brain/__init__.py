@@ -1541,7 +1541,7 @@ class LLMBrainContextEngine(ContextCompressor):
 # CLI's own LLM_BRAIN_NEURAL_EXPANSION_EXPORT gate, with the profile's
 # principal filter.  Nothing is served and no network is used.
 
-NEURAL_EXPANSION_TIMEOUT = 120
+NEURAL_EXPANSION_TIMEOUT = 300  # review-queue scan on network vaults can be slow
 _NE_MODES = ("demo", "export")
 
 
