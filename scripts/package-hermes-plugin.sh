@@ -16,6 +16,10 @@ mkdir -p "$(dirname "$output_dir")"
 stage="${output_dir}.tmp.$$"
 mkdir -p "$stage/docs/releases" "$stage/docs/research"
 cp "$source_dir/__init__.py" "$source_dir/README.md" "$stage/"
+mkdir -p "$stage/dashboard/dist"
+cp "$source_dir/dashboard/plugin_api.py" "$stage/dashboard/plugin_api.py"
+cp "$source_dir/dashboard/dist/index.js" "$stage/dashboard/dist/index.js"
+sed "s/\"version\": \"[^\"]*\"/\"version\": \"$version\"/" "$source_dir/dashboard/manifest.json" >"$stage/dashboard/manifest.json"
 cp "$repo_root/docs/evaluation.md" "$stage/docs/evaluation.md"
 cp "$release_notes" "$stage/docs/releases/v${version}.md"
 cp "$repo_root/docs/releases/unreleased.md" "$stage/docs/releases/unreleased.md"
@@ -28,6 +32,8 @@ import sys
 
 source = Path(sys.argv[1])
 compile(source.read_text(encoding="utf-8"), str(source), "exec")
+api = source.parent / "dashboard" / "plugin_api.py"
+compile(api.read_text(encoding="utf-8"), str(api), "exec")
 PY
 if LC_ALL=C grep -R -nE '/Users/[^$[:space:]]+|/home/[^$[:space:]]+|(^|[^0-9])(10|127|169\.254|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]+\.[0-9]+' "$stage"; then
   printf 'Hermes package contains a private machine identifier\n' >&2

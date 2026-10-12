@@ -98,6 +98,9 @@ OPTIONAL_CONFIG_DEFAULTS: Dict[str, Any] = {
     "laya_min_relevance": 0.55,
     "laya_min_margin": 0.1,
     "context_engine_registration": "always",
+    # Neural Expansion real-brain export from Hermes is opt-in; the synthetic
+    # demo needs no setting.
+    "neural_expansion_export": False,
 }
 OPTIONAL_CONFIG_KEYS = set(OPTIONAL_CONFIG_DEFAULTS)
 _LayaOptionalFields = {"confidence", "action", "probability", "probabilities"}
@@ -160,6 +163,8 @@ def _load_config(hermes_home: Optional[Path]) -> Dict[str, Any]:
 
 def _normalise_optional_config(config: Dict[str, Any]) -> None:
     """Normalise opt-in keys in place; absent keys stay absent."""
+    if "neural_expansion_export" in config:
+        config["neural_expansion_export"] = config["neural_expansion_export"] is True
     for key in ("laya_timeout_seconds", "laya_max_candidates"):
         if key in config:
             default = OPTIONAL_CONFIG_DEFAULTS[key]
@@ -1525,6 +1530,98 @@ class LLMBrainContextEngine(ContextCompressor):
         return selected
 
 
+# ---------------------------------------------------------------- Neural Expansion
+# A Hermes-native way to open the LLM-Brain viewer: the ``/neural-expansion``
+# slash command and the dashboard page both call this builder.  It writes a
+# new self-contained, owner-only (0600) HTML file under
+# ``$HERMES_HOME/llm-brain/neural-expansion/`` and returns its local path.
+# ``demo`` uses synthetic data only.  ``export`` reads the real brain and is
+# gated twice: ``neural_expansion_export: true`` in llm-brain.json, and the
+# CLI's own LLM_BRAIN_NEURAL_EXPANSION_EXPORT gate, with the profile's
+# principal filter.  Nothing is served and no network is used.
+
+NEURAL_EXPANSION_TIMEOUT = 120
+_NE_MODES = ("demo", "export")
+
+
+def _neural_expansion_dir(hermes_home: Path) -> Path:
+    target = hermes_home / "llm-brain" / "neural-expansion"
+    target.mkdir(parents=True, exist_ok=True)
+    os.chmod(target, 0o700)
+    return target
+
+
+def _neural_expansion_project(config: Dict[str, Any], cli: str, source_root: Path) -> str:
+    if config.get("project_id"):
+        return str(config["project_id"])
+    try:
+        done = subprocess.run(
+            [cli, "--root", str(config["vault_root"]), "brief", "--source-root", str(source_root), "--json", "--max-bytes", "256"],
+            cwd=str(source_root), text=True, capture_output=True, timeout=30,
+        )
+        payload = json.loads(done.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+    value = payload.get("project_id") if isinstance(payload, dict) else ""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value or "") else ""
+
+
+def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = None, principal: str = "") -> Dict[str, Any]:
+    """Build one Neural Expansion page; returns status, path and file URL."""
+    mode = (mode or "demo").strip().lower()
+    if mode not in _NE_MODES:
+        return {"status": "error", "error": "mode must be demo or export"}
+    home = hermes_home or _registration_hermes_home()
+    config = _load_config(home)
+    cli = _find_cli(config)
+    if not cli:
+        return {"status": "error", "error": "llm-brain CLI not found (set cli_path in llm-brain.json)"}
+    stamp = _sha(f"{mode}|{os.getpid()}|{threading.get_ident()}|{__import__('time').time_ns()}")[:12]
+    out_dir = _neural_expansion_dir(home)
+    env = os.environ.copy()
+    if mode == "demo":
+        output = out_dir / f"neural-expansion-demo-{stamp}.html"
+        command = [cli, "neural-expansion", "demo", "--output", str(output)]
+        data = "synthetic"
+        source_root = out_dir
+    else:
+        if config.get("neural_expansion_export") is not True:
+            return {"status": "disabled", "error": "real-brain export is off; set \"neural_expansion_export\": true in llm-brain.json (the demo needs no setting)"}
+        source_root = _workspace(home)
+        project_id = _neural_expansion_project(config, cli, source_root)
+        if not project_id:
+            return {"status": "error", "error": "no LLM-Brain project for this workspace; set project_id in llm-brain.json"}
+        principal = principal or _principal(config, {}, os.environ.get("HERMES_AGENT_IDENTITY", "default"))
+        output = out_dir / f"neural-expansion-{project_id}-{stamp}.html"
+        command = [cli, "--root", str(config["vault_root"]), "neural-expansion", "export", project_id,
+                   "--principal", principal, "--output", str(output)]
+        env["LLM_BRAIN_NEURAL_EXPANSION_EXPORT"] = "1"
+        data = "principal-filtered"
+    old_umask = os.umask(0o077)
+    try:
+        done = subprocess.run(command, cwd=str(source_root), env=env, text=True, capture_output=True, timeout=NEURAL_EXPANSION_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"status": "error", "error": "Neural Expansion build failed or timed out"}
+    finally:
+        os.umask(old_umask)
+    if done.returncode != 0 or not output.is_file() or output.is_symlink():
+        detail = _safe_text((done.stderr or "").strip().splitlines()[-1:][0] if (done.stderr or "").strip() else "")
+        return {"status": "error", "error": "Neural Expansion build failed" + (f": {detail}" if detail else "")}
+    os.chmod(output, 0o600)
+    return {"status": "ok", "mode": mode, "data": data, "path": str(output), "url": output.as_uri(), "mode_bits": "0600"}
+
+
+def _neural_expansion_command(raw_args: str = "") -> str:
+    """``/neural-expansion [demo|export]`` slash-command handler."""
+    words = (raw_args or "").split()
+    mode = words[0] if words else "demo"
+    result = build_neural_expansion(mode)
+    if result.get("status") != "ok":
+        return f"Neural Expansion: {result.get('error', 'unavailable')}"
+    label = "synthetic demo data" if result["data"] == "synthetic" else "your brain, principal-filtered, read-only"
+    return f"Neural Expansion ({label}) is ready. Open it in a browser: {result['url']}\nPrivate file (0600): {result['path']}"
+
+
 def register(ctx: Any) -> None:
     """Register whichever Hermes extension surface is currently loading us."""
     register_memory = getattr(ctx, "register_memory_provider", None)
@@ -1544,6 +1641,16 @@ def register(ctx: Any) -> None:
         except Exception:
             _release_registration(ctx, "context")
             raise
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command) and _claim_registration(ctx, "command"):
+        try:
+            register_command(
+                "neural-expansion", _neural_expansion_command,
+                description="Open the LLM-Brain Neural Expansion viewer (demo, or export with opt-in)",
+                args_hint="[demo|export]",
+            )
+        except Exception:
+            _release_registration(ctx, "command")
 
 
 def _registration_hermes_home() -> Path:

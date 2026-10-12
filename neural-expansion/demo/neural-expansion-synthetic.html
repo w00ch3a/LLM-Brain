@@ -1007,7 +1007,8 @@
       + `<div class="row"><span>Canonical ref</span><b>${escapeHTML(node.id)}</b></div>`
       + `<div class="row"><span>Provenance</span><b>${escapeHTML(node.provenance || "Not present")}</b></div>`
       + `<div class="row"><span>Observed</span><b>${escapeHTML(node.generated || "Unknown")}</b></div>`
-      + `<div class="row"><span>Record layer</span><b>${escapeHTML(layer)}</b></div>`;
+      + `<div class="row"><span>Record layer</span><b>${escapeHTML(layer)}</b></div>`
+      + (Array.isArray(node.labels) && node.labels.length ? `<div class="row"><span>Lineage labels</span><b>${escapeHTML(node.labels.join(", "))}</b></div>` : "");
     const current = visible();
     const records = new Map(current.nodes.map((item) => [item.id, item]));
     const attached = current.edges.filter((edge) => edge.source === node.id || edge.target === node.id);

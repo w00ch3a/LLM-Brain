@@ -1,0 +1,13 @@
+{
+  "name": "llm-brain",
+  "label": "Neural Expansion",
+  "description": "LLM-Brain memory viewer: synthetic demo, or this profile's principal-filtered brain with label lineage (opt-in)",
+  "icon": "Brain",
+  "version": "0.9.0",
+  "tab": {
+    "path": "/neural-expansion",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

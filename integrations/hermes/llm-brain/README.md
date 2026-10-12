@@ -145,3 +145,17 @@ When a caller requests `intent: evidence`, the bridge includes bounded lifecycle
 The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service, zvec engine or Python dependency; the opt-in Laya filter is a standard-library client for a local endpoint you run yourself. LLM-Brain's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
 
 Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. LLM-Brain is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.
+
+## Neural Expansion in Hermes (0.9)
+
+- `/neural-expansion` builds the synthetic demo and replies with a `file://`
+  link to a new owner-only (`0600`) page in
+  `$HERMES_HOME/llm-brain/neural-expansion/` (directory `0700`).
+- `/neural-expansion export` builds this profile's brain, principal-filtered
+  and read-only, with lineage labels. It is off until `llm-brain.json` sets
+  `"neural_expansion_export": true`; the CLI's own export gate still applies.
+- The package also contains `dashboard/` (manifest, `dist/index.js`,
+  `plugin_api.py`). Hermes' dashboard shows a **Neural Expansion** tab and
+  mounts `/api/plugins/llm-brain/` only when `llm-brain` is in
+  `plugins.enabled`. The API answers loopback clients only and returns the
+  page for a sandboxed iframe with a no-network CSP.

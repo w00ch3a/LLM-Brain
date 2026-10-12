@@ -101,6 +101,48 @@ def _write_owner_only_new_file(path: Path, contents: str) -> None:
         raise
 
 
+LINEAGE_LABEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}(?::[A-Za-z0-9._/@+-]{1,160})?$")
+
+
+def attach_lineage(payload: dict, project_root: Path) -> None:
+    """Add active label-ledger labels to visible nodes (0.9 label lineage).
+
+    Only labels on records already in the principal-filtered node set are
+    attached, and only label edges whose both endpoints are visible.  Reasons
+    and actors are never exported.  A missing, symlinked or malformed ledger
+    is ignored (the view simply has no labels).
+    """
+    ledger = project_root / "lineage" / "labels.tsv"
+    if ledger.is_symlink() or not ledger.is_file():
+        return
+    visible = {node["id"] for node in payload.get("nodes", [])}
+    active: dict[str, dict[str, str]] = {}
+    try:
+        lines = ledger.read_text(encoding="utf-8").splitlines()[1:]
+    except (OSError, UnicodeDecodeError):
+        return
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 9:
+            continue
+        _, _, action, ref, label, target = fields[:6]
+        if ref not in visible or not LINEAGE_LABEL_RE.fullmatch(label):
+            continue
+        bucket = active.setdefault(ref, {})
+        if action == "label":
+            bucket[label] = target if target in visible else ""
+        elif action == "unlabel":
+            bucket.pop(label, None)
+    for node in payload.get("nodes", []):
+        labels = active.get(node["id"])
+        if labels:
+            node["labels"] = sorted(labels)
+    for ref, labels in sorted(active.items()):
+        for label, target in sorted(labels.items()):
+            if target:
+                payload.setdefault("edges", []).append({"source": ref, "relation": "label:" + label.split(":", 1)[0], "target": target})
+
+
 def build_local_snapshot_html(
     vault_root_arg: Path,
     project_id: str,
@@ -141,6 +183,7 @@ def build_local_snapshot_html(
             package = private_root / "snapshot"
             build_snapshot(project_root, package)
             payload = build_export(package, principal)
+            attach_lineage(payload, project_root)
             _assert_no_writer(vault_root, project_id)
             page = render_html(
                 payload,
