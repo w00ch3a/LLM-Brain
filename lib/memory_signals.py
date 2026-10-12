@@ -1012,7 +1012,17 @@ def state_fingerprint(vault: Vault, key: str, now: dt.datetime) -> str:
     return hashlib.sha256("\n".join(sorted(holders)).encode()).hexdigest()[:24]
 
 
+def intention_quiet(metadata: dict[str, Any], now: dt.datetime) -> bool:
+    """Aftereffect suppression: snoozed, or a fire-once intention that fired."""
+    quiet = parse_time(metadata.get("brain_quiet_until"))
+    if quiet is not None and quiet > now:
+        return True
+    return clean(metadata.get("brain_intention_once")).lower() == "true" and bool(clean(metadata.get("brain_last_fired_at")))
+
+
 def intention_due(vault: Vault, metadata: dict[str, Any], now: dt.datetime, task: str, hints: list[str]) -> str:
+    if intention_quiet(metadata, now):
+        return ""
     kind = clean(metadata.get("brain_trigger_kind"))
     value = clean(metadata.get("brain_trigger_value"))
     if kind == "date":
@@ -1264,6 +1274,8 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
     sections: list[tuple[str, list[str]]] = []
     if payload["due_intentions"]:
         sections.append(("Due intentions:", [f"- {item}" for item in payload["due_intentions"]]))
+    if payload.get("working"):
+        sections.append(("Open working items (short-horizon, not durable):", payload["working"]))
     if payload.get("notices"):
         sections.append(("Corrections and retractions (newer than the documents they correct; a local copy of a corrected or retracted document is the outdated version):",
                          [f"- {notice_line(item)}" for item in payload["notices"]]))
@@ -1292,6 +1304,8 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
                 break
     if payload["stale_omitted"]:
         add(f"({payload['stale_omitted']} stale record(s) omitted pending re-verification.)")
+    if payload.get("compacted"):
+        add("(Compacted to one line per entry to fit the cap; open details with `llm-brain browse show` or search.)")
     if omitted:
         add(f"({omitted} more item(s) omitted by the size cap.)")
     text = "\n".join(lines) + "\n"
@@ -1306,13 +1320,31 @@ def command_brief(args: argparse.Namespace) -> int:
     now = now_from(args.now)
     max_bytes = max(args.max_bytes, 256)
     payload = brief_payload(vault, now, max_bytes, args.recent_days)
+    try:
+        import memory_lineage
+        payload["working"] = [
+            f"- [{item['kind']}] {item['text']} ({item['item_id']})" for item in memory_lineage.open_working(vault.root)[:6]
+        ]
+    except Exception:  # an older partial install without the lineage helper
+        payload["working"] = []
     text, omitted = render_brief(args.project_id, payload, max_bytes, args.recent_days, now)
+    compacted = False
+    if omitted and not args.no_compact:
+        # Compact-on-limit: rewrite entries to one line each (title + ref)
+        # instead of silently truncating facts; detail stays in the records.
+        compact = dict(payload, compacted=True)
+        compact["durable"] = [dict(item, summary="") for item in payload["durable"]]
+        compact["notices"] = [dict(item, text=_one_line(item["text"])[:80]) for item in payload.get("notices", [])]
+        compact["retractions"] = [dict(item, reason="") for item in payload["retractions"]]
+        text2, omitted2 = render_brief(args.project_id, compact, max_bytes, args.recent_days, now)
+        if omitted2 < omitted:
+            text, omitted, compacted = text2, omitted2, True
     if args.json:
         print(json.dumps({
             "status": "ok", "derived": True, "project_id": args.project_id, "max_bytes": max_bytes,
             "bytes": utf8_len(text), "omitted": omitted, "durable_count": len(payload["durable"]),
             "recent_count": len(payload["recent"]) + len(payload["retractions"]),
-            "stale_omitted": payload["stale_omitted"], "brief": text,
+            "stale_omitted": payload["stale_omitted"], "compacted": compacted, "brief": text,
         }, ensure_ascii=False, separators=(",", ":")))
     else:
         sys.stdout.write(text)
@@ -1466,6 +1498,7 @@ def parser() -> argparse.ArgumentParser:
     brief.add_argument("--max-bytes", type=int, default=4000)
     brief.add_argument("--recent-days", type=int, default=14)
     brief.add_argument("--json", action="store_true")
+    brief.add_argument("--no-compact", action="store_true")
 
     notices = base("notices", command_notices)
     notices.add_argument("--task", default="")

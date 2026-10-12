@@ -132,16 +132,16 @@ compare_snapshots "$snapshot_before" "$snapshot_after" || fail 'upgrade lost or 
 # 4. An older upgrader installs only lib/okf.py.  Core commands must still
 # work (fail-open), then repair-standalone completes the tree.
 new_dir="$home/standalone/$version"
-if [ ! -f "$new_dir/lib/memory_signals.py" ]; then
+if [ ! -f "$new_dir/lib/memory_signals.py" ] || [ ! -f "$new_dir/lib/memory_lineage.py" ]; then
   grep -Fq 'okf/claims/deploy-1.md' <<<"$(env_run "$new" search "$project_id" 'deploy rule' 2>/dev/null)" || fail 'search broke on an incomplete standalone tree'
   env_run "$new" maintenance status "$project_id" >/dev/null 2>&1 || fail 'maintenance broke on an incomplete standalone tree'
   env_run "$new" pack build "$project_id" --task 'deploy rule' >/dev/null 2>&1 || fail 'pack broke on an incomplete standalone tree'
   if env_run "$new" upgrade repair-standalone --source "$old_src" >/dev/null 2>&1; then fail 'repair accepted a mismatched release source'; fi
   repair="$(env_run "$new" upgrade repair-standalone --source "$repo_root")"
-  grep -Fq 'lib/memory_signals.py' <<<"$repair" || fail "repair did not restore helpers: $repair"
+  grep -Fq 'lib/memory_lineage.py' <<<"$repair" || fail "repair did not restore helpers: $repair"
   grep -Fq 'already-complete' <<<"$(env_run "$new" upgrade repair-standalone --source "$repo_root")" || fail 'repair is not idempotent'
 fi
-for f in lib/okf.py lib/replication.py lib/memory_signals.py lib/mcp_server.py neural-expansion/index.html; do
+for f in lib/okf.py lib/replication.py lib/memory_signals.py lib/memory_lineage.py lib/mcp_server.py neural-expansion/index.html; do
   [ -f "$new_dir/$f" ] || fail "standalone install lacks $f"
 done
 [ "$before" = "$(canonical_digest "$snapshot_before")" ] || fail 'snapshot drifted'
@@ -166,5 +166,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"b
 env_run "$new" neural-expansion path >/dev/null || fail 'Neural Expansion not installed by upgrade'
 [ "$(canonical_digest "$snapshot_after")" = "$(canonical_digest "$project")" ] || fail 'read-only commands changed canonical memory'
 [ "$(wc -l <"$project/audit.v2.tsv" | tr -d ' ')" -ge "$audit_before" ] || fail 'audit log shrank'
+
+# 6. 0.9 commands on upgraded data: labels append to a new ledger beside the
+# vault, lineage and the derived views work, canonical memory is unchanged.
+env_run "$new" label add "$project_id" okf/claims/deploy-1.md decision-point:deploy --reason 'post-upgrade check' >/dev/null || fail 'label add failed after upgrade'
+grep -Fq 'okf/claims/deploy-1.md' <<<"$(env_run "$new" lineage show "$project_id" --decision deploy)" || fail 'lineage failed after upgrade'
+env_run "$new" state index "$project_id" >/dev/null || fail 'state index failed after upgrade'
+env_run "$new" gates "$project_id" 'deploy rule' >/dev/null || fail 'gates failed after upgrade'
+env_run "$new" intention board "$project_id" >/dev/null || fail 'intention board failed after upgrade'
+[ "$(canonical_digest "$snapshot_after")" = "$(canonical_digest "$project")" ] || fail '0.9 commands changed canonical memory'
 
 printf 'llm-brain upgrade-from-previous self-check passed (%s -> %s)\n' "$previous_version" "$version"

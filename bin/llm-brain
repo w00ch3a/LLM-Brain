@@ -84,7 +84,7 @@ Commands:
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label L]... [--without-label L]... [--turn N] [--session ID] [--state-index] [--sufficiency]
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
@@ -95,6 +95,20 @@ Commands:
   intention add PROJECT_ID --action TEXT --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY [--principal ID]
   intention list PROJECT_ID [--status open|done|cancelled|all] [--due] [--task TEXT] [--path FILE] [--json]
   intention done|cancel PROJECT_ID INTENTION_ID --reason TEXT
+  intention add ... [--once] [--observe STATE_KEY]   Fire-once intentions go quiet after surfacing
+  intention revise PROJECT_ID INTENTION_ID (--reschedule TRIGGER|--override ACTION) --reason TEXT
+  intention quiet PROJECT_ID INTENTION_ID --until ISO --reason TEXT
+  intention board|observe PROJECT_ID [--task TEXT] [--within-days N]
+  label add|remove PROJECT_ID REF LABEL --reason TEXT [--target REF]   Append-only label ledger
+  label list PROJECT_ID [REF] [--label NAME] [--json]
+  lineage show PROJECT_ID (--ref REF|--topic TEXT|--decision NAME) [--json]
+  invalidate preview|apply PROJECT_ID --from REF [--reason TEXT]   KEEP/STALE/REPLACE/UNKNOWN as outcome labels
+  gates PROJECT_ID QUERY [--json]          Which gate refused recall (relevance/validity/applicability/risk)
+  recall-check PROJECT_ID QUERY [--batch N] [--max N] [--target F] [--json]   Sufficiency-gated expand-or-stop
+  browse build|show PROJECT_ID [FOLDER]    Derived folder summary indexes
+  state index|open PROJECT_ID [KEY|REF] [--since FILE]   Thin state index, open on demand
+  working add|list|done|drop PROJECT_ID [TEXT|ITEM_ID] [--kind todo|binding|constraint] [--session ID]
+  constraints PROJECT_ID [--turn N] [--every K]
   usage PROJECT_ID [--principal ID] [--json]
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
@@ -6002,14 +6016,15 @@ resolve_graph_target() {
 
 cmd_search() {
   if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
-    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt] [--path FILE]... [--usage-boost]'
+    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label LABEL]... [--without-label LABEL]...'
     return 0
   fi
   [ "$#" -ge 2 ] || die 64 "search requires PROJECT_ID and QUERY (try: llm-brain search --help)"
   local project_id="$1" query="$2"; shift 2 || true
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local usage_boost="${LLM_BRAIN_USAGE_BOOST:-0}" diversity_reserve="${LLM_BRAIN_DIVERSITY_RESERVE:-2}" diversity_reserved=0 path_matched=0 lexical_scorer="${LLM_BRAIN_LEXICAL_SCORER:-bm25f}"
-  local -a path_hints=()
+  local -a path_hints=() with_labels=() without_labels=()
+  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -6034,12 +6049,16 @@ cmd_search() {
       --receipt) receipt_file="__CANONICAL__"; shift ;;
       --path) [ -n "${2:-}" ] || die 64 "--path requires PATH"; path_hints+=("$2"); shift 2 ;;
       --usage-boost) usage_boost=1; shift ;;
+      --recency-boost) recency_boost=1; shift ;;
+      --label) validate_scalar "${2:-}" || die 65 "invalid --label"; with_labels+=("${2:-}"); shift 2 ;;
+      --without-label) validate_scalar "${2:-}" || die 65 "invalid --without-label"; without_labels+=("${2:-}"); shift 2 ;;
       *) die 64 "unknown search option: $1" ;;
     esac
   done
   validate_scalar "$query" || die 65 "query must be a single line"
   validate_scalar "$principal" || die 65 "--principal must be a single line"
   case "$usage_boost" in 0|1) ;; *) die 64 "LLM_BRAIN_USAGE_BOOST must be 0 or 1" ;; esac
+  case "$recency_boost" in 0|1) ;; *) die 64 "LLM_BRAIN_RECENCY_BOOST must be 0 or 1" ;; esac
   case "$diversity_reserve" in ''|*[!0-9]*) die 64 "LLM_BRAIN_DIVERSITY_RESERVE must be a non-negative integer" ;; esac
   case "$lexical_scorer" in bm25f|legacy) ;; *) die 64 "LLM_BRAIN_LEXICAL_SCORER must be bm25f or legacy" ;; esac
   # Older or partial installs without the signals helper keep the legacy scorer.
@@ -6229,6 +6248,27 @@ cmd_search() {
     rm -f "$final_ranked.usage"
   fi
 
+  if [ "$recency_boost" = 1 ] && [ -s "$final_ranked" ]; then
+    # Opt-in access-recency soft re-rank (x1.5 just used -> x0.7 floor).
+    # Re-orders the whole candidate list; never filters anything out.
+    if memory_lineage recency --project-dir "$dir" --principal "$principal" --ranked "$final_ranked" >"$final_ranked.recency"; then
+      cut -f1-6 "$final_ranked.recency" >"$final_ranked"
+    else
+      degraded=1
+    fi
+    rm -f "$final_ranked.recency"
+  fi
+  if { [ "${#with_labels[@]}" -gt 0 ] || [ "${#without_labels[@]}" -gt 0 ]; } && [ -s "$final_ranked" ]; then
+    local -a label_args=(label-filter --project-dir "$dir" --principal "$principal" --ranked "$final_ranked")
+    for term in ${with_labels[@]+"${with_labels[@]}"}; do label_args+=(--with-label "$term"); done
+    for term in ${without_labels[@]+"${without_labels[@]}"}; do label_args+=(--without-label "$term"); done
+    if memory_lineage "${label_args[@]}" >"$final_ranked.labels"; then
+      label_filtered=$(( $(wc -l <"$final_ranked") - $(wc -l <"$final_ranked.labels") ))
+      mv "$final_ranked.labels" "$final_ranked"
+    else
+      rm -f "$final_ranked.labels"; degraded=1
+    fi
+  fi
   head -n "$limit" "$final_ranked" | cut -f1 >"$selected_paths"
   lifecycle_bundle_record_count=0
   if [ "$intent" = current_state ] || [ "$intent" = evidence ]; then
@@ -6305,6 +6345,12 @@ cmd_search() {
   fi
   if [ -n "$metadata_file" ]; then
     printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\nlexical_scorer=%s\npath_hints=%s\npath_matched_count=%s\nusage_boost=%s\ndiversity_reserved=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" "$lexical_scorer" "$([ "${#path_hints[@]}" -gt 0 ] && printf '%s' "${#path_hints[@]}" || printf 0)" "$path_matched" "$([ "$usage_boost" = 1 ] && printf enabled || printf disabled)" "$diversity_reserved" >"$metadata_file"
+    [ "$recency_boost" = 0 ] || printf 'recency_boost=enabled\n' >>"$metadata_file"
+    { [ "${#with_labels[@]}" -eq 0 ] && [ "${#without_labels[@]}" -eq 0 ]; } || printf 'label_filtered_count=%s\n' "$label_filtered" >>"$metadata_file"
+    if [ ! -s "$selected_paths" ]; then
+      # Named-gate abstention: say which gate refused instead of a bare miss.
+      memory_lineage gates --project-dir "$dir" --principal "$principal" --query "$query" --metadata >>"$metadata_file" 2>/dev/null || printf 'abstain_gate=unknown\n' >>"$metadata_file"
+    fi
   fi
   retrieval_receipt "$receipt_file" search "$project_id" "$query" "$metadata_file" "$(cat "$selected_paths" 2>/dev/null || true)" || say_error "retrieval receipt unavailable"
   rm -rf "$tmp_dir"
@@ -6511,6 +6557,8 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
+  local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
+  local -a pack_label_args=()
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local task="" agent="generic" budget=1200 topic="" include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 receipt_file="" dir results metadata warnings selected render_order source_snapshot_hash="" rendered_refs="" evidence_opened=false evidence_incomplete=false context_truncated=false verified_hash evidence_refs hash pack bytes=0 line rel retrieval_mode="lexical" retrieval_degraded=false manifest_hash="none" planner="deterministic" state_resolution="disabled" state_unresolved_count=0 independent_source_count=0 correlated_record_count=0 lifecycle_bundle_resolution="disabled" lifecycle_bundle_record_count=0 evidence_ref evidence_file evidence_excerpt evidence_bytes state state_reason evidence_group correlated_records provenance_state independent_roots lifecycle_bundle lifecycle_warnings
@@ -6534,6 +6582,12 @@ cmd_pack() {
       --receipt) receipt_file="__CANONICAL__"; shift ;;
       --path) [ -n "${2:-}" ] || die 64 "--path requires PATH"; pack_path_hints+=("$2"); shift 2 ;;
       --usage-boost) usage_boost=1; shift ;;
+      --recency-boost) recency_boost=1; shift ;;
+      --label|--without-label) [ -n "${2:-}" ] || die 64 "$1 requires LABEL"; pack_label_args+=("$1" "$2"); shift 2 ;;
+      --turn) pack_turn="${2:-}"; shift 2 ;;
+      --session) pack_session="${2:-}"; shift 2 ;;
+      --state-index) state_index=1; shift ;;
+      --sufficiency) sufficiency=1; shift ;;
       *) die 64 "unknown pack option: $1" ;;
     esac
   done
@@ -6549,13 +6603,22 @@ cmd_pack() {
   [ -z "$as_of" ] || brain_datetime_valid "$as_of" || die 65 "--as-of must be an ISO-8601 UTC datetime"
   case "$budget" in ''|*[!0-9]*) die 64 "--budget-tokens must be a non-negative integer" ;; esac
   [ "$budget" -gt 0 ] || die 64 "--budget-tokens must be positive"
+  case "$pack_turn" in ''|*[!0-9]*) die 64 "--turn must be a non-negative integer" ;; esac
+  require_positive_integer "$pack_every" || die 64 "LLM_BRAIN_CONSTRAINT_EVERY must be a positive integer"
+  validate_scalar "$pack_session" || die 65 "--session must be a single line"
   require_project "$project_id" dir
+  if [ "$sufficiency" = 1 ]; then
+    # Sufficiency-gated expand-or-stop: select only as many records as the
+    # evidence-coverage loop needed (falls back to 20 if the helper fails).
+    search_limit="$(memory_lineage sufficiency --project-dir "$dir" --principal "$principal" --query "$task" --count-only 2>/dev/null || printf 20)"
+    case "$search_limit" in ''|*[!0-9]*|0) search_limit=20 ;; esac
+  fi
   [ "$receipt_file" = __CANONICAL__ ] && receipt_file="$dir/audit/retrieval-receipts.jsonl"
   results="$(mktemp "$dir/context-packs/.search.XXXXXX")"
   metadata="$(mktemp "$dir/context-packs/.metadata.XXXXXX")"
   warnings="$(mktemp "$dir/context-packs/.warnings.XXXXXX")"
   local -a search_args
-  search_args=("$project_id" "$task" "--limit" "20" "--strategy" "$strategy" "--metadata-file" "$metadata" "--explain")
+  search_args=("$project_id" "$task" "--limit" "$search_limit" "--strategy" "$strategy" "--metadata-file" "$metadata" "--explain")
   [ -z "$topic" ] || search_args+=("--topic" "$topic")
   [ -z "$query_embedder" ] || search_args+=("--query-embedder" "$query_embedder")
   [ "$expand_graph" = "0" ] || search_args+=("--expand-graph")
@@ -6568,6 +6631,8 @@ cmd_pack() {
   [ "$include_proposed" = "0" ] || search_args+=("--include-proposed")
   [ "$include_cold" = "0" ] || search_args+=("--include-cold")
   [ "$usage_boost" = "0" ] || search_args+=("--usage-boost")
+  [ "$recency_boost" = "0" ] || search_args+=("--recency-boost")
+  [ "${#pack_label_args[@]}" -eq 0 ] || search_args+=("${pack_label_args[@]}")
   if [ "${#pack_path_hints[@]}" -gt 0 ]; then
     for line in "${pack_path_hints[@]}"; do search_args+=("--path" "$line"); done
   fi
@@ -6597,6 +6662,19 @@ cmd_pack() {
   [ -z "$as_of" ] || notice_args+=(--now "$as_of")
   memory_signals "${notice_args[@]}" 2>/dev/null >"$notices_file" || : >"$notices_file"
   [ ! -s "$notices_file" ] || notices_hash="$(sha256_file "$notices_file")"
+  # 0.9 extras: standing constraints (re-injected every K turns when --turn
+  # is given), open working memory, completed-intention aftereffects, label
+  # lineage of selected records, an optional thin state index, and named
+  # recall gates when nothing was selected.  Empty for vaults without them.
+  extras_file="$(mktemp "$dir/context-packs/.extras.XXXXXX")"
+  tail -n +2 "$results" | cut -f1 >"${extras_file}.selected"
+  local -a extras_args=(pack-extras --project-dir "$dir" --task "$task" --selected "${extras_file}.selected" --turn "$pack_turn" --every "$pack_every" --session "$pack_session")
+  [ -z "$principal" ] || extras_args+=(--principal "$principal")
+  [ -z "$as_of" ] || extras_args+=(--now "$as_of")
+  [ "$state_index" = 0 ] || extras_args+=(--state-index)
+  memory_lineage "${extras_args[@]}" 2>/dev/null >"$extras_file" || : >"$extras_file"
+  rm -f "${extras_file}.selected"
+  [ ! -s "$extras_file" ] || extras_hash="$(sha256_file "$extras_file")"
   retrieval_mode="$(awk -F= '$1 == "retrieval_mode" { print $2 }' "$metadata")"
   retrieval_degraded="$(awk -F= '$1 == "degraded" { print $2 }' "$metadata")"
   intent="$(awk -F= '$1 == "intent" { print $2 }' "$metadata")"; [ -n "$intent" ] || intent="legacy"
@@ -6635,12 +6713,12 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
@@ -6666,6 +6744,10 @@ cmd_pack() {
         bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
       done <"$notices_file"
       printf '\n'
+    fi
+    if [ -s "$extras_file" ]; then
+      cat "$extras_file"
+      bytes=$((bytes + $(wc -c <"$extras_file" | tr -d ' ')))
     fi
     if [ -s "$warnings" ]; then
       printf '## State Warnings — unresolved, not current truth\n\n'
@@ -6725,10 +6807,20 @@ cmd_pack() {
   } >"${pack}.tmp.$$"
   mv "${pack}.tmp.$$" "$pack"
   audit_v2 "$dir" "pack-build" "$(basename "$pack")" "" "built" "$(sha256_file "$pack")" "bytes=$bytes"
+  # Fire-once intentions go quiet after surfacing (aftereffect suppression).
+  if [ -s "$intentions_file" ]; then
+    while IFS=$'\t' read -r intention_id _; do
+      [ -n "$intention_id" ] && [ -f "$dir/intentions/$intention_id.md" ] || continue
+      case "$(frontmatter_field "$dir/intentions/$intention_id.md" brain_intention_once)" in true|True)
+        set_frontmatter_field "$dir/intentions/$intention_id.md" brain_last_fired_at "$(yaml_quote "$(now_utc)")"
+        audit_v2 "$dir" "intention-fired" "$intention_id" open quiet "$(sha256_file "$dir/intentions/$intention_id.md")" "pack=$(basename "$pack")" ;;
+      esac
+    done <"$intentions_file"
+  fi
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 
@@ -7164,7 +7256,7 @@ project_lookup_readonly() {
 # Size-capped, derived project brief: durable approved facts plus recent
 # changes.  Read-only; safe for SessionStart hooks.
 cmd_brief() {
-  local project_id="" source_root="" principal="" max_bytes=4000 recent_days=14 json=0 dir
+  local project_id="" source_root="" principal="" max_bytes=4000 recent_days=14 json=0 no_compact=0 dir
   while [ $# -gt 0 ]; do
     case "$1" in
       --source-root) source_root="${2:-}"; shift 2 ;;
@@ -7172,6 +7264,7 @@ cmd_brief() {
       --max-bytes) max_bytes="${2:-}"; shift 2 ;;
       --recent-days) recent_days="${2:-}"; shift 2 ;;
       --json) json=1; shift ;;
+      --no-compact) no_compact=1; shift ;;
       --*) die 64 "unknown brief option: $1" ;;
       *) [ -z "$project_id" ] || die 64 "brief accepts one PROJECT_ID"; project_id="$1"; shift ;;
     esac
@@ -7191,6 +7284,7 @@ cmd_brief() {
   local -a args=(brief --project-dir "$dir" --project-id "$project_id" --max-bytes "$max_bytes" --recent-days "$recent_days")
   [ -z "$principal" ] || args+=(--principal "$principal")
   [ "$json" = 0 ] || args+=(--json)
+  { [ "$no_compact" = 0 ] && [ "${LLM_BRAIN_BRIEF_COMPACT:-1}" != 0 ]; } || args+=(--no-compact)
   memory_signals "${args[@]}"
 }
 
@@ -7294,9 +7388,11 @@ cmd_intention() {
   require_project "$project_id" dir
   case "$action" in
     add)
-      local action_text="" trigger="" principal="" kind value baseline="" intention_id file scan
+      local action_text="" trigger="" principal="" kind value baseline="" intention_id file scan once=0 observe=""
       while [ $# -gt 0 ]; do
         case "$1" in
+          --once) once=1; shift ;;
+          --observe) observe="${2:-}"; shift 2 ;;
           --action) action_text="${2:-}"; shift 2 ;;
           --trigger) trigger="${2:-}"; shift 2 ;;
           --principal) principal="${2:-}"; shift 2 ;;
@@ -7314,7 +7410,9 @@ cmd_intention() {
       printf '%s\n%s\n' "$action_text" "$value" >"$scan"
       if ! secret_scan_file "$scan"; then rm -f "$scan"; die 65 "intention text matched the secret scanner"; fi
       rm -f "$scan"
+      [ -z "$observe" ] || validate_scalar "$observe" || die 65 "invalid --observe state key"
       [ "$kind" != state ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$value")"
+      [ -z "$observe" ] || [ -n "$baseline" ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$observe")"
       intention_id="intention_$(sha256_text "$project_id|$action_text|$kind|$value|$principal" | cut -c1-16)"
       ensure_dir "$dir/intentions"
       file="$dir/intentions/$intention_id.md"
@@ -7325,6 +7423,8 @@ cmd_intention() {
           printf 'type: Intention\ntitle: %s\nbrain_project_id: %s\nbrain_intention_id: %s\nbrain_intention_action: %s\nbrain_intention_status: open\nbrain_trigger_kind: %s\nbrain_trigger_value: %s\n' "$(yaml_quote "Intention: $action_text")" "$project_id" "$intention_id" "$(yaml_quote "$action_text")" "$kind" "$(yaml_quote "$value")"
           [ -z "$baseline" ] || printf 'brain_trigger_baseline: %s\n' "$baseline"
           [ -z "$principal" ] || printf 'brain_principal: %s\n' "$(yaml_quote "$principal")"
+          [ "$once" = 0 ] || printf 'brain_intention_once: true\n'
+          [ -z "$observe" ] || printf 'brain_intention_observe: %s\n' "$(yaml_quote "$observe")"
           printf 'brain_sensitivity: internal\nbrain_artifact_state: operational\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
           printf '%s\n' '---'
           printf '# Intention\n\nWhen `%s:%s` fires: %s\n\nThis is prospective memory, not canonical knowledge. Close it with `intention done` or `intention cancel`.\n' "$kind" "$value" "$action_text"
@@ -7373,11 +7473,71 @@ cmd_intention() {
       set_frontmatter_field "$file" brain_intention_status "$new"
       set_frontmatter_field "$file" brain_closed_at "$(yaml_quote "$(now_utc)")"
       set_frontmatter_field "$file" brain_close_reason "$(yaml_quote "$reason")"
+      memory_lineage intention-patch --project-dir "$dir" --intention-id "$intention_id" --patch decide --old open --new "$new" --reason "$reason" >/dev/null 2>&1 || true
       audit_v2 "$dir" "intention-$action" "$intention_id" open "$new" "$(sha256_file "$file")" "reason=$(slug "$reason")"
       release_lock
       printf 'intention=%s project_id=%s intention_id=%s\n' "$new" "$project_id" "$intention_id"
       ;;
-    *) die 64 "intention requires add, list, done or cancel" ;;
+    board)
+      local -a args=(board --project-dir "$dir")
+      while [ $# -gt 0 ]; do case "$1" in --task) args+=(--task "${2:-}"); shift 2 ;; --principal) args+=(--principal "${2:-}"); shift 2 ;; *) die 64 "unknown intention board option: $1" ;; esac; done
+      memory_lineage "${args[@]}"
+      ;;
+    observe)
+      local -a args=(observe --project-dir "$dir")
+      while [ $# -gt 0 ]; do case "$1" in --within-days) args+=(--within-days "${2:-}"); shift 2 ;; --principal) args+=(--principal "${2:-}"); shift 2 ;; *) die 64 "unknown intention observe option: $1" ;; esac; done
+      memory_lineage "${args[@]}"
+      ;;
+    revise|quiet)
+      # Typed patches (Form -> Revise -> Filter -> Decide).  Each patch is
+      # appended to intentions/ID.patches.tsv; the old value stays traceable.
+      local intention_id="${1:-}" reason="" reschedule="" override="" until="" file old new kind value patch baseline=""
+      shift || true
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --reschedule) reschedule="${2:-}"; shift 2 ;;
+          --override) override="${2:-}"; shift 2 ;;
+          --until) until="${2:-}"; shift 2 ;;
+          --reason) reason="${2:-}"; shift 2 ;;
+          *) die 64 "unknown intention $action option: $1" ;;
+        esac
+      done
+      [ -n "$intention_id" ] && [ -n "$reason" ] || die 64 "intention $action requires INTENTION_ID --reason TEXT"
+      validate_id "$intention_id" || die 64 "invalid intention id"
+      for value in "$reason" "$reschedule" "$override" "$until"; do validate_scalar "$value" || die 65 "intention patch values must be single lines"; done
+      file="$dir/intentions/$intention_id.md"
+      [ -f "$file" ] && [ ! -L "$file" ] || die 66 "intention missing: $intention_id"
+      [ "$(frontmatter_field "$file" brain_intention_status)" = open ] || die 65 "intention is not open: $intention_id"
+      if [ "$action" = quiet ]; then
+        [ -n "$until" ] || die 64 "intention quiet requires --until ISO"
+        brain_datetime_valid "$until" || case "$until" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) die 65 "--until must be an ISO date or UTC datetime" ;; esac
+      elif [ -n "$reschedule" ]; then
+        kind="${reschedule%%:*}"; value="${reschedule#*:}"
+        [ "$kind" != "$reschedule" ] && intention_trigger_valid "$kind" "$value" || die 65 "invalid trigger: $reschedule"
+        [ "$kind" != state ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$value")"
+      elif [ -z "$override" ]; then
+        die 64 "intention revise requires --reschedule TRIGGER or --override ACTION"
+      fi
+      acquire_lock "project-$project_id"
+      if [ "$action" = quiet ]; then
+        old="$(frontmatter_field "$file" brain_quiet_until)"; new="$until"; patch=quiet
+        set_frontmatter_field "$file" brain_quiet_until "$(yaml_quote "$until")"
+      elif [ -n "$reschedule" ]; then
+        old="$(frontmatter_field "$file" brain_trigger_kind):$(frontmatter_field "$file" brain_trigger_value)"; new="$reschedule"; patch=reschedule
+        set_frontmatter_field "$file" brain_trigger_kind "$kind"
+        set_frontmatter_field "$file" brain_trigger_value "$(yaml_quote "$value")"
+        [ -z "$baseline" ] || set_frontmatter_field "$file" brain_trigger_baseline "$baseline"
+        set_frontmatter_field "$file" brain_last_fired_at '""'
+      else
+        old="$(frontmatter_field "$file" brain_intention_action)"; new="$override"; patch=override
+        set_frontmatter_field "$file" brain_intention_action "$(yaml_quote "$override")"
+      fi
+      memory_lineage intention-patch --project-dir "$dir" --intention-id "$intention_id" --patch "$patch" --old "$old" --new "$new" --reason "$reason" >/dev/null
+      audit_v2 "$dir" "intention-$patch" "$intention_id" "$(slug "$old")" "$(slug "$new")" "$(sha256_file "$file")" "reason=$(slug "$reason")"
+      release_lock
+      printf 'intention=%s project_id=%s intention_id=%s\n' "$patch" "$project_id" "$intention_id"
+      ;;
+    *) die 64 "intention requires add, list, done, cancel, revise, quiet, board or observe" ;;
   esac
 }
 
@@ -7411,6 +7571,263 @@ association_propose() {
     fi
     printf '%s\t%s\t%s\t%s\n' "$ref_a" "$ref_b" "$count" "$([ "$write_review" = 1 ] && printf '%s' "$review_id" || printf -- '-')"
   done < <(memory_signals coaccess --project-dir "$dir" --min-count "$min_count" | tail -n +2)
+}
+
+# ---------------------------------------------------------------- 0.9 ideas
+# Label lineage, cascading invalidation, recall gates, sufficiency, folder
+# summaries, progressive state, working memory, constraints and the intention
+# board live in lib/memory_lineage.py.  Reads are derived; the only writes are
+# append-only label/working/patch events and rebuildable summary indexes, made
+# here under the project lock with an audit row.  Canonical records are never
+# edited or deleted by these commands.
+memory_lineage() {
+  local helper
+  resolve_okf_runtime
+  if ! helper="$(sibling_helper memory_lineage.py)"; then
+    printf 'llm-brain: lib/memory_lineage.py is missing beside %s; run: llm-brain upgrade repair-standalone --source RELEASE_DIR\n' "$SCRIPT_SOURCE" >&2
+    return 69
+  fi
+  "$OKF_PYTHON" "$helper" "$@"
+}
+
+lineage_common_args() {
+  # usage: lineage_common_args DIR PRINCIPAL -> prints nothing; sets LINEAGE_ARGS
+  LINEAGE_ARGS=(--project-dir "$1")
+  [ -z "$2" ] || LINEAGE_ARGS+=(--principal "$2")
+}
+
+cmd_label() {
+  local action="${1:-}" project_id="${2:-}" dir ref label="" target="" reason="" principal="" json=0 output; shift 2 || true
+  [ -n "$project_id" ] || die 64 "label requires add|remove|list PROJECT_ID"
+  require_project "$project_id" dir
+  case "$action" in
+    add|remove)
+      ref="${1:-}"; label="${2:-}"; shift 2 || true
+      [ -n "$ref" ] && [ -n "$label" ] || die 64 "label $action requires PROJECT_ID REF LABEL --reason TEXT [--target REF]"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --reason) reason="${2:-}"; shift 2 ;;
+          --target) target="${2:-}"; shift 2 ;;
+          *) die 64 "unknown label option: $1" ;;
+        esac
+      done
+      [ -n "$reason" ] || die 64 "label $action requires --reason TEXT"
+      for value in "$ref" "$label" "$target" "$reason"; do validate_scalar "$value" || die 65 "label arguments must be single lines"; done
+      memory_lineage label-validate "$label" || die 65 "invalid label: $label"
+      acquire_lock "project-$project_id"
+      if ! output="$(memory_lineage label-append --project-dir "$dir" --action "$([ "$action" = add ] && printf label || printf unlabel)" --ref "$ref" --label "$label" --target "$target" --actor "$(okf_actor)" --reason "$reason")"; then
+        release_lock; die 65 "label $action refused"
+      fi
+      case "$output" in *label=unchanged*) ;; *) audit_v2 "$dir" "label-$action" "$(slug "$ref")" "" "$(slug "$label")" "$(sha256_file "$dir/lineage/labels.tsv")" "reason=$(slug "$reason")" ;; esac
+      release_lock
+      printf '%s\n' "$output"
+      ;;
+    list)
+      local -a args=(labels --project-dir "$dir")
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --label) args+=(--label "${2:-}"); shift 2 ;;
+          --principal) principal="${2:-}"; shift 2 ;;
+          --json) args+=(--json); shift ;;
+          --*) die 64 "unknown label list option: $1" ;;
+          *) args+=(--ref "$1"); shift ;;
+        esac
+      done
+      [ -z "$principal" ] || args+=(--principal "$principal")
+      memory_lineage "${args[@]}"
+      ;;
+    *) die 64 "label requires add, remove or list" ;;
+  esac
+}
+
+cmd_lineage() {
+  local action="${1:-}" project_id="${2:-}" dir; shift 2 || true
+  [ "$action" = show ] && [ -n "$project_id" ] || die 64 "lineage requires show PROJECT_ID (--ref REF|--topic TEXT|--decision NAME) [--json]"
+  require_project "$project_id" dir
+  local -a args=(lineage --project-dir "$dir")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ref|--topic|--decision|--principal) validate_scalar "${2:-}" || die 65 "invalid $1"; args+=("$1" "${2:-}"); shift 2 ;;
+      --json) args+=(--json); shift ;;
+      *) die 64 "unknown lineage option: $1" ;;
+    esac
+  done
+  memory_lineage "${args[@]}"
+}
+
+# Cascading invalidation (#8): preview adjudicates KEEP/STALE/REPLACE/UNKNOWN
+# for records topologically related to a trigger; apply records each outcome
+# as an outcome:* label (append-only).  Nothing is retracted or edited.
+cmd_invalidate() {
+  local action="${1:-}" project_id="${2:-}" trigger="" reason="" principal="" json=0 dir plan ref outcome depth why tref applied=0; shift 2 || true
+  [ -n "$project_id" ] || die 64 "invalidate requires preview|apply PROJECT_ID --from REF"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) trigger="${2:-}"; shift 2 ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      --principal) principal="${2:-}"; shift 2 ;;
+      --json) json=1; shift ;;
+      *) die 64 "unknown invalidate option: $1" ;;
+    esac
+  done
+  [ -n "$trigger" ] || die 64 "invalidate requires --from REF"
+  validate_scalar "$trigger" || die 65 "invalid --from"
+  require_project "$project_id" dir
+  local -a args=(invalidate --project-dir "$dir" --trigger "$trigger")
+  [ -z "$principal" ] || args+=(--principal "$principal")
+  case "$action" in
+    preview)
+      [ "$json" = 0 ] || args+=(--json)
+      memory_lineage "${args[@]}"
+      ;;
+    apply)
+      [ -n "$reason" ] || die 64 "invalidate apply requires --reason TEXT"
+      validate_scalar "$reason" || die 65 "invalid reason"
+      plan="$(memory_lineage "${args[@]}" | tail -n +2)"
+      acquire_lock "project-$project_id"
+      while IFS=$'\t' read -r ref outcome depth why tref; do
+        [ -n "$ref" ] || continue
+        if memory_lineage label-append --project-dir "$dir" --action label --ref "$ref" --label "outcome:$outcome" --target "$tref" --actor "$(okf_actor)" --reason "$reason; $why" >/dev/null; then
+          applied=$((applied + 1))
+          printf '%s\t%s\t%s\n' "$ref" "$outcome" "$why"
+        fi
+      done <<<"$plan"
+      [ "$applied" = 0 ] || audit_v2 "$dir" "invalidate-apply" "$(slug "$trigger")" "" "labelled-$applied" "$(sha256_file "$dir/lineage/labels.tsv")" "reason=$(slug "$reason")"
+      release_lock
+      printf 'invalidate=applied project_id=%s trigger=%s labelled=%s\n' "$project_id" "$trigger" "$applied"
+      ;;
+    *) die 64 "invalidate requires preview or apply" ;;
+  esac
+}
+
+cmd_gates() {
+  local project_id="${1:-}" query="${2:-}" dir; shift 2 || true
+  [ -n "$project_id" ] && [ -n "$query" ] || die 64 "gates requires PROJECT_ID QUERY [--principal ID] [--json]"
+  validate_scalar "$query" || die 65 "query must be a single line"
+  require_project "$project_id" dir
+  local -a args=(gates --project-dir "$dir" --query "$query")
+  while [ $# -gt 0 ]; do case "$1" in --principal) args+=(--principal "${2:-}"); shift 2 ;; --json) args+=(--json); shift ;; *) die 64 "unknown gates option: $1" ;; esac; done
+  memory_lineage "${args[@]}"
+}
+
+cmd_sufficiency() {
+  local project_id="${1:-}" query="${2:-}" dir; shift 2 || true
+  [ -n "$project_id" ] && [ -n "$query" ] || die 64 "recall-check requires PROJECT_ID QUERY [--batch N] [--max N] [--target 0..1] [--json]"
+  validate_scalar "$query" || die 65 "query must be a single line"
+  require_project "$project_id" dir
+  local -a args=(sufficiency --project-dir "$dir" --query "$query")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --batch|--max|--target|--principal) args+=("$1" "${2:-}"); shift 2 ;;
+      --json) args+=(--json); shift ;;
+      *) die 64 "unknown recall-check option: $1" ;;
+    esac
+  done
+  memory_lineage "${args[@]}"
+}
+
+cmd_browse() {
+  local action="${1:-}" project_id="${2:-}" dir; shift 2 || true
+  [ -n "$project_id" ] || die 64 "browse requires build|show PROJECT_ID [FOLDER]"
+  require_project "$project_id" dir
+  case "$action" in
+    build)
+      acquire_lock "project-$project_id"
+      memory_lineage summaries --project-dir "$dir" --action build || { release_lock; die 70 "summary build failed"; }
+      release_lock
+      ;;
+    show)
+      local folder="${1:-okf}"
+      validate_scalar "$folder" || die 65 "invalid folder"
+      memory_lineage summaries --project-dir "$dir" --action show --folder "$folder"
+      ;;
+    *) die 64 "browse requires build or show" ;;
+  esac
+}
+
+cmd_state() {
+  local action="${1:-}" project_id="${2:-}" dir; shift 2 || true
+  [ -n "$project_id" ] || die 64 "state requires index|open PROJECT_ID"
+  require_project "$project_id" dir
+  local -a args=(state --project-dir "$dir")
+  case "$action" in
+    index)
+      args+=(--action index)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --since) [ -f "${2:-}" ] || die 66 "--since file missing"; args+=(--since "$2"); shift 2 ;;
+          --changes-only) args+=(--changes-only); shift ;;
+          --principal) args+=(--principal "${2:-}"); shift 2 ;;
+          *) die 64 "unknown state index option: $1" ;;
+        esac
+      done
+      ;;
+    open)
+      [ -n "${1:-}" ] || die 64 "state open requires PROJECT_ID KEY|REF"
+      validate_scalar "$1" || die 65 "invalid key"
+      args+=(--action open --key "$1"); shift
+      while [ $# -gt 0 ]; do case "$1" in --principal) args+=(--principal "${2:-}"); shift 2 ;; *) die 64 "unknown state open option: $1" ;; esac; done
+      ;;
+    *) die 64 "state requires index or open" ;;
+  esac
+  memory_lineage "${args[@]}"
+}
+
+cmd_working() {
+  local action="${1:-}" project_id="${2:-}" dir text="" kind=todo session="" item="" scan output; shift 2 || true
+  [ -n "$project_id" ] || die 64 "working requires add|list|done|drop PROJECT_ID"
+  require_project "$project_id" dir
+  case "$action" in
+    list)
+      local -a args=(working --project-dir "$dir" --action list)
+      while [ $# -gt 0 ]; do
+        case "$1" in --session) args+=(--session "${2:-}"); shift 2 ;; --all) args+=(--status all); shift ;; --json) args+=(--json); shift ;; *) die 64 "unknown working list option: $1" ;; esac
+      done
+      memory_lineage "${args[@]}"
+      return
+      ;;
+    add)
+      text="${1:-}"; shift || true
+      while [ $# -gt 0 ]; do case "$1" in --kind) kind="${2:-}"; shift 2 ;; --session) session="${2:-}"; shift 2 ;; *) die 64 "unknown working add option: $1" ;; esac; done
+      [ -n "$text" ] || die 64 "working add requires PROJECT_ID TEXT [--kind todo|binding|constraint] [--session ID]"
+      validate_scalar "$text" || die 65 "working text must be a single line"
+      validate_scalar "$session" || die 65 "invalid session"
+      scan="$(mktemp "${TMPDIR:-/tmp}/llm-brain-working.XXXXXX")"
+      printf '%s\n' "$text" >"$scan"
+      if ! secret_scan_file "$scan"; then rm -f "$scan"; die 65 "working text matched the secret scanner"; fi
+      rm -f "$scan"
+      ;;
+    done|drop)
+      item="${1:-}"; shift || true
+      while [ $# -gt 0 ]; do case "$1" in --reason) text="${2:-}"; shift 2 ;; *) die 64 "unknown working option: $1" ;; esac; done
+      [ -n "$item" ] || die 64 "working $action requires PROJECT_ID ITEM_ID"
+      validate_id "$item" || die 64 "invalid item id"
+      validate_scalar "$text" || die 65 "invalid reason"
+      ;;
+    *) die 64 "working requires add, list, done or drop" ;;
+  esac
+  acquire_lock "project-$project_id"
+  if ! output="$(memory_lineage working --project-dir "$dir" --action "$action" --text "$text" --kind "$kind" --session "$session" --item "$item")"; then
+    release_lock; die 65 "working $action refused"
+  fi
+  audit_v2 "$dir" "working-$action" "$(printf '%s' "$output" | sed -n 's/.*item_id=\([^ ]*\).*/\1/p')" "" "$action" "$(sha256_file "$dir/working/items.tsv")" "kind=$kind"
+  release_lock
+  printf '%s project_id=%s\n' "$output" "$project_id"
+}
+
+cmd_constraints() {
+  local project_id="${1:-}" dir; shift || true
+  [ -n "$project_id" ] || die 64 "constraints requires PROJECT_ID [--turn N] [--every K]"
+  require_project "$project_id" dir
+  local -a args=(constraints --project-dir "$dir")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --turn|--every) require_positive_integer "${2:-}" || die 64 "$1 must be a positive integer"; args+=("$1" "$2"); shift 2 ;;
+      --principal) args+=(--principal "${2:-}"); shift 2 ;;
+      *) die 64 "unknown constraints option: $1" ;;
+    esac
+  done
+  memory_lineage "${args[@]}"
 }
 
 cmd_mcp() {
@@ -8933,7 +9350,7 @@ cmd_upgrade_repair_standalone() {
   [ -f "$source/bin/llm-brain" ] && [ "$(sha256_file "$source/bin/llm-brain")" = "$(sha256_file "$SCRIPT_SOURCE")" ] ||
     die 65 "release source CLI does not match the installed CLI"
   mkdir -p "$SCRIPT_DIR/lib"
-  for helper in okf.py replication.py memory_signals.py mcp_server.py; do
+  for helper in okf.py replication.py memory_signals.py memory_lineage.py mcp_server.py; do
     [ -f "$source/lib/$helper" ] || continue
     if [ ! -f "$SCRIPT_DIR/lib/$helper" ] || ! cmp -s "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; then
       install -m 0644 "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; repaired="$repaired lib/$helper"
@@ -8969,7 +9386,7 @@ upgrade_update_host() {
       install -m 0755 "$(upgrade_target_cli "$source")" "$target_dir/llm-brain"
       mkdir -p "$target_dir/lib"
       install -m 0644 "$source/lib/okf.py" "$target_dir/lib/okf.py"
-      for helper in replication.py memory_signals.py mcp_server.py; do
+      for helper in replication.py memory_signals.py memory_lineage.py mcp_server.py; do
         [ ! -f "$source/lib/$helper" ] || install -m 0644 "$source/lib/$helper" "$target_dir/lib/$helper"
       done
       if [ -d "$source/neural-expansion" ]; then
@@ -9483,6 +9900,15 @@ main() {
     usage) cmd_usage "$@" ;;
     stability) cmd_stability "$@" ;;
     intention) cmd_intention "$@" ;;
+    label) cmd_label "$@" ;;
+    lineage) cmd_lineage "$@" ;;
+    invalidate) cmd_invalidate "$@" ;;
+    gates) cmd_gates "$@" ;;
+    recall-check) cmd_sufficiency "$@" ;;
+    browse) cmd_browse "$@" ;;
+    state) cmd_state "$@" ;;
+    working) cmd_working "$@" ;;
+    constraints) cmd_constraints "$@" ;;
     mcp) cmd_mcp "$@" ;;
     neural-expansion|viewer) cmd_neural_expansion "$@" ;;
     bridge) cmd_bridge "$@" ;;
