@@ -1587,7 +1587,49 @@ def _neural_expansion_project(config: Dict[str, Any], cli: str, source_root: Pat
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value or "") else ""
 
 
-def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = None, principal: str = "") -> Dict[str, Any]:
+_NE_PROJECT_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+
+def _tsv_rows(path: Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return max(0, sum(1 for line in handle if line.strip()) - 1)
+    except OSError:
+        return 0
+
+
+def list_neural_expansion_projects(hermes_home: Optional[Path] = None) -> list:
+    """Registered projects with counts only (canonical records, graph edges, pending review)."""
+    home = hermes_home or _registration_hermes_home()
+    config = _load_config(home)
+    vault = Path(str(config.get("vault_root") or "")).expanduser()
+    registry = vault / "registry" / "projects.tsv"
+    rows = []
+    try:
+        lines = registry.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return rows
+    header = lines[0].split("\t") if lines else []
+    for line in lines[1:]:
+        cols = line.split("\t")
+        record = dict(zip(header, cols))
+        project_id = (record.get("project_id") or "").strip()
+        if not _NE_PROJECT_RE.fullmatch(project_id) or not (vault / "projects" / project_id).is_dir():
+            continue
+        root = vault / "projects" / project_id
+        try:
+            pending = sum(1 for item in (root / "review").iterdir() if item.suffix == ".md")
+        except OSError:
+            pending = 0
+        rows.append({"project_id": project_id, "alias": _safe_text(record.get("alias") or project_id)[:80],
+                     "records": _tsv_rows(root / "indexes" / "documents.tsv"),
+                     "relations": _tsv_rows(root / "indexes" / "graph.tsv"),
+                     "pending_review": pending})
+    seen = set()
+    return [row for row in rows if not (row["project_id"] in seen or seen.add(row["project_id"]))]
+
+
+def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = None, principal: str = "", project_id: str = "") -> Dict[str, Any]:
     """Build one Neural Expansion page; returns status, path and file URL."""
     mode = (mode or "demo").strip().lower()
     if mode not in _NE_MODES:
@@ -1612,7 +1654,12 @@ def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = Non
         if config.get("neural_expansion_export") is not True:
             return {"status": "disabled", "error": "real-brain export is off; set \"neural_expansion_export\": true in llm-brain.json (the demo needs no setting)"}
         source_root = _workspace(home)
-        project_id = _neural_expansion_project(config, cli, source_root)
+        project_id = (project_id or "").strip()
+        if project_id:
+            if project_id not in {row["project_id"] for row in list_neural_expansion_projects(home)}:
+                return {"status": "error", "error": "unknown project; use /neural-expansion projects"}
+        else:
+            project_id = _neural_expansion_project(config, cli, source_root)
         if not project_id:
             return {"status": "error", "error": "no LLM-Brain project for this workspace; set project_id in llm-brain.json"}
         principal = principal or _principal(config, {}, os.environ.get("HERMES_AGENT_IDENTITY", "default"))
@@ -1635,14 +1682,23 @@ def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = Non
     if stat.S_IMODE(output.stat().st_mode) != 0o600:
         output.unlink()
         return {"status": "error", "error": "output file did not keep 0600 permissions; refused"}
-    return {"status": "ok", "mode": mode, "data": data, "path": str(output), "url": output.as_uri(), "mode_bits": "0600"}
+    result = {"status": "ok", "mode": mode, "data": data, "path": str(output), "url": output.as_uri(), "mode_bits": "0600"}
+    if mode == "export":
+        result["project_id"] = project_id
+    return result
 
 
 def _neural_expansion_command(raw_args: str = "") -> str:
-    """``/neural-expansion [demo|export]`` slash-command handler."""
+    """``/neural-expansion [demo|export [PROJECT_ID]|projects]`` slash-command handler."""
     words = (raw_args or "").split()
     mode = words[0] if words else "demo"
-    result = build_neural_expansion(mode)
+    if mode == "projects":
+        rows = list_neural_expansion_projects()
+        if not rows:
+            return "Neural Expansion: no registered projects found"
+        return "Neural Expansion projects (records / relations / pending review):\n" + "\n".join(
+            f"- {row['project_id']} ({row['alias']}): {row['records']} / {row['relations']} / {row['pending_review']}" for row in rows)
+    result = build_neural_expansion(mode, project_id=words[1] if mode == "export" and len(words) > 1 else "")
     if result.get("status") != "ok":
         return f"Neural Expansion: {result.get('error', 'unavailable')}"
     label = "synthetic demo data" if result["data"] == "synthetic" else "your brain, principal-filtered, read-only"

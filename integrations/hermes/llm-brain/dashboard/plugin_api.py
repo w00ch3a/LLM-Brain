@@ -53,6 +53,17 @@ def status(request: Request):
             "cli_found": bool(plugin._find_cli(config))}
 
 
+@router.get("/projects")
+def projects(request: Request):
+    """Project picker data: ids, aliases and counts only (no record content)."""
+    _require_loopback(request)
+    plugin = _plugin()
+    config = plugin._load_config(plugin._registration_hermes_home())
+    if config.get("neural_expansion_export") is not True:
+        return {"projects": []}
+    return {"projects": plugin.list_neural_expansion_projects()}
+
+
 _CSP_META = ('<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
              'script-src \'unsafe-inline\'; style-src \'unsafe-inline\'; img-src data:; connect-src \'none\'">')
 
@@ -67,13 +78,22 @@ def with_csp(page: str) -> str:
 
 
 @router.get("/view")
-def view(request: Request, mode: str = "demo"):
+def view(request: Request, mode: str = "demo", project: str = ""):
     _require_loopback(request)
-    result = _plugin().build_neural_expansion(mode)
+    result = _plugin().build_neural_expansion(mode, project_id=project)
     if result.get("status") != "ok":
         raise HTTPException(status_code=409 if result.get("status") == "disabled" else 500, detail=result.get("error", "unavailable"))
     path = Path(result["path"])
-    if path.stat().st_size > _MAX_PAGE_BYTES:
-        raise HTTPException(status_code=413, detail="page too large")
+    try:
+        # The served copy is only a transport: read it, then remove it so
+        # private pages do not pile up under $HERMES_HOME/neural-expansion.
+        if path.stat().st_size > _MAX_PAGE_BYTES:
+            raise HTTPException(status_code=413, detail="page too large")
+        page = path.read_text(encoding="utf-8")
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
     return {"status": "ok", "mode": result["mode"], "data": result["data"], "file": path.name,
-            "html": with_csp(path.read_text(encoding="utf-8"))}
+            "project_id": result.get("project_id", ""), "html": with_csp(page)}

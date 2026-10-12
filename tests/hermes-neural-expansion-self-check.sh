@@ -130,9 +130,22 @@ assert local.get("/api/plugins/llm-brain/status").json()["export_enabled"] is Tr
 body = local.get("/api/plugins/llm-brain/view", params={"mode": "export"}).json()
 assert body["data"] == "principal-filtered" and "connect-src 'none'" in body["html"] and "Record secret" not in body["html"], body.keys()
 assert local.get("/api/plugins/llm-brain/view", params={"mode": "demo"}).json()["data"] == "synthetic"
+# Served copies are removed after the page is returned.
+assert not list((home / "neural-expansion").glob("*.html")) or all(p == page_path for p in (home / "neural-expansion").glob("*.html")), list((home / "neural-expansion").iterdir())
+# Project picker: counts only, explicit project export, unknown ids refused.
+rows = local.get("/api/plugins/llm-brain/projects").json()["projects"]
+row = [r for r in rows if r["project_id"] == project_id]
+assert row and row[0]["records"] >= 3 and set(row[0]) == {"project_id", "alias", "records", "relations", "pending_review"}, rows
+body = local.get("/api/plugins/llm-brain/view", params={"mode": "export", "project": project_id}).json()
+assert body["project_id"] == project_id and "Record alpha" in body["html"]
+assert local.get("/api/plugins/llm-brain/view", params={"mode": "export", "project": "nope"}).status_code == 500
+assert "unknown project" in handler("export nope")
+listing = handler("projects")
+assert project_id in listing and "Record" not in listing, listing
 remote = TestClient(app, client=("192.0.2.10", 50000))
 assert remote.get("/api/plugins/llm-brain/view").status_code == 403
 assert remote.get("/api/plugins/llm-brain/status").status_code == 403
+assert remote.get("/api/plugins/llm-brain/projects").status_code == 403
 print("hermes_neural_expansion=ok")
 PY
 printf 'hermes neural expansion self-check passed\n'

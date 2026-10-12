@@ -21,18 +21,22 @@ function makePage(rest) {
     const [mode, setMode] = useState('demo')
     const [html, setHtml] = useState('')
     const [error, setError] = useState('')
+    const [projects, setProjects] = useState([])
+    const [project, setProject] = useState('')
 
-    const load = next => {
+    const load = (next, chosen = project) => {
       setMode(next)
       setError('')
       setHtml('')
-      rest(`/view?mode=${encodeURIComponent(next)}`)
+      const query = next === 'export' && chosen ? `&project=${encodeURIComponent(chosen)}` : ''
+      rest(`/view?mode=${encodeURIComponent(next)}${query}`)
         .then(r => setHtml((r && r.html) || ''))
         .catch(e => setError(String((e && e.message) || e)))
     }
 
     useEffect(() => {
       rest('/status').then(setStatus).catch(e => setError(String((e && e.message) || e)))
+      rest('/projects').then(r => setProjects((r && r.projects) || [])).catch(() => setProjects([]))
       load('demo')
     }, [])
 
@@ -66,6 +70,16 @@ function makePage(rest) {
             button('My brain', 'export', !exportEnabled,
               exportEnabled ? "This profile's brain, principal-filtered, read-only"
                 : 'Set "neural_expansion_export": true in llm-brain.json on the Hermes host'),
+            exportEnabled && projects.length
+              ? jsx('select', {
+                  value: project,
+                  title: 'Project (records / relations / pending review)',
+                  onChange: e => { setProject(e.target.value); load('export', e.target.value) },
+                  style: { padding: '3px 6px', borderRadius: '6px', background: 'transparent', color: 'inherit', border: '1px solid var(--ui-border, #555)' },
+                  children: [jsx('option', { value: '', children: 'Detected project' }, '')].concat(projects.map(p =>
+                    jsx('option', { value: p.project_id, children: `${p.alias} (${p.records} records, ${p.relations} relations, ${p.pending_review} pending)` }, p.project_id)))
+                })
+              : null,
             jsx('span', { style: { opacity: 0.7 }, children: mode === 'demo' ? 'Synthetic data only.' : 'Principal-filtered snapshot with label lineage.' }),
             error ? jsx('span', { style: { color: '#d66' }, children: error }) : null
           ]
