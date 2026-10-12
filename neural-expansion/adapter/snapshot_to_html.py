@@ -15,6 +15,7 @@ import re
 import stat
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -146,6 +147,7 @@ def attach_lineage(payload: dict, project_root: Path) -> None:
 PENDING_SHOWN_CAP = 300
 PENDING_SCAN_LIMIT = 20000
 PENDING_HEAD_BYTES = 16384
+PENDING_READ_WORKERS = 16
 PENDING_STATES = {"proposed", "pending", "needs-review", "unreviewed"}
 DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
@@ -219,10 +221,11 @@ def attach_pending(payload: dict, project_root: Path, principal: str, cap: int =
         entries = sorted(review.iterdir())
     except OSError:
         return
-    for path in entries[:PENDING_SCAN_LIMIT]:
-        if path.suffix != ".md" or path.is_symlink():
-            continue
-        meta = _read_frontmatter_head(path)
+    candidates = [path for path in entries[:PENDING_SCAN_LIMIT] if path.suffix == ".md"]
+    # Network vaults (CIFS/NFS) are latency-bound: read frontmatter heads in parallel.
+    with ThreadPoolExecutor(max_workers=PENDING_READ_WORKERS) as pool:
+        heads = list(pool.map(_read_frontmatter_head, candidates))
+    for path, meta in zip(candidates, heads):
         if meta is None or meta.get("type") != "ReviewItem":
             continue
         if not _pending_visible(meta, principal):
