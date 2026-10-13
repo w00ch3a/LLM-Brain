@@ -338,6 +338,46 @@ class LocalSnapshotHtmlTests(unittest.TestCase):
         _, fixture = self._fixture(result)
         self.assertFalse(any(node.get("unreviewed") for node in fixture["nodes"]))
 
+    def test_all_projects_merge_groups_by_project_and_skips_locked(self):
+        from snapshot_to_html import build_all_projects_html
+        second = self.vault / "projects" / "second"
+        second.mkdir()
+        write_synthetic_project(second)
+        third = self.vault / "projects" / "third"
+        third.mkdir()
+        write_synthetic_project(third)
+        (self.vault / ".locks" / "project-third.lock").mkdir(parents=True)
+        self._review("pending-open")
+        seen = []
+        result = build_all_projects_html(self.vault, ["demo", "second", "third"], "alice", self.output,
+                                         progress=lambda done, total, pid, ok: seen.append((done, total, pid, ok)))
+        html, fixture = self._fixture(result)
+        self.assertEqual(stat.S_IMODE(result.stat().st_mode), 0o600)
+        self.assertEqual(sorted(row[2:] for row in seen), [("demo", True), ("second", True), ("third", False)])
+        self.assertEqual(sorted(row[0] for row in seen), [1, 2, 3])
+        ids = {node["id"] for node in fixture["nodes"]}
+        self.assertTrue({"project/demo", "project/second", "okf/claims/alice.md#demo", "okf/claims/alice.md#second",
+                         "review/pending-open.md#demo"} <= ids)
+        self.assertFalse(any(i.endswith("#third") or i == "project/third" for i in ids))
+        self.assertNotIn("okf/claims/bob.md", html)
+        self.assertNotIn("SECRET BODY", html)
+        self.assertIn({"source": "okf/claims/alice.md#second", "relation": "in_project", "target": "project/second"}, fixture["edges"])
+        self.assertIn({"source": "okf/claims/alice.md#demo", "relation": "supports", "target": "okf/claims/open.md#demo"}, fixture["edges"])
+        meta = fixture["meta"]
+        self.assertEqual([row["project_id"] for row in meta["projects"]], ["demo", "second"])
+        self.assertEqual(meta["skipped"][0]["project_id"], "third")
+        self.assertEqual(meta["reviewed_total"], 4)
+        self.assertEqual(meta["pending"]["total"], 1)
+        self.assertEqual(meta["pending"]["cap"], 200)
+        self.assertTrue(all(edge["source"] in ids and edge["target"] in ids for edge in fixture["edges"]))
+
+    def test_all_projects_rejects_bad_ids_and_vault_output(self):
+        from snapshot_to_html import build_all_projects_html
+        with self.assertRaisesRegex(LocalSnapshotError, "invalid project ID"):
+            build_all_projects_html(self.vault, ["demo", "../x"], "alice", self.output)
+        with self.assertRaisesRegex(LocalSnapshotError, "outside the vault"):
+            build_all_projects_html(self.vault, ["demo"], "alice", self.vault / "x.html")
+
     def test_output_must_be_new_and_outside_vault(self):
         with self.assertRaisesRegex(LocalSnapshotError, "outside the vault"):
             build_local_snapshot_html(self.vault, "demo", "alice", self.vault / "neural-expansion.html")

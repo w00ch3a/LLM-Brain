@@ -10,7 +10,7 @@
  * Nothing is written to disk on the desktop side.
  */
 import { host, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PATH = '/neural-expansion'
@@ -23,16 +23,48 @@ function makePage(rest) {
     const [error, setError] = useState('')
     const [projects, setProjects] = useState([])
     const [project, setProject] = useState('')
+    const [progress, setProgress] = useState('')
+    const token = useRef(0)
+
+    // "View all": the backend builds every project in parallel; poll its progress.
+    const loadAll = (mine) => {
+      setProgress('Loading all projects…')
+      rest('/view-all/start')
+        .then(started => {
+          const poll = () => {
+            if (token.current !== mine) return
+            rest(`/view-all/status?job=${encodeURIComponent(started.job)}`)
+              .then(r => {
+                if (token.current !== mine) return
+                if (r && r.status === 'ok') {
+                  setProgress(r.skipped ? `${r.total - r.skipped} of ${r.total} projects loaded (${r.skipped} skipped)` : '')
+                  setHtml(r.html || '')
+                } else {
+                  setProgress(`Loading all projects… ${(r && r.done) || 0}/${(r && r.total) || started.total}` + (r && r.skipped ? ` (${r.skipped} skipped)` : ''))
+                  setTimeout(poll, 1200)
+                }
+              })
+              .catch(e => { if (token.current === mine) { setProgress(''); setError(String((e && e.message) || e)) } })
+          }
+          poll()
+        })
+        .catch(e => { if (token.current === mine) { setProgress(''); setError(String((e && e.message) || e)) } })
+    }
 
     const load = (next, chosen = project) => {
+      const mine = ++token.current
       setMode(next)
       setError('')
       setHtml('')
+      setProgress('')
+      if (next === 'export' && chosen === '__all__') return loadAll(mine)
       const query = next === 'export' && chosen ? `&project=${encodeURIComponent(chosen)}` : ''
       rest(`/view?mode=${encodeURIComponent(next)}${query}`)
-        .then(r => setHtml((r && r.html) || ''))
-        .catch(e => setError(String((e && e.message) || e)))
+        .then(r => { if (token.current === mine) setHtml((r && r.html) || '') })
+        .catch(e => { if (token.current === mine) setError(String((e && e.message) || e)) })
     }
+
+    useEffect(() => () => { token.current += 1 }, [])
 
     useEffect(() => {
       rest('/status').then(setStatus).catch(e => setError(String((e && e.message) || e)))
@@ -76,11 +108,13 @@ function makePage(rest) {
                   title: 'Project (records / relations / pending review)',
                   onChange: e => { setProject(e.target.value); load('export', e.target.value) },
                   style: { padding: '3px 6px', borderRadius: '6px', background: 'transparent', color: 'inherit', border: '1px solid var(--ui-border, #555)' },
-                  children: [jsx('option', { value: '', children: 'Detected project' }, '')].concat(projects.map(p =>
+                  children: [jsx('option', { value: '', children: 'Detected project' }, ''),
+                    jsx('option', { value: '__all__', children: `View all (All projects: ${projects.reduce((n, p) => n + p.records, 0)} records, ${projects.reduce((n, p) => n + p.pending_review, 0)} pending)` }, '__all__')].concat(projects.map(p =>
                     jsx('option', { value: p.project_id, children: `${p.alias} (${p.records} records, ${p.relations} relations, ${p.pending_review} pending)` }, p.project_id)))
                 })
               : null,
             jsx('span', { style: { opacity: 0.7 }, children: mode === 'demo' ? 'Synthetic data only.' : 'Principal-filtered snapshot with label lineage.' }),
+            progress ? jsx('span', { role: 'status', style: { opacity: 0.85 }, children: progress }) : null,
             error ? jsx('span', { style: { color: '#d66' }, children: error }) : null
           ]
         }),

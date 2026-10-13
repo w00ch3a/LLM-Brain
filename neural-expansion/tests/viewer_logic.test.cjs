@@ -128,3 +128,18 @@ test("unreviewed nodes get their own state and can be hidden with their edges", 
   assert.equal(hidden.edges.length, 2);
   assert.equal(Core.recordLayer(withPending.nodes[4]), "Review queue · day cluster (unreviewed)");
 });
+
+test("project hub nodes have their own layer and search matches the project name", () => {
+  const merged = {
+    nodes: [
+      { id: "project/alpha", title: "alpha", type: "Project", status: "project", project: "alpha" },
+      { id: "okf/a.md#alpha", title: "Thing", type: "Claim", status: "stable", project: "alpha" },
+      { id: "okf/a.md#beta", title: "Thing", type: "Claim", status: "stable", project: "beta" },
+    ],
+    edges: [{ source: "okf/a.md#alpha", relation: "in_project", target: "project/alpha" }],
+  };
+  assert.equal(Core.recordLayer(merged.nodes[0]), "Project group");
+  assert.equal(Core.recordLayer(merged.nodes[1]), "Canonical OKF");
+  assert.deepEqual(Core.visibleGraph(merged, "beta").nodes.map((n) => n.id), ["okf/a.md#beta"]);
+  assert.equal(Core.visibleGraph(merged, "", "project").nodes.length, 1);
+});

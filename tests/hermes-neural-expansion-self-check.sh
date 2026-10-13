@@ -49,6 +49,10 @@ done
 "$cli" --root "$vault" label add "$project_id" okf/claims/beta.md superseded-by --target okf/claims/alpha.md --reason 'fixture' >/dev/null
 "$cli" --root "$vault" label add "$project_id" okf/claims/alpha.md decision-point:storage --reason 'fixture' >/dev/null
 "$cli" --root "$vault" index build "$project_id" >/dev/null
+# A second, empty project for the merged "View all" page.
+mkdir -p "$fixture/workspace2"
+"$cli" --root "$vault" project ensure "$fixture/workspace2" --id proj_hermes_ne_second >/dev/null
+"$cli" --root "$vault" index build proj_hermes_ne_second >/dev/null
 
 package_dir="$fixture/package"
 "$repo_root/scripts/package-hermes-plugin.sh" "$package_dir" >/dev/null
@@ -142,7 +146,24 @@ assert local.get("/api/plugins/llm-brain/view", params={"mode": "export", "proje
 assert "unknown project" in handler("export nope")
 listing = handler("projects")
 assert project_id in listing and "Record" not in listing, listing
+# View all: background merged build with progress, page served once then removed.
+import time
+started = local.get("/api/plugins/llm-brain/view-all/start").json()
+assert started["status"] == "started" and started["total"] == 2, started
+for _ in range(240):
+    state = local.get("/api/plugins/llm-brain/view-all/status", params={"job": started["job"]}).json()
+    if state["status"] == "ok":
+        break
+    assert state["status"] == "running" and 0 <= state["done"] <= 2, state
+    time.sleep(0.5)
+assert state["status"] == "ok" and state["done"] == 2 and state["skipped"] == 0, {k: state[k] for k in state if k != "html"}
+assert "project/" + project_id in state["html"] and "project/proj_hermes_ne_second" in state["html"]
+assert "Record alpha" in state["html"] and "Record secret" not in state["html"] and "connect-src 'none'" in state["html"]
+assert not list((home / "neural-expansion").glob("neural-expansion-all-*.html")), "served All projects copy not removed"
+assert local.get("/api/plugins/llm-brain/view-all/status", params={"job": started["job"]}).status_code == 404
 remote = TestClient(app, client=("192.0.2.10", 50000))
+assert remote.get("/api/plugins/llm-brain/view-all/start").status_code == 403
+assert remote.get("/api/plugins/llm-brain/view-all/status", params={"job": "x"}).status_code == 403
 assert remote.get("/api/plugins/llm-brain/view").status_code == 403
 assert remote.get("/api/plugins/llm-brain/status").status_code == 403
 assert remote.get("/api/plugins/llm-brain/projects").status_code == 403

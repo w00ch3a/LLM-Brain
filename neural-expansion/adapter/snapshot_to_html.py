@@ -15,7 +15,7 @@ import re
 import stat
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -293,17 +293,7 @@ def attach_pending(payload: dict, project_root: Path, principal: str, cap: int =
     summary.update(shown=len(shown), clustered=len(rest), clusters=len(days))
 
 
-def build_local_snapshot_html(
-    vault_root_arg: Path,
-    project_id: str,
-    principal: str,
-    output_arg: Path,
-    include_pending: bool = True,
-) -> Path:
-    """Read one explicit project snapshot, filter it, and write owner-only HTML."""
-    if not PROJECT_ID_RE.fullmatch(project_id) or project_id in {".", ".."}:
-        raise LocalSnapshotError("invalid project ID")
-    _validate_principal(principal)
+def _resolve_vault(vault_root_arg: Path) -> Path:
     if not vault_root_arg.is_absolute() or vault_root_arg.is_symlink():
         raise LocalSnapshotError("vault root must be an absolute, non-symlink directory")
     try:
@@ -312,7 +302,12 @@ def build_local_snapshot_html(
         raise LocalSnapshotError("vault root is unavailable") from exc
     if not vault_root.is_dir():
         raise LocalSnapshotError("vault root is unavailable")
+    return vault_root
 
+
+def _resolve_project(vault_root: Path, project_id: str) -> Path:
+    if not PROJECT_ID_RE.fullmatch(project_id) or project_id in {".", ".."}:
+        raise LocalSnapshotError("invalid project ID")
     projects = vault_root / "projects"
     project_path = projects / project_id
     if projects.is_symlink() or project_path.is_symlink() or not project_path.is_dir():
@@ -324,8 +319,12 @@ def build_local_snapshot_html(
         raise LocalSnapshotError("selected project is unavailable") from exc
     if project_root.parent != projects_real:
         raise LocalSnapshotError("selected project is unavailable")
+    return project_root
 
-    output = _validate_output(output_arg, vault_root)
+
+def _project_payload(vault_root: Path, project_root: Path, project_id: str, principal: str,
+                     include_pending: bool, cap: int) -> dict:
+    """Filtered payload for one project, built from a private hardened snapshot."""
     _assert_no_writer(vault_root, project_id)
     try:
         with tempfile.TemporaryDirectory(prefix="llm-brain-neural-expansion-") as private_temp:
@@ -336,27 +335,160 @@ def build_local_snapshot_html(
             payload = build_export(package, principal)
             attach_lineage(payload, project_root)
             if include_pending:
-                attach_pending(payload, project_root, principal)
-            _assert_no_writer(vault_root, project_id)
-            page = render_html(
-                payload,
-                "NEURAL EXPANSION · LOCAL SNAPSHOT · PRINCIPAL-FILTERED · READ ONLY",
-            )
-            _write_owner_only_new_file(output, page)
+                attach_pending(payload, project_root, principal, cap=cap)
     except (ExportError, OSError) as exc:
         raise LocalSnapshotError("consistent filtered snapshot unavailable") from exc
+    _assert_no_writer(vault_root, project_id)
+    return payload
+
+
+def _render_and_write(payload: dict, output: Path) -> None:
+    page = render_html(payload, "NEURAL EXPANSION · LOCAL SNAPSHOT · PRINCIPAL-FILTERED · READ ONLY")
+    try:
+        _write_owner_only_new_file(output, page)
+    except OSError as exc:
+        raise LocalSnapshotError("consistent filtered snapshot unavailable") from exc
+
+
+def build_local_snapshot_html(
+    vault_root_arg: Path,
+    project_id: str,
+    principal: str,
+    output_arg: Path,
+    include_pending: bool = True,
+) -> Path:
+    """Read one explicit project snapshot, filter it, and write owner-only HTML."""
+    if not PROJECT_ID_RE.fullmatch(project_id) or project_id in {".", ".."}:
+        raise LocalSnapshotError("invalid project ID")
+    _validate_principal(principal)
+    vault_root = _resolve_vault(vault_root_arg)
+    project_root = _resolve_project(vault_root, project_id)
+    output = _validate_output(output_arg, vault_root)
+    payload = _project_payload(vault_root, project_root, project_id, principal, include_pending, PENDING_SHOWN_CAP)
+    _render_and_write(payload, output)
+    return output
+
+
+ALL_PROJECTS_SHOWN_BUDGET = 600
+ALL_PROJECTS_MIN_CAP = 20
+ALL_PROJECTS_WORKERS = 4
+
+
+def merge_project_payloads(results: list) -> dict:
+    """Merge per-project payloads into one graph grouped by a node per project.
+
+    ``results`` holds ``(project_id, payload_or_None, error_text)`` tuples.
+    Node ids are suffixed with ``#<project>`` so equal paths in different
+    projects stay distinct (the path prefix still drives the record layer).
+    """
+    nodes: list = []
+    edges: list = []
+    per_project: list = []
+    totals = {"total": 0, "shown": 0, "clustered": 0, "clusters": 0, "excluded": 0}
+    skipped = []
+    for project_id, payload, error in results:
+        if payload is None:
+            skipped.append({"project_id": project_id, "reason": error or "unavailable"})
+            continue
+        suffix = "#" + project_id
+        hub = "project/" + project_id
+        pending = (payload.get("meta") or {}).get("pending") or {}
+        reviewed = [node for node in payload.get("nodes", []) if not node.get("unreviewed")]
+        unreviewed = [node for node in payload.get("nodes", []) if node.get("unreviewed")]
+        nodes.append({
+            "id": hub, "title": f"{project_id} · {len(reviewed)} reviewed · {int(pending.get('total') or 0)} unreviewed",
+            "type": "Project", "status": "project", "trust": "grouping", "generated": "",
+            "provenance": "Project registry", "project": project_id,
+            "excerpt": f"{len(reviewed)} reviewed records and {int(pending.get('total') or 0)} unreviewed review-queue items visible to this principal.",
+        })
+        for node in payload.get("nodes", []):
+            copy = dict(node)
+            copy["id"] = node["id"] + suffix
+            copy["project"] = project_id
+            nodes.append(copy)
+            if not node.get("unreviewed") or node.get("type") == "UnreviewedBatch":
+                edges.append({"source": copy["id"], "relation": "in_project", "target": hub})
+        for edge in payload.get("edges", []):
+            edges.append({"source": edge["source"] + suffix, "relation": edge["relation"], "target": edge["target"] + suffix})
+        for key in totals:
+            totals[key] += int(pending.get(key) or 0)
+        per_project.append({"project_id": project_id, "reviewed": len(reviewed), "unreviewed_total": int(pending.get("total") or 0),
+                            "unreviewed_shown": int(pending.get("shown") or 0), "unreviewed_clustered": int(pending.get("clustered") or 0),
+                            "unreviewed_nodes": len(unreviewed)})
+    totals["cap"] = "per project"
+    meta = {
+        "project": f"All projects ({len(per_project)} of {len(results)})",
+        "version": "0.9.2", "privacy": "Principal-filtered snapshot",
+        "pending": totals, "projects": per_project, "skipped": skipped,
+        "reviewed_total": sum(row["reviewed"] for row in per_project),
+    }
+    return {"meta": meta, "nodes": nodes, "edges": edges}
+
+
+def build_all_projects_html(
+    vault_root_arg: Path,
+    project_ids: list,
+    principal: str,
+    output_arg: Path,
+    include_pending: bool = True,
+    progress=None,
+    workers: int = ALL_PROJECTS_WORKERS,
+) -> Path:
+    """Build one merged page for several projects, in parallel, owner-only.
+
+    Each project goes through the same snapshot/filter/pending path as a
+    single-project export (with a smaller per-project cap so the merged graph
+    stays responsive).  A project that is locked by a writer or cannot be
+    snapshotted is listed in ``meta.skipped`` instead of failing the page.
+    ``progress(done, total, project_id, ok)`` is called as each finishes.
+    """
+    _validate_principal(principal)
+    ids = list(dict.fromkeys(project_ids))
+    if not ids:
+        raise LocalSnapshotError("no projects selected")
+    for project_id in ids:
+        if not PROJECT_ID_RE.fullmatch(project_id) or project_id in {".", ".."}:
+            raise LocalSnapshotError("invalid project ID")
+    vault_root = _resolve_vault(vault_root_arg)
+    output = _validate_output(output_arg, vault_root)
+    cap = max(ALL_PROJECTS_MIN_CAP, ALL_PROJECTS_SHOWN_BUDGET // len(ids))
+
+    def one(project_id):
+        try:
+            root = _resolve_project(vault_root, project_id)
+            return project_id, _project_payload(vault_root, root, project_id, principal, include_pending, cap), ""
+        except LocalSnapshotError as exc:
+            return project_id, None, str(exc)
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(one, project_id): project_id for project_id in ids}
+        for done, future in enumerate(as_completed(futures), 1):
+            project_id, payload, error = future.result()
+            results[project_id] = (project_id, payload, error)
+            if progress:
+                progress(done, len(ids), project_id, payload is not None)
+    merged = merge_project_payloads([results[project_id] for project_id in ids])
+    merged["meta"]["pending"]["cap"] = cap
+    _render_and_write(merged, output)
     return output
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vault-root", required=True, type=Path, help="explicit local LLM-Brain vault root")
-    parser.add_argument("--project-id", required=True, help="exact registered project ID")
+    parser.add_argument("--project-id", required=True, action="append",
+                        help="exact registered project ID; repeat it to merge several projects into one page")
     parser.add_argument("--principal", required=True, help="existing LLM-Brain principal filter (not authentication)")
     parser.add_argument("--output", required=True, type=Path, help="new absolute .html output path outside the vault")
     args = parser.parse_args()
     try:
-        result = build_local_snapshot_html(args.vault_root, args.project_id, args.principal, args.output)
+        if len(args.project_id) == 1:
+            result = build_local_snapshot_html(args.vault_root, args.project_id[0], args.principal, args.output)
+        else:
+            def report(done, total, project_id, ok):
+                print(f"ne-progress {done}/{total} {'ok' if ok else 'skipped'}", file=sys.stderr, flush=True)
+            result = build_all_projects_html(args.vault_root, args.project_id, args.principal, args.output, progress=report)
     except LocalSnapshotError as exc:
         print(str(exc), file=sys.stderr)
         return 2

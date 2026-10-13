@@ -114,7 +114,7 @@ Commands:
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
   mcp serve [--brain PATH] [--project-id ID] [--read-only]   One process = one brain (vault root)
   neural-expansion demo [--output FILE.html] [--open] | neural-expansion path
-  neural-expansion export PROJECT_ID --principal ID --output FILE.html [--open]   Experimental; LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1
+  neural-expansion export PROJECT_ID [--also PROJECT_ID ...] --principal ID --output FILE.html [--open]   Experimental; LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1
   maintenance schedule declare PROJECT_ID --name TEXT --cadence TEXT [--runner hermes|codex|cron|other] [--max-age-days N]
   maintenance schedule disable PROJECT_ID
   bridge recall --source-root PATH [--project-id ID] --query-file FILE [--principal ID] [--intent INTENT] [--strategy lexical|vector|hybrid] [--budget-tokens N] [--require-evidence] [--exploratory] [--receipt]
@@ -7902,11 +7902,16 @@ cmd_neural_expansion() {
       ;;
     export)
       project_id="${1:-}"; shift || true
+      extra_projects=()
       [ -n "$project_id" ] || die 64 "neural-expansion export requires PROJECT_ID --principal ID --output FILE.html"
       while [ $# -gt 0 ]; do
         case "$1" in
           --principal) principal="${2:-}"; shift 2 ;;
           --output) output="${2:-}"; shift 2 ;;
+          --also)
+            validate_id "${2:-}" || die 64 "invalid project id"
+            require_project "${2:-}" >/dev/null
+            extra_projects+=(--project-id "$2"); shift 2 ;;
           --open) open=1; shift ;;
           *) die 64 "unknown neural-expansion export option: $1" ;;
         esac
@@ -7921,7 +7926,7 @@ cmd_neural_expansion() {
       case "$output" in /*) ;; *) output="$CWD/$output" ;; esac
       require_project "$project_id" >/dev/null
       resolve_okf_runtime
-      PYTHONDONTWRITEBYTECODE=1 "$OKF_PYTHON" "$home/adapter/snapshot_to_html.py" --vault-root "$(cd "$ROOT" && pwd -P)" --project-id "$project_id" --principal "$principal" --output "$output" >/dev/null || die 70 "neural-expansion export failed; build the index first and retry when no writer is active"
+      PYTHONDONTWRITEBYTECODE=1 "$OKF_PYTHON" "$home/adapter/snapshot_to_html.py" --vault-root "$(cd "$ROOT" && pwd -P)" --project-id "$project_id" ${extra_projects[@]+"${extra_projects[@]}"} --principal "$principal" --output "$output" >/dev/null || die 70 "neural-expansion export failed; build the index first and retry when no writer is active"
       printf 'neural_expansion=export project_id=%s principal=%s file=%s mode=0600\n' "$project_id" "$principal" "$output"
       [ "$open" = 0 ] || neural_expansion_open "$output"
       ;;

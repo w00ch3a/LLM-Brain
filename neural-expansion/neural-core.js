@@ -18,7 +18,7 @@
       if (hideUnreviewed && isUnreviewed(node)) return false;
       if (status !== "all" && node.status !== status) return false;
       if (!needle) return true;
-      return [node.id, node.title, node.type, node.status, node.provenance, node.excerpt]
+      return [node.id, node.title, node.type, node.status, node.provenance, node.excerpt, node.project]
         .join(" ")
         .toLocaleLowerCase()
         .includes(needle);
@@ -155,6 +155,7 @@
   }
 
   function recordLayer(node) {
+    if (node?.type === "Project") return "Project group";
     if (String(node?.id || "").startsWith("review-day/")) return "Review queue · day cluster (unreviewed)";
     if (node?.type === "AssociativeProjection") return "Derived projection";
     if (String(node?.id || "").startsWith("review/")) return "Review / quarantine";

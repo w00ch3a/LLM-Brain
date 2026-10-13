@@ -11,6 +11,7 @@
     Episode: "#a8bdcd",
     ReviewItem: "#ff7889",
     UnreviewedBatch: "#ff9aa8",
+    Project: "#ffe7a3",
     AssociativeProjection: "#e58cff",
     default: "#82b9ff",
   };
@@ -74,7 +75,7 @@
   const pendingNote = byId("pendingNote");
   const unreviewedTotal = nodes.filter((node) => Core.isUnreviewed(node)).length;
   let hideUnreviewed = false;
-  const pendingRelations = new Set(["captured_on", "follows"]);
+  const pendingRelations = new Set(["captured_on", "follows", "in_project"]);
   const visible = () => Core.visibleGraph(graph, search.value, filter.value, hideUnreviewed);
   const unreviewedBadge = '<span class="badge-unreviewed">Unreviewed</span>';
   const project = (point) => Core.projectPoint(point, camera, width, height);
@@ -790,6 +791,14 @@
     if (n(pendingMeta.excluded)) note += ` · ${n(pendingMeta.excluded)} other items not shown (restricted, redaction, other principals or resolved)`;
     if (pendingMeta.truncated_scan) note += " · review folder exceeded scan limit";
     pendingNote.textContent = note;
+    pendingNote.hidden = false;
+  }
+  if (data.meta && Array.isArray(data.meta.projects)) {
+    const n = (value) => Number(value) || 0;
+    const skipped = Array.isArray(data.meta.skipped) ? data.meta.skipped : [];
+    let note = `All projects: ${data.meta.projects.length} loaded · ${n(data.meta.reviewed_total)} reviewed records · ${n(pendingMeta && pendingMeta.total)} unreviewed items (up to ${escapeHTML(String(pendingMeta && pendingMeta.cap))} shown per project)`;
+    if (skipped.length) note += ` · ${skipped.length} skipped: ` + skipped.map((row) => `${row.project_id} (${row.reason})`).join(", ");
+    pendingNote.textContent = note + (pendingNote.hidden ? "" : " — " + pendingNote.textContent);
     pendingNote.hidden = false;
   }
   byId("clear").addEventListener("click", clearSearchAndSelection);

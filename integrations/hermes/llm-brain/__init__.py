@@ -1688,6 +1688,114 @@ def build_neural_expansion(mode: str = "demo", hermes_home: Optional[Path] = Non
     return result
 
 
+NE_ALL = "__all__"
+_NE_JOBS: Dict[str, Dict[str, Any]] = {}
+_NE_JOBS_LOCK = threading.Lock()
+_NE_JOB_TTL = 900
+
+
+def _ne_prune_jobs() -> None:
+    now = __import__("time").time()
+    with _NE_JOBS_LOCK:
+        for job_id, job in list(_NE_JOBS.items()):
+            if job.get("finished") and now - job["finished"] > _NE_JOB_TTL:
+                path = job.get("path")
+                if path:
+                    try:
+                        Path(path).unlink()
+                    except OSError:
+                        pass
+                _NE_JOBS.pop(job_id, None)
+
+
+def start_neural_expansion_all(hermes_home: Optional[Path] = None, principal: str = "") -> Dict[str, Any]:
+    """Start a merged "All projects" export in the background; poll with neural_expansion_job()."""
+    _ne_prune_jobs()
+    home = hermes_home or _registration_hermes_home()
+    config = _load_config(home)
+    if config.get("neural_expansion_export") is not True:
+        return {"status": "disabled", "error": "real-brain export is off; set \"neural_expansion_export\": true in llm-brain.json"}
+    cli = _find_cli(config)
+    if not cli:
+        return {"status": "error", "error": "llm-brain CLI not found (set cli_path in llm-brain.json)"}
+    ids = [row["project_id"] for row in list_neural_expansion_projects(home)]
+    if not ids:
+        return {"status": "error", "error": "no registered projects"}
+    try:
+        out_dir = _neural_expansion_dir(home, str(config.get("vault_root") or ""))
+    except (OSError, _NEOutputError) as exc:
+        return {"status": "error", "error": f"no private output directory: {exc}"}
+    with _NE_JOBS_LOCK:
+        if sum(1 for job in _NE_JOBS.values() if not job.get("finished")) >= 2:
+            return {"status": "error", "error": "an All projects build is already running; wait for it to finish"}
+    stamp = _sha(f"all|{os.getpid()}|{threading.get_ident()}|{__import__('time').time_ns()}")[:12]
+    output = out_dir / f"neural-expansion-all-{stamp}.html"
+    principal = principal or _principal(config, {}, os.environ.get("HERMES_AGENT_IDENTITY", "default"))
+    command = [cli, "--root", str(config["vault_root"]), "neural-expansion", "export", ids[0]]
+    for extra in ids[1:]:
+        command += ["--also", extra]
+    command += ["--principal", principal, "--output", str(output)]
+    env = os.environ.copy()
+    env["LLM_BRAIN_NEURAL_EXPANSION_EXPORT"] = "1"
+    job = {"status": "running", "done": 0, "total": len(ids), "skipped": 0, "path": "", "error": "", "finished": 0}
+    with _NE_JOBS_LOCK:
+        _NE_JOBS[stamp] = job
+
+    def run() -> None:
+        import time as _time
+        old_umask = os.umask(0o077)
+        try:
+            proc = subprocess.Popen(command, cwd=str(_workspace(home)), env=env, text=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except OSError:
+            job.update(status="error", error="Neural Expansion build failed", finished=_time.time())
+            return
+        finally:
+            os.umask(old_umask)
+        timer = threading.Timer(NEURAL_EXPANSION_TIMEOUT * 2, proc.kill)
+        timer.start()
+        last = ""
+        try:
+            for line in proc.stderr:
+                match = re.match(r"ne-progress (\d+)/(\d+) (ok|skipped)", line.strip())
+                if match:
+                    job["done"] = int(match.group(1))
+                    if match.group(3) == "skipped":
+                        job["skipped"] += 1
+                elif line.strip():
+                    last = line.strip()
+            proc.wait()
+        finally:
+            timer.cancel()
+        if proc.returncode != 0 or not output.is_file() or output.is_symlink():
+            if not output.is_symlink():
+                output.unlink(missing_ok=True)
+            job.update(status="error", error="Neural Expansion build failed" + (f": {_safe_text(last)}" if last else ""), finished=_time.time())
+            return
+        os.chmod(output, 0o600)
+        if stat.S_IMODE(output.stat().st_mode) != 0o600:
+            output.unlink()
+            job.update(status="error", error="output file did not keep 0600 permissions; refused", finished=_time.time())
+            return
+        job.update(status="ok", path=str(output), finished=_time.time())
+
+    threading.Thread(target=run, name="llm-brain-ne-all", daemon=True).start()
+    return {"status": "started", "job": stamp, "total": len(ids)}
+
+
+def neural_expansion_job(job_id: str) -> Dict[str, Any]:
+    """Progress of an All projects build; status ok carries the page path (caller removes it)."""
+    _ne_prune_jobs()
+    with _NE_JOBS_LOCK:
+        job = _NE_JOBS.get(job_id or "")
+        if job is None:
+            return {"status": "unknown"}
+        view = {key: job[key] for key in ("status", "done", "total", "skipped", "error", "path")}
+        if job["status"] in ("ok", "error"):
+            _NE_JOBS.pop(job_id, None)
+    return view
+
+
 def _neural_expansion_command(raw_args: str = "") -> str:
     """``/neural-expansion [demo|export [PROJECT_ID]|projects]`` slash-command handler."""
     words = (raw_args or "").split()

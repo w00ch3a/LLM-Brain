@@ -97,3 +97,38 @@ def view(request: Request, mode: str = "demo", project: str = ""):
             pass
     return {"status": "ok", "mode": result["mode"], "data": result["data"], "file": path.name,
             "project_id": result.get("project_id", ""), "html": with_csp(page)}
+
+
+@router.get("/view-all/start")
+def view_all_start(request: Request):
+    """Start the merged All projects page (runs in the background; poll /view-all/status)."""
+    _require_loopback(request)
+    result = _plugin().start_neural_expansion_all()
+    if result.get("status") != "started":
+        raise HTTPException(status_code=409 if result.get("status") == "disabled" else 500, detail=result.get("error", "unavailable"))
+    return result
+
+
+@router.get("/view-all/status")
+def view_all_status(request: Request, job: str = ""):
+    """Progress counts while running; the page (once, then removed) when done."""
+    _require_loopback(request)
+    state = _plugin().neural_expansion_job(job)
+    if state.get("status") == "unknown":
+        raise HTTPException(status_code=404, detail="unknown or expired job")
+    if state.get("status") == "error":
+        raise HTTPException(status_code=500, detail=state.get("error") or "unavailable")
+    if state.get("status") != "ok":
+        return {"status": "running", "done": state["done"], "total": state["total"], "skipped": state["skipped"]}
+    path = Path(state["path"])
+    try:
+        if path.stat().st_size > _MAX_PAGE_BYTES:
+            raise HTTPException(status_code=413, detail="page too large")
+        page = path.read_text(encoding="utf-8")
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return {"status": "ok", "mode": "export", "data": "principal-filtered", "project_id": "__all__",
+            "done": state["done"], "total": state["total"], "skipped": state["skipped"], "html": with_csp(page)}

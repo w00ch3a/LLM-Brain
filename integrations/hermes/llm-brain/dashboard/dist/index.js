@@ -22,6 +22,30 @@
     const [error, setError] = useState("");
     const [projects, setProjects] = useState([]);
     const [project, setProject] = useState("");
+    const [progress, setProgress] = useState("");
+    const token = SDK.hooks.useRef ? SDK.hooks.useRef(0) : React.useRef(0);
+    useEffect(function () { return function () { token.current += 1; }; }, []);
+
+    function loadAll(mine) {
+      setProgress("Loading all projects\u2026");
+      function fail(e) { if (token.current === mine) { setProgress(""); setError(String(e.message || e)); } }
+      SDK.fetchJSON(API + "/view-all/start").then(function (started) {
+        function poll() {
+          if (token.current !== mine) return;
+          SDK.fetchJSON(API + "/view-all/status?job=" + encodeURIComponent(started.job)).then(function (r) {
+            if (token.current !== mine) return;
+            if (r && r.status === "ok") {
+              setProgress(r.skipped ? (r.total - r.skipped) + " of " + r.total + " projects loaded (" + r.skipped + " skipped)" : "");
+              setHtml(r.html || "");
+            } else {
+              setProgress("Loading all projects\u2026 " + ((r && r.done) || 0) + "/" + ((r && r.total) || started.total) + (r && r.skipped ? " (" + r.skipped + " skipped)" : ""));
+              setTimeout(poll, 1200);
+            }
+          }).catch(fail);
+        }
+        poll();
+      }).catch(fail);
+    }
 
     useEffect(function () {
       SDK.fetchJSON(API + "/status").then(setStatus).catch(function (e) { setError(String(e.message || e)); });
@@ -30,11 +54,13 @@
 
     function load(nextMode, chosen) {
       if (chosen === undefined) chosen = project;
-      setMode(nextMode); setError(""); setHtml("");
+      const mine = ++token.current;
+      setMode(nextMode); setError(""); setHtml(""); setProgress("");
+      if (nextMode === "export" && chosen === "__all__") { loadAll(mine); return; }
       const query = nextMode === "export" && chosen ? "&project=" + encodeURIComponent(chosen) : "";
       SDK.fetchJSON(API + "/view?mode=" + encodeURIComponent(nextMode) + query)
-        .then(function (r) { setHtml(r.html || ""); })
-        .catch(function (e) { setError(String(e.message || e)); });
+        .then(function (r) { if (token.current === mine) setHtml(r.html || ""); })
+        .catch(function (e) { if (token.current === mine) setError(String(e.message || e)); });
     }
 
     const exportEnabled = status && status.export_enabled;
@@ -47,10 +73,12 @@
         exportEnabled && projects.length ? h("select", {
           value: project, title: "Project (records / relations / pending review)",
           onChange: function (e) { setProject(e.target.value); load("export", e.target.value); }
-        }, [h("option", { key: "", value: "" }, "Detected project")].concat(projects.map(function (p) {
+        }, [h("option", { key: "", value: "" }, "Detected project"),
+          h("option", { key: "__all__", value: "__all__" }, "View all (All projects: " + projects.reduce(function (n, p) { return n + p.records; }, 0) + " records, " + projects.reduce(function (n, p) { return n + p.pending_review; }, 0) + " pending)")].concat(projects.map(function (p) {
           return h("option", { key: p.project_id, value: p.project_id }, p.alias + " (" + p.records + " records, " + p.relations + " relations, " + p.pending_review + " pending)");
         }))) : null,
         h("span", { style: { opacity: 0.7 } }, mode === "demo" ? "Synthetic data only." : "Principal-filtered local snapshot with label lineage."),
+        progress ? h("span", { role: "status", style: { opacity: 0.85 } }, progress) : null,
         error ? h("span", { style: { color: "#d66" } }, error) : null
       )),
       html ? h("iframe", { title: "Neural Expansion", sandbox: "allow-scripts", srcDoc: html,
