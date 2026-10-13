@@ -78,6 +78,7 @@ core_checks() {
     bash "$repo_root/tests/reflection-scheduler-self-check.sh" -- \
     bash "$repo_root/tests/work-self-check.sh" -- \
     bash "$repo_root/tests/state-commitment-capsule-self-check.sh" -- \
+    bash "$repo_root/tests/commitment-dir-self-check.sh" -- \
     bash "$repo_root/tests/temporal-self-check.sh" -- \
     bash "$repo_root/tests/retrieval-planner-self-check.sh" -- \
     bash "$repo_root/tests/procedure-run-self-check.sh" -- \

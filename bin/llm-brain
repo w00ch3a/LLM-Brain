@@ -2718,6 +2718,8 @@ commitment_decision_record_locked() {
   hash="$(sha256_file "$file")"
   id="commitment_$(sha256_text "$project_id|$hash|$policy|$effective|$reason" | cut -c1-16)"
   destination="$dir/reflection/commitments/$id.md"
+  # Older projects predate reflection/commitments/; create it instead of failing the submit.
+  ensure_dir "$dir/reflection/commitments"
   if [ ! -f "$destination" ]; then
     {
       printf '%s\n' '---'
