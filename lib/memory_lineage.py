@@ -1693,6 +1693,97 @@ def command_forget_neighbours(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------- #11 careful belief updates
+
+BELIEF_MIN_SUPPORT = 2  # a fact with this many independent sources is "well supported"
+
+
+def _source_key(meta: dict[str, Any], fallback: str) -> str:
+    for field in ("brain_source_ref", "brain_provenance"):
+        value = clean(meta.get(field))
+        if value:
+            return value
+    return fallback
+
+
+def belief_support(vault: Vault, target: Path) -> list[str]:
+    """Independent sources behind an effective fact: its own source, every
+    effective record that supports it (distinct sources only), and a human
+    verification.  Deterministic, frontmatter only."""
+    trel = vault.rel(target)
+    tmeta = vault.meta(target)
+    keys = {_source_key(tmeta, trel)}
+    verified = tmeta.get("verified")
+    if isinstance(verified, dict) and str(verified.get("by", "")).startswith("human:"):
+        keys.add("human-verification")
+    superseded = vault.superseded()
+    for path in vault.semantic_files():
+        if path == target or path in superseded or not vault.resolver.effective(path):
+            continue
+        meta = vault.meta(path)
+        if any(vault.resolver.canonical_ref(item) == target for item in ref_list(meta.get("brain_supports"))):
+            keys.add(_source_key(meta, vault.rel(path)))
+    return sorted(keys)
+
+
+def belief_check(vault: Vault, review: Path) -> dict[str, Any]:
+    """Would promoting this review item overwrite a well-supported fact on the
+    strength of fewer independent sources?  Challengers are the item itself
+    plus open review items that supersede or re-version the same target."""
+    meta, _ = okf.split_frontmatter(review)
+    out: dict[str, Any] = {"verdict": "ok", "target": "", "support": 0, "challengers": 0, "needed": 0, "corroborating": []}
+    targets = []
+    for field in ("brain_supersedes", "brain_version_of"):
+        for ref in ref_list(meta.get(field)):
+            path = vault.resolver.canonical_ref(ref)
+            if path is not None and vault.resolver.effective(path) and path not in vault.superseded():
+                targets.append(path)
+    if not targets:
+        return out
+    try:
+        minimum = max(1, int(os.environ.get("LLM_BRAIN_BELIEF_MIN_SUPPORT", BELIEF_MIN_SUPPORT)))
+    except ValueError:
+        minimum = BELIEF_MIN_SUPPORT
+    worst: dict[str, Any] | None = None
+    for target in targets:
+        support = belief_support(vault, target)
+        keys = {_source_key(meta, review.name)}
+        corroborating = []
+        for other in sorted((vault.root / "review").glob("*.md")):
+            if other == review:
+                continue
+            try:
+                ometa, _ = okf.split_frontmatter(other)
+            except okf.OkfError:
+                continue
+            if clean(ometa.get("brain_review_state")) not in {"proposed", "needs-validation"}:
+                continue
+            if clean(ometa.get("brain_review_kind")) not in {"claim", "procedure", "reference"}:
+                continue
+            refs = ref_list(ometa.get("brain_supersedes")) + ref_list(ometa.get("brain_version_of"))
+            if any(vault.resolver.canonical_ref(item) == target for item in refs):
+                key = _source_key(ometa, other.name)
+                if key not in keys:
+                    keys.add(key)
+                    corroborating.append(other.stem)
+        row = {"target": vault.rel(target), "support": len(support), "challengers": len(keys),
+               "needed": len(support), "corroborating": corroborating,
+               "verdict": "hold" if len(support) >= minimum and len(keys) < len(support) else "ok"}
+        if worst is None or (row["verdict"] == "hold" and worst["verdict"] != "hold"):
+            worst = row
+    return worst or out
+
+
+def command_belief_check(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    row = belief_check(vault, Path(args.review))
+    if args.json:
+        print(json.dumps(row, sort_keys=True))
+    else:
+        print("\t".join([row["verdict"], row["target"], str(row["support"]), str(row["challengers"]), str(row["needed"]), ",".join(row["corroborating"])]))
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1811,6 +1902,9 @@ def parser() -> argparse.ArgumentParser:
     ct = commands.add_parser("capture-tag")
     ct.add_argument("--file", required=True)
     ct.set_defaults(func=command_capture_tag)
+    bc = base("belief-check", command_belief_check)
+    bc.add_argument("--review", required=True)
+    bc.add_argument("--json", action="store_true")
     fn = base("forget-neighbours", command_forget_neighbours)
     fn.add_argument("--ref", required=True)
     ho = base("handover", command_handover)

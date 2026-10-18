@@ -267,4 +267,55 @@ LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 b neural-expansion export "$pid" --principal
 grep -Fq 'retracted' <<<"$(b label list "$pid" okf/claims/vault-code.md)" || fail '#10 lineage lost the retraction'
 printf 'idea-10=ok\n'
 
+# ---- #11 careful belief updates: one outlier cannot overwrite a well-supported fact.
+scand() { # id title statement supersedes
+  cat >"$fixture/cand-$1.md" <<EOT
+---
+type: Claim
+title: "$2"
+brain_review_kind: claim
+brain_candidate_id: $1
+brain_confidence: 0.5
+brain_risk: medium
+brain_sensitivity: internal
+brain_provenance: "review://$1"
+brain_provider_id: "self-check"
+brain_provider_version: "1"
+brain_source_authority: external-observation
+brain_supersedes: "$4"
+---
+# $2
+
+Candidate statement: $3
+EOT
+  b reflect submit "$pid" "$fixture/cand-$1.md" >/dev/null 2>&1 || true
+}
+claim mtu-fact 'Router MTU' 'The router MTU is 1500.' 2026-02-01T00:00:00Z 'brain_source_ref: "sources/router-manual.md"'
+claim mtu-check 'Router MTU measured' 'A ping sweep confirmed MTU 1500.' 2026-02-02T00:00:00Z 'brain_source_ref: "sources/ping-sweep.md"' 'brain_supports: ["okf/claims/mtu-fact.md"]'
+[ "$(lineage belief-check --project-dir "$pdir" --review "$claims/mtu-fact.md" | cut -f1)" = ok ] || fail '#11 a record with no supersession was judged'
+scand bel_one 'Router MTU is 9000' 'The router MTU is 9000.' okf/claims/mtu-fact.md
+out="$(b review decide "$pid" bel_one approved --reason 'forum post' 2>&1)" && fail "#11 outlier overwrote a two-source fact: $out"
+grep -Fq 'promotion=held review_id=bel_one reason=belief-outlier target=okf/claims/mtu-fact.md support=2 sources=1' <<<"$out" || fail "#11 hold not explained: $out"
+[ ! -f "$claims/bel_one.md" ] || fail '#11 outlier reached canonical memory'
+grep -Fxq 'brain_review_state: needs-validation' "$pdir/review/bel_one.md" || fail '#11 outlier not kept for review'
+conflict="$(ls "$pdir"/review/belief_*.md)"
+grep -Fq 'No overwrite occurred' "$conflict" || fail '#11 conflict record missing'
+grep -Fq 'belief-hold' "$pdir/audit.v2.tsv" || fail '#11 hold not audited'
+grep -Fq 'okf/claims/mtu-fact.md' <<<"$(b search "$pid" 'router MTU')" || fail '#11 the supported fact stopped being recalled'
+# A second independent source makes the challenge as strong as the fact.
+scand bel_two 'Router MTU changed to 9000' 'After the firmware update the router MTU is 9000.' okf/claims/mtu-fact.md
+b review decide "$pid" bel_two approved --reason 'second source agrees' >/dev/null || fail '#11 corroborated update was still held'
+[ -f "$claims/bel_two.md" ] || fail '#11 corroborated update not promoted'
+# A single-source fact updates as before (no new friction).
+claim lone-fact 'Printer name' 'The printer is called Kestrel.' 2026-02-01T00:00:00Z 'brain_source_ref: "sources/label.md"'
+scand bel_lone 'Printer renamed' 'The printer is now called Osprey.' okf/claims/lone-fact.md
+b review decide "$pid" bel_lone approved --reason 'renamed' >/dev/null || fail '#11 single-source fact could not be updated'
+# A person may overrule, and it is audited.
+claim dns-fact 'DNS server' 'The DNS server is 10.0.0.53.' 2026-02-01T00:00:00Z 'brain_source_ref: "sources/dhcp.md"' 'verified: {by: "human:test", at: "2026-02-01T00:00:00Z"}'
+scand bel_dns 'DNS moved' 'The DNS server is 10.0.0.54.' okf/claims/dns-fact.md
+! b review decide "$pid" bel_dns approved --reason 'x' >/dev/null 2>&1 || fail '#11 human-verified fact counted as one source'
+b review decide "$pid" bel_dns approved --overrule-belief --reason 'I changed it myself' >/dev/null || fail '#11 overrule failed'
+[ -f "$claims/bel_dns.md" ] && grep -Fq 'belief-overrule' "$pdir/audit.v2.tsv" || fail '#11 overrule not promoted or not audited'
+printf 'idea-11=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

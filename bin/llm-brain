@@ -82,7 +82,8 @@ Commands:
   ingest FILE [--topic ID] [--capture-only|--manual-only] [--provider EXECUTABLE]
   ingest-source PROJECT_ID FILE [ROOT]                 Compatibility custody command
   reflect list|prepare|submit|run PROJECT_ID [ARGS]
-  review list|show|decide PROJECT_ID [ARGS]   decide ... approved --as-fact promotes a hypothetical/proposal you have agreed to
+  review list|show|decide PROJECT_ID [ARGS]   decide ... approved --as-fact promotes a hypothetical/proposal you have agreed to;
+                                              --overrule-belief lets one source replace a better-supported fact
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
@@ -2854,6 +2855,24 @@ promote_review_locked() {
       return 65
       ;;
   esac
+  # 0.10 careful belief update: one outlier must not overwrite a fact backed
+  # by more independent sources.  The item stays as a separate review record
+  # (plus a conflict record) until enough sources agree or a human overrules.
+  if [ ! -f "$dest" ] && [ "${BELIEF_OVERRULE:-0}" != 1 ] && { [ -n "$(frontmatter_field "$review" brain_supersedes)" ] || [ -n "$(frontmatter_field "$review" brain_version_of)" ]; }; then
+    local belief belief_verdict belief_target belief_support belief_challengers belief_conflict
+    belief="$(memory_lineage belief-check --project-dir "$dir" --review "$review" 2>/dev/null || printf 'ok\n')"
+    IFS=$'\t' read -r belief_verdict belief_target belief_support belief_challengers _ _ <<<"$belief"
+    if [ "$belief_verdict" = hold ]; then
+      set_frontmatter_field "$review" brain_review_state needs-validation
+      set_frontmatter_field "$review" brain_review_reason belief-hold-outlier
+      set_frontmatter_field "$review" brain_belief_hold "target=$belief_target support=$belief_support sources=$belief_challengers"
+      belief_conflict="belief_$(sha256_text "$review_id:$belief_target" | cut -c1-12)"
+      write_review_item "$dir" "$belief_conflict" "conflict" "Outlier contradiction of $belief_target" "needs-validation" "0.0" "high" "internal" "policy" "llm-brain" "review://$review_id" "Review $review_id would supersede $belief_target, which has $belief_support independent source(s); the challenge has $belief_challengers. No overwrite occurred. It is promoted automatically once as many independent sources agree, or a person can overrule with review decide ... approved --overrule-belief." >/dev/null
+      audit_v2 "$dir" "belief-hold" "$review_id" "$state" needs-validation "$(sha256_file "$review")" "target=$(slug "$belief_target") support=$belief_support sources=$belief_challengers"
+      printf 'promotion=held review_id=%s reason=belief-outlier target=%s support=%s sources=%s conflict=%s\n' "$review_id" "$belief_target" "$belief_support" "$belief_challengers" "$belief_conflict"
+      return 3
+    fi
+  fi
   if [ -f "$dest" ]; then
     if grep -Fq "review://$review_id" "$dest"; then printf 'promotion=idempotent review_id=%s canonical=%s\n' "$review_id" "$dest"; return 0; fi
     local conflict
@@ -2996,7 +3015,7 @@ submit_candidate() {
               ;;
             *)
           provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
-          if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; fi
+          if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; [ "$status" != 3 ] || status=0; fi
               ;;
           esac
           ;;
@@ -3016,7 +3035,7 @@ submit_candidate() {
       esac
     elif auto_promote_eligible "$file"; then
       provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
-      if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; fi
+      if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; [ "$status" != 3 ] || status=0; fi
     fi
   fi
   release_lock
@@ -4527,7 +4546,7 @@ cmd_review() {
     decide)
       local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       case "$state" in proposed|needs-validation|approved|rejected|superseded) ;; *) die 64 "invalid review state" ;; esac
       local dir file old
@@ -4570,8 +4589,10 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
         fi
+        [ "${BELIEF_OVERRULE:-0}" != 1 ] || audit_v2 "$dir" "belief-overrule" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         if promote_review_locked "$project_id" "$id" "$actor" "$reason"; then :; else promotion_status=$?; fi
         release_lock
+        [ "$promotion_status" != 3 ] || die 75 "review $id held: it contradicts a better-supported fact (see the belief_ conflict review); add corroborating sources or use --overrule-belief"
         return "$promotion_status"
       fi
       case "$old:$state" in
