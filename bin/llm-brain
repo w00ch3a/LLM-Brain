@@ -109,6 +109,8 @@ Commands:
   state index|open PROJECT_ID [KEY|REF] [--since FILE]   Thin state index, open on demand
   working add|list|done|drop PROJECT_ID [TEXT|ITEM_ID] [--kind todo|binding|constraint] [--session ID]
   constraints PROJECT_ID [--turn N] [--every K]
+  ruled-out add PROJECT_ID --approach TEXT --reason TEXT [--scope TEXT] [--evidence REF] [--principal ID]
+  ruled-out reopen PROJECT_ID ITEM_ID --reason TEXT | ruled-out list PROJECT_ID [--task TEXT] [--json]
   usage PROJECT_ID [--principal ID] [--json]
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
@@ -1191,6 +1193,7 @@ bridge_cached_sources_meta() {
   ' "$list" >"$work/need"
   bridge_sources_meta "$dir" "$work/need" | awk -F '\t' 'BEGIN { OFS = "\t" } { print $1, $2, $3, $4, $6 }' >"$work/fresh"
   find "$dir/indexes/evidence-text" -maxdepth 1 -type f 2>/dev/null | sed "s#^$dir/##" >"$work/views" || : >"$work/views"
+  : >"$work/cache"
   awk -F '\t' -v dir="$dir" -v ver="$EVIDENCE_VIEW_VERSION" -v cached="$work/cached" -v fresh="$work/fresh" -v views="$work/views" -v out="$work/cache" '
     BEGIN {
       OFS = "\t"
@@ -3374,6 +3377,8 @@ cmd_bridge() {
         [ -z "$evidence_resolution" ] || :
       fi
       bridge_render_context "$id" "$results" "$metadata" "$budget" "$context"
+      # 0.10: matching "already ruled out" approaches (empty for most vaults).
+      memory_lineage recall-extras --project-dir "$dir" --principal "$principal" --task "$query" >>"$context" 2>/dev/null || true
       retrieval_receipt "$receipt_file" bridge-recall "$id" "$query" "$metadata" "$(tail -n +2 "$results" | cut -f1)" || say_error "retrieval receipt unavailable"
       actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
       degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
@@ -7826,6 +7831,63 @@ cmd_state() {
   memory_lineage "${args[@]}"
 }
 
+# "Already ruled out" (0.10 #4): an append-only operational ledger of
+# approaches that were tried and rejected, with the reason.  Packs and bridge
+# recall surface matching items; reopen appends an event, nothing is deleted.
+cmd_ruled_out() {
+  local action="${1:-}" project_id="${2:-}" dir approach="" reason="" scope="" evidence="" principal="" item="" task="" json=0 scan output; shift 2 || true
+  [ -n "$project_id" ] || die 64 "ruled-out requires add|reopen|list PROJECT_ID"
+  require_project "$project_id" dir
+  case "$action" in
+    list)
+      local -a args=(ruled-out --project-dir "$dir" --action list)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --task) args+=(--task "${2:-}"); shift 2 ;;
+          --principal) args+=(--principal "${2:-}"); shift 2 ;;
+          --json) args+=(--json); shift ;;
+          *) die 64 "unknown ruled-out list option: $1" ;;
+        esac
+      done
+      memory_lineage "${args[@]}"
+      return
+      ;;
+    add)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --approach) approach="${2:-}"; shift 2 ;;
+          --reason) reason="${2:-}"; shift 2 ;;
+          --scope) scope="${2:-}"; shift 2 ;;
+          --evidence) evidence="${2:-}"; shift 2 ;;
+          --principal) principal="${2:-}"; shift 2 ;;
+          *) die 64 "unknown ruled-out add option: $1" ;;
+        esac
+      done
+      [ -n "$approach" ] && [ -n "$reason" ] || die 64 "ruled-out add requires --approach TEXT --reason TEXT [--scope TEXT] [--evidence REF] [--principal ID]"
+      for value in "$approach" "$reason" "$scope" "$evidence" "$principal"; do validate_scalar "$value" || die 65 "ruled-out values must be single lines"; done
+      scan="$(mktemp "${TMPDIR:-/tmp}/llm-brain-ruled.XXXXXX")"
+      printf '%s\n%s\n%s\n' "$approach" "$reason" "$scope" >"$scan"
+      if ! secret_scan_file "$scan"; then rm -f "$scan"; die 65 "ruled-out text matched the secret scanner"; fi
+      rm -f "$scan"
+      ;;
+    reopen)
+      item="${1:-}"; shift || true
+      while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; --principal) principal="${2:-}"; shift 2 ;; *) die 64 "unknown ruled-out reopen option: $1" ;; esac; done
+      [ -n "$item" ] && [ -n "$reason" ] || die 64 "ruled-out reopen requires PROJECT_ID ITEM_ID --reason TEXT"
+      validate_id "$item" || die 64 "invalid item id"
+      validate_scalar "$reason" || die 65 "invalid reason"
+      ;;
+    *) die 64 "ruled-out requires add, reopen or list" ;;
+  esac
+  acquire_lock "project-$project_id"
+  if ! output="$(memory_lineage ruled-out --project-dir "$dir" --principal "$principal" --action "$action" --approach "$approach" --reason "$reason" --scope "$scope" --evidence "$evidence" --item "$item")"; then
+    release_lock; die 65 "ruled-out $action refused"
+  fi
+  case "$output" in *unchanged*) ;; *) audit_v2 "$dir" "ruled-out-$action" "$(printf '%s' "$output" | sed -n 's/.*item_id=\([^ ]*\).*/\1/p')" "" "$action" "$(sha256_file "$dir/ruled-out/items.tsv")" "reason=$(slug "$reason" | cut -c1-60)" ;; esac
+  release_lock
+  printf '%s project_id=%s\n' "$output" "$project_id"
+}
+
 cmd_working() {
   local action="${1:-}" project_id="${2:-}" dir text="" kind=todo session="" item="" scan output; shift 2 || true
   [ -n "$project_id" ] || die 64 "working requires add|list|done|drop PROJECT_ID"
@@ -9966,6 +10028,7 @@ main() {
     browse) cmd_browse "$@" ;;
     state) cmd_state "$@" ;;
     working) cmd_working "$@" ;;
+    ruled-out) cmd_ruled_out "$@" ;;
     constraints) cmd_constraints "$@" ;;
     mcp) cmd_mcp "$@" ;;
     neural-expansion|viewer) cmd_neural_expansion "$@" ;;

@@ -1071,6 +1071,11 @@ def command_pack_extras(args: argparse.Namespace) -> int:
         out.append("## Working Memory — open, short-horizon (not durable knowledge)\n")
         out += [f"- [{item['kind']}] {item['text']} (`{item['item_id']}`)" for item in items[:12]]
         out.append("")
+    ruled = ruled_out_matches(vault, args.task)
+    if ruled:
+        out.append("## Already Ruled Out — tried before; do not retry without new evidence\n")
+        out += ruled
+        out.append("")
     done = completed_cues(vault, now, args.task)
     if done:
         out.append("## Completed Intentions — cue matched but already done\n")
@@ -1275,6 +1280,120 @@ def command_handover(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- 0.10: already ruled out (#4)
+
+RULED = Path("ruled-out") / "items.tsv"
+RULED_HEADER = "event_id\trecorded_at\taction\titem_id\tprincipal\tscope\tapproach\treason\tevidence"
+
+
+def read_ruled(root: Path) -> list[dict[str, str]]:
+    path = root / RULED
+    names = RULED_HEADER.split("\t")
+    rows = []
+    if path.is_file() and not path.is_symlink():
+        for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
+            fields = line.split("\t")
+            if number and len(fields) == len(names):
+                rows.append(dict(zip(names, fields)))
+    return rows
+
+
+def open_ruled(vault: Vault) -> list[dict[str, str]]:
+    """Active ruled-out items visible to the principal (reopen events applied)."""
+    items: dict[str, dict[str, str]] = {}
+    for row in read_ruled(vault.root):
+        if row["action"] == "add":
+            items[row["item_id"]] = dict(row)
+        elif row["action"] == "reopen":
+            items.pop(row["item_id"], None)
+    visible = []
+    for item in items.values():
+        scope = item.get("principal", "-")
+        if scope not in ("", "-") and scope != vault.principal:
+            continue
+        visible.append(item)
+    return sorted(visible, key=lambda item: (item["recorded_at"], item["item_id"]))
+
+
+def ruled_out_matches(vault: Vault, task: str, limit: int = 5) -> list[str]:
+    wanted = set(_terms(task))
+    if not wanted:
+        return []
+    scored = []
+    for item in open_ruled(vault):
+        terms = set(_terms(item["scope"] + " " + item["approach"]))
+        overlap = len(wanted & terms)
+        if terms and overlap >= min(2, len(terms)):
+            evidence = f"; evidence `{item['evidence']}`" if item["evidence"] not in ("", "-") else ""
+            scored.append((overlap, item["recorded_at"], f"- {item['approach']} — {item['reason']} ({item['recorded_at'][:10]}; `{item['item_id']}`{evidence})"))
+    stored = active_labels(vault)
+    for ref, labels in stored.items():
+        if not any(name == "ruled-out" or name.startswith("ruled-out:") for name in labels):
+            continue
+        path = vault.resolver.canonical_ref(ref)
+        if path is None or not vault.resolver.visible(path, strict_principal=True):
+            continue
+        terms = set(_terms(vault.title(path)))
+        overlap = len(wanted & terms)
+        if terms and overlap >= min(2, len(terms)):
+            event = next(row for name, row in labels.items() if name.split(":", 1)[0] == "ruled-out")
+            scored.append((overlap, event["recorded_at"], f"- {_one(vault.title(path), 100)} — {_one(event['reason'], 160)} (`{ref}`)"))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [line for _, _, line in scored[:limit]]
+
+
+def command_ruled_out(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    now = iso(now_from(args.now))
+    if args.action == "list":
+        items = open_ruled(vault)
+        if args.task:
+            print("\n".join(ruled_out_matches(vault, args.task, args.limit)))
+            return 0
+        if args.json:
+            print(json.dumps({"status": "ok", "items": items}, ensure_ascii=False, separators=(",", ":")))
+            return 0
+        print("item_id\trecorded_at\tscope\tapproach\treason\tevidence")
+        for item in items:
+            print(f"{item['item_id']}\t{item['recorded_at']}\t{item['scope']}\t{item['approach']}\t{item['reason']}\t{item['evidence']}")
+        return 0
+    if args.action == "add":
+        if not args.approach.strip() or not args.reason.strip():
+            print("ruled-out add needs --approach and --reason", file=sys.stderr)
+            return 64
+        item_id = "ro_" + _sha(f"{args.scope}|{args.approach}|{args.principal}")[:12]
+        if any(item["item_id"] == item_id for item in open_ruled(vault)):
+            print(f"ruled-out=unchanged item_id={item_id}")
+            return 0
+        fields = [now, "add", item_id, _one(args.principal, 80) or "-", _one(args.scope, 200) or "-",
+                  _one(args.approach, 240), _one(args.reason, 300), _one(args.evidence, 200) or "-"]
+    else:
+        if args.item not in {item["item_id"] for item in open_ruled(vault)}:
+            print(f"ruled-out item is not active: {args.item}", file=sys.stderr)
+            return 65
+        item_id = args.item
+        fields = [now, "reopen", item_id, _one(args.principal, 80) or "-", "-", "-", _one(args.reason or "reopened", 300), "-"]
+    path = vault.root / RULED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with path.open("a", encoding="utf-8") as stream:
+        if new:
+            stream.write(RULED_HEADER + "\n")
+        stream.write("\t".join([_sha("|".join(fields))[:16]] + fields) + "\n")
+    print(f"ruled-out={args.action} item_id={item_id}")
+    return 0
+
+
+def command_recall_extras(args: argparse.Namespace) -> int:
+    """Small add-on for bridge recall (Hermes/MCP): ruled-out approaches only."""
+    vault = Vault(args.project_dir, args.principal)
+    lines = ruled_out_matches(vault, args.task, 4)
+    if lines:
+        print("\n### Already ruled out — do not retry without new evidence\n")
+        print("\n".join(lines))
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1369,6 +1488,18 @@ def parser() -> argparse.ArgumentParser:
     pe.add_argument("--session", default="")
     pe.add_argument("--state-index", action="store_true")
     base("brief-extras", command_brief_extras)
+    ro = base("ruled-out", command_ruled_out)
+    ro.add_argument("--action", choices=("add", "reopen", "list"), required=True)
+    ro.add_argument("--approach", default="")
+    ro.add_argument("--reason", default="")
+    ro.add_argument("--scope", default="")
+    ro.add_argument("--evidence", default="")
+    ro.add_argument("--item", default="")
+    ro.add_argument("--task", default="")
+    ro.add_argument("--limit", type=int, default=5)
+    ro.add_argument("--json", action="store_true")
+    rx = base("recall-extras", command_recall_extras)
+    rx.add_argument("--task", default="")
     ho = base("handover", command_handover)
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")

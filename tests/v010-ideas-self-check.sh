@@ -81,4 +81,24 @@ b working done "$pid" "$(b working list "$pid" | awk -F '\t' 'NR>1 {print $1}' |
 b working done "$pid" "$(b working list "$pid" | awk -F '\t' 'NR>1 {print $1}' | head -1)" >/dev/null
 printf 'idea-3=ok\n'
 
+# ---- #4 already ruled out: append-only, surfaced in packs and bridge recall.
+out="$(b ruled-out add "$pid" --scope 'flaky upload test' --approach 'Raise the upload timeout to 60s' --reason 'still flaky at 60s; root cause is a race' --evidence okf/claims/deploy-new.md)"
+ro_id="$(sed -n 's/.*item_id=\([^ ]*\).*/\1/p' <<<"$out")"
+grep -Fq 'ruled-out=unchanged' <<<"$(b ruled-out add "$pid" --scope 'flaky upload test' --approach 'Raise the upload timeout to 60s' --reason again)" || fail '#4 add not idempotent'
+b ruled-out add "$pid" --scope 'flaky upload test' --approach 'Private retry idea' --reason 'only alice sees this' --principal alice >/dev/null
+pack="$(b pack build "$pid" --task 'fix the flaky upload test' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq '## Already Ruled Out' "$pack" || fail '#4 pack lacks the ruled-out section'
+grep -Fq 'Raise the upload timeout to 60s — still flaky at 60s' "$pack" || fail '#4 ruled-out reason missing'
+! grep -Fq 'Private retry idea' "$pack" || fail '#4 principal-scoped ruled-out item leaked'
+grep -Fq 'Private retry idea' "$(b pack build "$pid" --task 'fix the flaky upload test' --principal alice | sed -n 's/.*file=\([^ ]*\).*/\1/p')" || fail '#4 scoped item hidden from its principal'
+! grep -Fq 'Already Ruled Out' "$(b pack build "$pid" --task 'tariff rate percent today' | sed -n 's/.*file=\([^ ]*\).*/\1/p')" || fail '#4 unrelated task got ruled-out items'
+printf 'flaky upload test\n' >"$fixture/q-flaky.txt"
+grep -Fq 'Already ruled out' <<<"$(recall_md "$fixture/q-flaky.txt")" || fail '#4 bridge recall lacks ruled-out items'
+b ruled-out reopen "$pid" "$ro_id" --reason 'new evidence: race fixed upstream' >/dev/null
+! grep -Fq 'Raise the upload timeout' <<<"$(b ruled-out list "$pid" --task 'fix the flaky upload test')" || fail '#4 reopened item still active'
+grep -c 'Raise the upload timeout' "$pdir/ruled-out/items.tsv" | grep -qx 1 || fail '#4 history rewritten'
+grep -Fq $'\treopen\t'"$ro_id" "$pdir/ruled-out/items.tsv" || fail '#4 reopen not appended'
+grep -Fq 'ruled-out-add' "$pdir/audit.v2.tsv" || fail '#4 not audited'
+printf 'idea-4=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'
