@@ -1309,6 +1309,9 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
                 break
     if payload["stale_omitted"]:
         add(f"({payload['stale_omitted']} stale record(s) omitted pending re-verification.)")
+    if payload.get("forgotten"):
+        never, stale = payload["forgotten"]
+        add(f"({never} saved record(s) never recalled and {stale} request(s) with no update in 30+ days; run `llm-brain forgotten`.)")
     if payload.get("compacted"):
         add("(Compacted to one line per entry to fit the cap; open details with `llm-brain browse show` or search.)")
     if omitted:
@@ -1341,6 +1344,9 @@ def command_brief(args: argparse.Namespace) -> int:
         if since is not None:
             payload["handover"] = (since, memory_lineage.handover_changes(vault, since, now))
         payload["others"] = memory_lineage.handover_collisions(vault, getattr(args, "session", "") or "")
+        forgotten = memory_lineage.forgotten_report(vault, now, 30, 0)
+        if forgotten["never_recalled_count"] or forgotten["stale_requests_count"]:
+            payload["forgotten"] = (forgotten["never_recalled_count"], forgotten["stale_requests_count"])
     except Exception:
         pass
     text, omitted = render_brief(args.project_id, payload, max_bytes, args.recent_days, now)

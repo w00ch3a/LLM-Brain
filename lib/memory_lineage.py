@@ -1394,6 +1394,72 @@ def command_recall_extras(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- 0.10: forgotten saves (#5)
+
+def forgotten_report(vault: Vault, now: dt.datetime, days: int = 30, limit: int = 20) -> dict[str, Any]:
+    """Saved-but-never-recalled records and requests with no update in ``days``.
+
+    "Never recalled" needs usage evidence: retrieval receipts are opt-in
+    (``--receipt`` or ``LLM_BRAIN_RECEIPTS=1``).  Without any receipts the
+    report says so instead of calling every record forgotten.
+    """
+    table, receipts = ms.usage_table(vault)
+    never: list[dict[str, str]] = []
+    if receipts:
+        for path in vault.semantic_files():
+            if not vault.eligible(path, now, include_cold=True):
+                continue
+            rel = vault.rel(path)
+            entry = table.get(rel)
+            if entry and (entry["uses"] or entry["rendered"]):
+                continue
+            created = _created(vault, path)
+            if created is not None and (now - created).days < days:
+                continue
+            never.append({"ref": rel, "title": _one(vault.title(path), 100), "saved": iso(created) if created else ""})
+    stale: list[dict[str, str]] = []
+    for path, meta, _ in vault.frontmatter_dir("intentions"):
+        if meta.get("type") != "Intention" or (clean(meta.get("brain_intention_status")) or "open") != "open":
+            continue
+        scoped = ref_list(meta.get("brain_principal"))
+        if scoped and vault.principal not in scoped:
+            continue
+        iid = clean(meta.get("brain_intention_id")) or path.stem
+        times = [parse_time(meta.get("brain_created_at")), parse_time(meta.get("brain_last_fired_at"))]
+        times += [parse_time(row[0]) for row in patches(vault.root, iid) if row]
+        last = max([t for t in times if t is not None], default=None)
+        if last is not None and (now - last).days >= days:
+            stale.append({"id": iid, "kind": "intention", "text": _one(meta.get("brain_intention_action"), 120), "last_update": iso(last)})
+    for item in open_working(vault.root):
+        last = parse_time(item.get("recorded_at"))
+        if last is not None and (now - last).days >= days:
+            stale.append({"id": item["item_id"], "kind": "working", "text": _one(item.get("text"), 120), "last_update": iso(last)})
+    never.sort(key=lambda row: (row["saved"], row["ref"]))
+    stale.sort(key=lambda row: (row["last_update"], row["id"]))
+    return {
+        "status": "ok", "derived": True, "days": days, "receipts": receipts,
+        "usage_evidence": "receipts" if receipts else "none (receipts are opt-in: --receipt or LLM_BRAIN_RECEIPTS=1)",
+        "never_recalled_count": len(never), "never_recalled": never[:limit],
+        "stale_requests_count": len(stale), "stale_requests": stale[:limit],
+    }
+
+
+def command_forgotten(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    report = forgotten_report(vault, now_from(args.now), args.days, args.limit)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    print(f"forgotten=ok days={args.days} receipts={report['receipts']} never_recalled={report['never_recalled_count']} stale_requests={report['stale_requests_count']}")
+    if not report["receipts"]:
+        print(f"usage evidence: {report['usage_evidence']}")
+    for row in report["never_recalled"]:
+        print(f"never-recalled\t{row['ref']}\t{row['saved'][:10]}\t{row['title']}")
+    for row in report["stale_requests"]:
+        print(f"stale-{row['kind']}\t{row['id']}\t{row['last_update'][:10]}\t{row['text']}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1500,6 +1566,10 @@ def parser() -> argparse.ArgumentParser:
     ro.add_argument("--json", action="store_true")
     rx = base("recall-extras", command_recall_extras)
     rx.add_argument("--task", default="")
+    fg = base("forgotten", command_forgotten)
+    fg.add_argument("--days", type=int, default=30)
+    fg.add_argument("--limit", type=int, default=20)
+    fg.add_argument("--json", action="store_true")
     ho = base("handover", command_handover)
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")

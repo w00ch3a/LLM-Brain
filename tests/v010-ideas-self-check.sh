@@ -101,4 +101,21 @@ grep -Fq $'\treopen\t'"$ro_id" "$pdir/ruled-out/items.tsv" || fail '#4 reopen no
 grep -Fq 'ruled-out-add' "$pdir/audit.v2.tsv" || fail '#4 not audited'
 printf 'idea-4=ok\n'
 
+# ---- #5 forgotten saves: honest without receipts, counts never-recalled with them.
+grep -Fq 'usage evidence: none' <<<"$(b forgotten "$pid")" || fail '#5 report did not say receipts are off'
+b intention add "$pid" --action 'Ask the vendor for the invoice' --trigger keyword:invoice >/dev/null
+f="$(b forgotten "$pid" --json)"
+"$py" -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["never_recalled_count"]==0 and d["receipts"]==0, d' "$f" || fail "#5 never-recalled without receipts: $f"
+LLM_BRAIN_RECEIPTS=1 b search "$pid" 'tariff rate' >/dev/null
+[ -s "$pdir/audit/retrieval-receipts.jsonl" ] || fail '#5 LLM_BRAIN_RECEIPTS=1 did not record a receipt'
+f="$(b forgotten "$pid" --days 1 --json)"
+"$py" -c '
+import json,sys
+d=json.loads(sys.argv[1]); refs=[r["ref"] for r in d["never_recalled"]]
+assert d["receipts"]>=1 and "okf/claims/deploy-new.md" in refs and "okf/claims/tariff-v2.md" not in refs, d' "$f" || fail "#5 never-recalled wrong: $f"
+f="$("$py" "$repo_root/lib/memory_lineage.py" forgotten --project-dir "$pdir" --days 30 --now 2099-01-01T00:00:00Z --json)"
+"$py" -c 'import json,sys; d=json.loads(sys.argv[1]); assert any(r["kind"]=="intention" for r in d["stale_requests"]), d' "$f" || fail "#5 stale request missing: $f"
+grep -Fq 'never recalled' <<<"$(b brief "$pid" --max-bytes 8000)" || fail '#5 brief lacks the one-line forgotten pointer'
+printf 'idea-5=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

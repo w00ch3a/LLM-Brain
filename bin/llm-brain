@@ -112,6 +112,7 @@ Commands:
   ruled-out add PROJECT_ID --approach TEXT --reason TEXT [--scope TEXT] [--evidence REF] [--principal ID]
   ruled-out reopen PROJECT_ID ITEM_ID --reason TEXT | ruled-out list PROJECT_ID [--task TEXT] [--json]
   usage PROJECT_ID [--principal ID] [--json]
+  forgotten PROJECT_ID [--days N] [--principal ID] [--json]   Saved-but-never-recalled records and stale requests
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
   mcp serve [--brain PATH] [--project-id ID] [--read-only]   One process = one brain (vault root)
@@ -7346,6 +7347,22 @@ cmd_brief() {
   memory_signals "${args[@]}"
 }
 
+cmd_forgotten() {
+  local project_id="${1:-}" dir; shift || true
+  [ -n "$project_id" ] || die 64 "forgotten requires PROJECT_ID"
+  require_project "$project_id" dir
+  local -a args=(forgotten --project-dir "$dir")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) require_positive_integer "${2:-}" || die 64 "--days must be a positive integer"; args+=(--days "$2"); shift 2 ;;
+      --principal) validate_scalar "${2:-}" || die 65 "invalid principal"; args+=(--principal "${2:-}"); shift 2 ;;
+      --json) args+=(--json); shift ;;
+      *) die 64 "unknown forgotten option: $1" ;;
+    esac
+  done
+  memory_lineage "${args[@]}"
+}
+
 cmd_usage() {
   local project_id="${1:-}" principal="" json=0 dir; shift || true
   [ -n "$project_id" ] || die 64 "usage requires PROJECT_ID"
@@ -10018,6 +10035,7 @@ main() {
     maintenance) cmd_maintenance "$@" ;;
     brief) cmd_brief "$@" ;;
     usage) cmd_usage "$@" ;;
+    forgotten) cmd_forgotten "$@" ;;
     stability) cmd_stability "$@" ;;
     intention) cmd_intention "$@" ;;
     label) cmd_label "$@" ;;
@@ -10032,7 +10050,7 @@ main() {
     constraints) cmd_constraints "$@" ;;
     mcp) cmd_mcp "$@" ;;
     neural-expansion|viewer) cmd_neural_expansion "$@" ;;
-    bridge) cmd_bridge "$@" ;;
+    bridge) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && [ "${1:-}" = recall ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; cmd_bridge "$@" ;;
     run) cmd_run "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     projection) cmd_projection "$@" ;;
@@ -10044,8 +10062,8 @@ main() {
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;
     index) cmd_index "$@" ;;
-    search) cmd_search "$@" ;;
-    pack) cmd_pack "$@" ;;
+    search) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; cmd_search "$@" ;;
+    pack) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; cmd_pack "$@" ;;
     adapters) cmd_adapters "$@" ;;
     export) cmd_export "$@" ;;
     import) cmd_import "$@" ;;
