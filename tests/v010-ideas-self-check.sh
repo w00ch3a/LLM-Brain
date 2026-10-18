@@ -236,4 +236,35 @@ printf 'cardiologist visit\n' >"$fixture/q-card.txt"
 grep -Fq 'cardiologist' <<<"$(recall_md "$fixture/q-card.txt" --principal alice)" || fail '#9 owner lost recall'
 printf 'idea-9=ok\n'
 
+# ---- #10 forgetting that sticks: packs, indexes, summaries, export; tombstone stays.
+claim vault-code 'Gate code' 'The side gate code is 4417 zebra.' 2026-03-02T00:00:00Z 'brain_state_key: gate.code'
+claim gate-note 'Gate note' 'Visitors use the side gate; the side gate code is 4417 zebra.' 2026-03-03T00:00:00Z 'brain_supports: ["okf/claims/vault-code.md"]'
+b index build "$pid" >/dev/null 2>&1
+b association build "$pid" okf/claims/vault-code.md okf/claims/deploy-new.md --reason 'co-used' >/dev/null
+b browse build "$pid" >/dev/null
+pack="$(b pack build "$pid" --task 'side gate code zebra' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq '4417' "$pack" || fail '#10 setup: pack lacks the target'
+grep -Fq 'vault-code.md' "$pdir/indexes/summaries/okf__claims.md" || fail '#10 setup: summary lacks the target'
+preview="$(b retract "$pid" vault-code --reason 'code changed; forget it' --preview)"
+grep -Fq 'inferable_neighbours=' <<<"$preview" || fail "#10 preview lacks neighbours: $preview"
+grep -Fq 'okf/claims/gate-note.md(links-via-supports)' <<<"$preview" || fail "#10 restating neighbour not listed: $preview"
+grep -Fq 'okf/claims/deploy-new.md(association)' <<<"$preview" || fail "#10 association partner not listed: $preview"
+token="$(sed -n 's/.*token=\([0-9a-f]\{64\}\).*/\1/p' <<<"$preview")"
+applied="$(b retract "$pid" vault-code --reason 'code changed; forget it' --confirm "$token")"
+grep -Fq 'residual=none' <<<"$applied" || fail "#10 residual derived artefacts: $applied"
+[ ! -f "$pack" ] || fail '#10 old pack still quotes the target'
+! grep -Fq 'vault-code.md' "$pdir/indexes/summaries/okf__claims.md" || fail '#10 summary line survived'
+grep -Fq 'deploy-new.md' "$pdir/indexes/summaries/okf__claims.md" || fail '#10 summary lost unrelated lines'
+b browse build "$pid" >/dev/null
+! grep -Fq 'vault-code.md' "$pdir/indexes/summaries/okf__claims.md" || fail '#10 summary rebuild resurrected the target'
+! grep -Fq 'okf/claims/vault-code.md' <<<"$(b search "$pid" 'side gate code zebra')" || fail '#10 search still returns the target'
+! grep -Fq 'okf/claims/vault-code.md' <<<"$(b search "$pid" 'gate code' --expand-graph)" || fail '#10 graph expansion resurrected the target'
+pack="$(b pack build "$pid" --task 'side gate code zebra 4417' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+! grep -Fq 'okf/claims/vault-code.md</code>' "$pack" || fail '#10 new pack selected the target'
+LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 b neural-expansion export "$pid" --principal bob --output "$fixture/ne-forget.html" >/dev/null
+! grep -Fq 'The side gate code is 4417' "$fixture/ne-forget.html" || fail '#10 Neural Expansion export kept the target text'
+[ -f "$pdir/okf/retractions/vault-code.md" ] && [ -f "$claims/vault-code.md" ] || fail '#10 tombstone or lineage record missing'
+grep -Fq 'retracted' <<<"$(b label list "$pid" okf/claims/vault-code.md)" || fail '#10 lineage lost the retraction'
+printf 'idea-10=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

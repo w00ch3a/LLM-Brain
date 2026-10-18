@@ -4668,6 +4668,11 @@ EOF
     printf 'retraction_preview=ok project_id=%s canonical_id=%s canonical_hash=%s principal=%s token=%s\n' "$project_id" "$canonical_id" "$canonical_hash" "${principal:-shared}" "$token"
     if [ "$hidden_dependants" -gt 0 ]; then printf 'dependants=%s inaccessible=unknown\n' "${visible_dependants:-none}"; else printf 'dependants=%s\n' "${visible_dependants:-none}"; fi
     printf 'derived=known indexes, projections, context-packs; residual=bounded exact-scope cleanup on confirmation; inaccessible_scope=%s; raw_custody=preserved provenance=preserved\n' "$([ "$hidden_dependants" -gt 0 ] && printf unknown || printf none)"
+    # 0.10 #10: records the retracted fact could still be inferred from.
+    local neighbours
+    neighbours="$(memory_lineage forget-neighbours --project-dir "$dir" --principal "$principal" --ref "${canonical#"$dir"/}" 2>/dev/null | awk -F '\t' '{ printf "%s%s(%s)", (NR > 1 ? "," : ""), $1, $2 }')"
+    printf 'inferable_neighbours=%s\n' "${neighbours:-none}"
+    [ -z "$neighbours" ] || printf 'note=these records may restate or imply the retracted fact; review, supersede or retract them too\n'
     return 0
   fi
   if [ "$mode" = confirm ]; then
@@ -4700,6 +4705,14 @@ EOF
       [ -z "$principal" ] || principal_visible "$derived" "$principal" || continue
       printf '%s\n' "${derived#"$dir"/}" >>"${file}.affected.$$"
       case "$derived" in
+        # Packs quote excerpts across several lines: drop the whole derived pack.
+        "$dir"/context-packs/*.md) rm -f "$derived" ;;
+        # Summaries carry one line per record with its file name, so only the
+        # dead line drops and the rest of the summary stays useful.
+        "$dir"/indexes/summaries/*.md) tmp="${derived}.tmp.$$"; grep -v -e "$canonical_id" -e "$canonical_hash" "$derived" >"$tmp"; mv "$tmp" "$derived" ;;
+        # Derived projections (associations, evidence projections) that name
+        # the record would let a neighbour re-surface it.
+        "$dir"/projections/*.md) rm -f "$derived" ;;
         *.md) case "$derived" in *"$canonical_id"*) rm -f "$derived" ;; esac ;;
         *) tmp="${derived}.tmp.$$"; grep -v -e "$canonical_id" -e "$canonical_hash" "$derived" >"$tmp" && mv "$tmp" "$derived" || rm -f "$tmp" ;;
       esac

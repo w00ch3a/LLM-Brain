@@ -737,6 +737,8 @@ def summary_text(vault: Vault, folder: Path) -> str:
             continue
         if clean(meta.get("brain_sensitivity") or "internal") != "internal" or ref_list(meta.get("brain_principal")):
             continue  # restricted or principal-scoped records are counted only
+        if (vault.root / "okf" / "retractions" / path.name).is_file():
+            continue  # retracted: forgetting sticks; the tombstone keeps lineage
         when = record_created(meta)
         key = when.strftime("%Y-%m") if when else "undated"
         title = clean(meta.get("title")) or path.stem
@@ -751,7 +753,7 @@ def summary_text(vault: Vault, folder: Path) -> str:
         lines.append("")
     hidden = len(files) - sum(len(v) for v in groups.values())
     if hidden:
-        lines.append(f"({hidden} restricted, scoped or unreadable file(s) not summarised.)")
+        lines.append(f"({hidden} restricted, scoped, retracted or unreadable file(s) not summarised.)")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1640,6 +1642,57 @@ def command_capture_tag(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- 0.10: sticky forgetting (#10)
+
+def forget_neighbours(vault: Vault, ref: str, threshold: float = 0.5) -> list[tuple[str, str]]:
+    """Records from which a retracted record could be inferred: relation links
+    in either direction, association partners, a shared state key, or a body
+    that restates most of the target.  Visible records only."""
+    target = vault.resolver.canonical_ref(ref)
+    if target is None:
+        return []
+    trel = vault.rel(target)
+    tmeta = vault.meta(target)
+    tkey = clean(tmeta.get("brain_state_key"))
+    tshingles = ms.shingles(ms.TOKEN_RE.findall(re.sub(r"\A\s*# [^\n]*\n", "", vault.body(target)).lower()))
+    out: dict[str, str] = {}
+    for field in ms.RELATION_FIELDS:
+        for linked in ref_list(tmeta.get(field)):
+            path = vault.resolver.canonical_ref(linked)
+            if path is not None and path != target and vault.resolver.visible(path, strict_principal=True):
+                out.setdefault(vault.rel(path), f"linked-by-{field.removeprefix('brain_')}")
+    for path in vault.semantic_files():
+        if path == target or not vault.resolver.visible(path, strict_principal=True):
+            continue
+        rel = vault.rel(path)
+        meta = vault.meta(path)
+        for field in ms.RELATION_FIELDS:
+            if any(vault.resolver.canonical_ref(item) == target for item in ref_list(meta.get(field))):
+                out.setdefault(rel, f"links-via-{field.removeprefix('brain_')}")
+        if tkey and clean(meta.get("brain_state_key")) == tkey:
+            out.setdefault(rel, f"same-state-key:{tkey}")
+        if len(tshingles) >= 4:
+            other = ms.shingles(ms.TOKEN_RE.findall(re.sub(r"\A\s*# [^\n]*\n", "", vault.body(path)).lower()))
+            if other and len(tshingles & other) / len(tshingles) >= threshold:
+                out.setdefault(rel, f"restates-{len(tshingles & other) * 100 // len(tshingles)}pct")
+    for _, meta, _ in vault.frontmatter_dir("projections"):
+        if meta.get("type") != "AssociativeProjection" or clean(meta.get("brain_projection_state")) != "active":
+            continue
+        a, b2 = clean(meta.get("brain_association_a")), clean(meta.get("brain_association_b"))
+        other = b2 if a == trel else a if b2 == trel else ""
+        path = vault.resolver.canonical_ref(other) if other else None
+        if path is not None and vault.resolver.visible(path, strict_principal=True):
+            out.setdefault(vault.rel(path), "association")
+    return sorted(out.items())
+
+
+def command_forget_neighbours(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    for rel, why in forget_neighbours(vault, args.ref):
+        print(f"{rel}\t{why}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1758,6 +1811,8 @@ def parser() -> argparse.ArgumentParser:
     ct = commands.add_parser("capture-tag")
     ct.add_argument("--file", required=True)
     ct.set_defaults(func=command_capture_tag)
+    fn = base("forget-neighbours", command_forget_neighbours)
+    fn.add_argument("--ref", required=True)
     ho = base("handover", command_handover)
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")
