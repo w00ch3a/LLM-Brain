@@ -159,11 +159,13 @@ done_id="$(b intention add "$project_id" --action 'Archive raw extracts' --trigg
 b intention done "$project_id" "$done_id" --reason archived >/dev/null
 pack="$(b pack build "$project_id" --task 'archive the extracts' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 grep -Fq 'do not repeat' "$pack" || fail 'completed cue aftereffect missing'
-rev="$(b intention add "$project_id" --action 'Re-run the model' --trigger date:2026-12-01 --observe study.dataset | sed -n 's/.*intention_id=\([^ ]*\).*/\1/p')"
-b intention revise "$project_id" "$rev" --reschedule date:2026-10-15 --reason 'moved up' >/dev/null
+rev="$(b intention add "$project_id" --action 'Re-run the model' --trigger date:2099-12-01 --observe study.dataset | sed -n 's/.*intention_id=\([^ ]*\).*/\1/p')"
+# Relative to today so the "revised, upcoming within 30 days" checks never expire.
+soon="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc).date() + d.timedelta(days=10)).isoformat())')"
+b intention revise "$project_id" "$rev" --reschedule "date:$soon" --reason 'moved up' >/dev/null
 b intention revise "$project_id" "$rev" --override 'Re-run the model on CensusC' --reason 'dataset changed' >/dev/null
 [ "$(tail -n +2 "$project_dir/intentions/$rev.patches.tsv" | wc -l | tr -d ' ')" = 2 ] || fail 'patches not appended'
-grep -Fq 'date:2026-12-01' "$project_dir/intentions/$rev.patches.tsv" || fail 'old trigger not traceable'
+grep -Fq 'date:2099-12-01' "$project_dir/intentions/$rev.patches.tsv" || fail 'old trigger not traceable'
 grep -Fq "revised	$rev" <<<"$(b intention board "$project_id")" || fail 'board does not show revised'
 obs="$(b intention observe "$project_id" --within-days 30)"
 grep -Fq "$rev" <<<"$obs" || fail "observe missed upcoming intention: $obs"
