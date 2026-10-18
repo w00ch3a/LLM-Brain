@@ -6584,6 +6584,7 @@ cmd_eval() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
+  local history_file="" history_hash="" history_line=""
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local -a pack_label_args=()
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
@@ -6724,6 +6725,22 @@ cmd_pack() {
     render_order="$(cut -f1 "${results}.render.$$")"
     rm -f "${results}.render.$$"
   fi
+  # Historical and as-of packs label each record's resolver state
+  # ("HISTORICAL, superseded by X on DATE") and render in observed-time order.
+  if [ "$historical" = 1 ] || [ -n "$as_of" ]; then
+    history_file="$(mktemp "$dir/context-packs/.history.XXXXXX")"
+    printf '%s\n' "$render_order" >"${history_file}.in"
+    local -a history_args=(history-states --project-dir "$dir" --selected "${history_file}.in")
+    [ -z "$principal" ] || history_args+=(--principal "$principal")
+    [ -z "$as_of" ] || history_args+=(--now "$as_of")
+    if [ -n "$render_order" ] && memory_lineage "${history_args[@]}" >"$history_file" 2>/dev/null && [ -s "$history_file" ]; then
+      render_order="$(cut -f1 "$history_file")"
+      history_hash="$(sha256_file "$history_file")"
+    else
+      : >"$history_file"
+    fi
+    rm -f "${history_file}.in"
+  fi
   if [ "$intent" = current_state ]; then
     awk -F '\t' 'NR > 1 && $4 != "current" { print $9 "\t" $1 "\t" $4 ":" $16 }' "$results" >"$warnings"
   fi
@@ -6740,12 +6757,12 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
@@ -6805,6 +6822,10 @@ cmd_pack() {
       lifecycle_warnings="$(lifecycle_bundle_warning_text "$lifecycle_bundle" 2>/dev/null || true)"
       [ -z "$lifecycle_warnings" ] || printf '%s\n\n' "$lifecycle_warnings"
       printf '### %s\n\n%s\n\nType: <code>%s</code>  \nLifecycle: <code>%s</code>  \nTrust: <code>%s</code>  \nFreshness: <code>%s</code>  \nSource hash: <code>%s</code>  \nProvider: <code>%s</code>  \nExpansion: <code>%s</code>\n\n' "$title" "$excerpt" "$type" "$status" "$trust" "$freshness" "$(sha256_file "$source")" "$(frontmatter_field "$source" brain_provider_id)" "$rel"
+      if [ -n "$history_file" ] && [ -s "$history_file" ]; then
+        history_line="$(awk -F '\t' -v path="$rel" '$1 == path { print $4; exit }' "$history_file")"
+        [ -z "$history_line" ] || printf 'Resolver: %s\n\n' "$history_line"
+      fi
       printf 'Evidence group: <code>%s</code>  \nIndependent roots: <code>%s</code>  \nCorrelated records: <code>%s</code>  \nProvenance: <code>%s</code>\n\n' "$evidence_group" "$independent_roots" "$correlated_records" "$provenance_state"
       bytes=$((bytes + evidence_bytes))
       rendered_refs="${rendered_refs}${rendered_refs:+,}${rel}"
@@ -6847,7 +6868,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

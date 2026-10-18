@@ -43,4 +43,17 @@ grep -Fq 'quasar appendix' <<<"$(recall_md "$fixture/q-plan.txt")" || fail '#1 b
 rm -rf "$pdir/sources/abc123def456-plan.md" "$pdir/indexes"/evidence-*
 printf 'idea-1=ok\n'
 
+# ---- #2 historical/as-of packs label resolver state and order by observed time.
+claim tariff-v1 'Tariff rate' 'The tariff rate is 5 percent.' 2026-01-01T00:00:00Z 'brain_observed_at: "2026-01-01T00:00:00Z"'
+claim tariff-v2 'Tariff rate (revised)' 'The tariff rate is 7 percent.' 2026-03-01T00:00:00Z 'brain_observed_at: "2026-03-01T00:00:00Z"' 'brain_supersedes: ["okf/claims/tariff-v1.md"]'
+pack="$(b pack build "$pid" --task 'tariff rate percent' --historical | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq 'Resolver: HISTORICAL, superseded by `okf/claims/tariff-v2.md` (Tariff rate (revised)) on 2026-03-01' "$pack" || fail "#2 historical label missing: $(cat "$pack")"
+grep -Fq 'Resolver: CURRENT as of' "$pack" || fail '#2 current label missing'
+[ "$(grep -n '^### Tariff rate' "$pack" | head -1 | cut -d: -f2-)" = '### Tariff rate' ] || fail '#2 not ordered by observed time'
+asof="$(b pack build "$pid" --task 'tariff rate percent' --as-of 2026-02-01T00:00:00Z | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+! grep -Fq 'HISTORICAL' "$asof" || fail '#2 as-of pack labelled a record superseded after the as-of date'
+plain="$(b pack build "$pid" --task 'tariff rate percent' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+! grep -Fq 'Resolver:' "$plain" || fail '#2 default pack gained resolver lines (token cost)'
+printf 'idea-2=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

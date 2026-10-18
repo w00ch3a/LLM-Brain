@@ -1113,6 +1113,70 @@ def command_brief_extras(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------- 0.10: history labels (#2)
+
+def history_state(vault: Vault, path: Path, now: dt.datetime, derived: dict) -> tuple[str, str]:
+    """(state, one-line label) for a record as of ``now``; deterministic and small."""
+    rel = vault.rel(path)
+    entries = derived.get(rel, [])
+    for label, target, stamp in entries:
+        when = parse_time(stamp)
+        if label == "retracted" and (when is None or when <= now):
+            return "retracted", f"RETRACTED{(' on ' + when.date().isoformat()) if when else ''} (`{target}`)"
+    later = []
+    for label, target, stamp in entries:
+        when = parse_time(stamp)
+        if label in ("superseded-by", "revised") and (when is None or when <= now):
+            later.append((when or now, target))
+    if later:
+        when, target = sorted(later)[-1]
+        tpath = vault.resolver.canonical_ref(target)
+        title = _one(vault.title(tpath), 80) if tpath is not None else target
+        return "historical", f"HISTORICAL, superseded by `{target}` ({title}) on {when.date().isoformat()}"
+    meta = vault.meta(path)
+    valid_to = parse_time(meta.get("brain_valid_to"))
+    if valid_to is not None and valid_to <= now:
+        return "expired", f"EXPIRED on {valid_to.date().isoformat()} (valid_to)"
+    key = clean(meta.get("brain_state_key"))
+    created = _created(vault, path)
+    if key and created is not None:
+        newer = []
+        for other in vault.semantic_files():
+            if other == path or clean(vault.meta(other).get("brain_state_key")) != key:
+                continue
+            if not vault.resolver.effective(other) or not vault.resolver.visible(other, strict_principal=True):
+                continue
+            when = _created(vault, other)
+            if when is not None and created < when <= now:
+                newer.append((when, vault.rel(other)))
+        if newer:
+            when, target = sorted(newer)[-1]
+            # A shared state key is a hint, not a supersession: say so.
+            return "older-value", f"OLDER VALUE for state `{key}`; newer record `{target}` on {when.date().isoformat()} (not an explicit supersession)"
+    return "current", f"CURRENT as of {now.date().isoformat()}"
+
+
+def command_history_states(args: argparse.Namespace) -> int:
+    """Selected refs in observed-time order with their resolver state label."""
+    vault = Vault(args.project_dir, args.principal)
+    now = now_from(args.now)
+    derived = derived_labels(vault)
+    refs = [line.strip() for line in Path(args.selected).read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = []
+    for index, ref in enumerate(refs):
+        path = vault.resolver.canonical_ref(ref)
+        if path is None:
+            rows.append((dt.datetime.max.replace(tzinfo=dt.timezone.utc), index, ref, "", "unknown"))
+            continue
+        state, label = history_state(vault, path, now, derived)
+        created = _created(vault, path) or dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        rows.append((created, index, ref, label, state))
+    for created, _, ref, label, state in sorted(rows, key=lambda row: (row[0], row[1])):
+        observed = "" if created.year == dt.MAXYEAR else iso(created)
+        print(f"{ref}\t{observed}\t{state}\t{label}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1207,6 +1271,8 @@ def parser() -> argparse.ArgumentParser:
     pe.add_argument("--session", default="")
     pe.add_argument("--state-index", action="store_true")
     base("brief-extras", command_brief_extras)
+    hs = base("history-states", command_history_states)
+    hs.add_argument("--selected", required=True)
     return result
 
 
