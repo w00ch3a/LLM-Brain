@@ -1177,6 +1177,104 @@ def command_history_states(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------- 0.10: session handover (#3)
+
+HANDOVER_LIMIT = 8
+
+
+def handover_changes(vault: Vault, since: dt.datetime, now: dt.datetime, limit: int = HANDOVER_LIMIT) -> list[str]:
+    """Approved changes visible to this principal since ``since``: new or
+    re-verified records, supersessions and retractions.  Newest first."""
+    events: list[tuple[dt.datetime, str]] = []
+    seen: set[str] = set()
+    derived = derived_labels(vault)
+    for ref, entries in derived.items():
+        for label, target, stamp in entries:
+            when = parse_time(stamp)
+            if when is None or not (since < when <= now):
+                continue
+            path = vault.resolver.canonical_ref(ref)
+            title = _one(vault.title(path), 70) if path is not None else ref
+            if label == "superseded-by":
+                events.append((when, f"- {when.date().isoformat()} superseded: {title} → `{target}`"))
+                seen.add(target)
+            elif label == "retracted":
+                events.append((when, f"- {when.date().isoformat()} retracted: {title} (`{ref}`)"))
+    for path in vault.semantic_files():
+        if not vault.eligible(path, now, include_cold=True):
+            continue
+        rel = vault.rel(path)
+        if rel in seen:
+            continue
+        meta = vault.meta(path)
+        times = [record_created(meta), parse_time(meta.get("brain_reviewed_at")), *ms.verification_times(meta)]
+        changed = max([t for t in times if t is not None and since < t <= now], default=None)
+        if changed is not None:
+            events.append((changed, f"- {changed.date().isoformat()} new or re-verified: {_one(vault.title(path), 70)} (`{rel}`)"))
+    events.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    lines = [line for _, line in events[:limit]]
+    if len(events) > limit:
+        lines.append(f"- … {len(events) - limit} more; run `llm-brain lineage show` or search for detail")
+    return lines
+
+
+def _touches(text: str) -> set[str]:
+    found = {"path:" + match.group(1).strip("./") for match in ms.PATH_HINT_RE.finditer(text or "")}
+    found |= {"state:" + match.group(1) for match in re.finditer(r"\bstate[:=]\s*([A-Za-z0-9_.-]+)", text or "")}
+    return found
+
+
+def handover_collisions(vault: Vault, session: str = "", limit: int = 6) -> list[str]:
+    """Open work from other sessions/agents, flagging shared paths or state keys."""
+    owners: dict[str, set[str]] = {}
+    other: list[str] = []
+    for item in open_working(vault.root):
+        owner = item.get("session") or "-"
+        for key in _touches(item.get("text", "")):
+            owners.setdefault(key, set()).add(owner)
+        if session and owner not in ("-", session):
+            other.append(f"- [{owner}] {item['text']} (`{item['item_id']}`)")
+    for path, meta, _ in vault.frontmatter_dir("intentions"):
+        if meta.get("type") != "Intention" or (clean(meta.get("brain_intention_status")) or "open") != "open":
+            continue
+        scoped = ref_list(meta.get("brain_principal"))
+        if scoped and vault.principal not in scoped:
+            continue
+        kind, value = clean(meta.get("brain_trigger_kind")), clean(meta.get("brain_trigger_value"))
+        key = {"path": "path:" + value.strip("./"), "state": "state:" + value}.get(kind)
+        if key:
+            owners.setdefault(key, set()).add("intention:" + (clean(meta.get("brain_intention_id")) or path.stem))
+    lines = [line for line in other[:limit]]
+    for key in sorted(owners):
+        if len(owners[key]) >= 2:
+            lines.append(f"- COLLISION on `{key.split(':', 1)[1]}`: {', '.join(sorted(owners[key]))} — coordinate before editing")
+    return lines[: limit + 4]
+
+
+def command_handover(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    now = now_from(args.now)
+    since = parse_time(args.since) if args.since else None
+    if args.since and since is None:
+        print("--since must be an ISO-8601 datetime with timezone", file=sys.stderr)
+        return 64
+    payload = {
+        "status": "ok", "derived": True, "since": iso(since) if since else None,
+        "changes": handover_changes(vault, since, now) if since else [],
+        "others": handover_collisions(vault, args.session),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if since:
+        print(f"Since your last session ({since.date().isoformat()}):")
+        print("\n".join(payload["changes"]) or "- no approved changes")
+    if payload["others"]:
+        print("Other agents' open work here:")
+        print("\n".join(payload["others"]))
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1271,6 +1369,10 @@ def parser() -> argparse.ArgumentParser:
     pe.add_argument("--session", default="")
     pe.add_argument("--state-index", action="store_true")
     base("brief-extras", command_brief_extras)
+    ho = base("handover", command_handover)
+    ho.add_argument("--since", default="")
+    ho.add_argument("--session", default="")
+    ho.add_argument("--json", action="store_true")
     hs = base("history-states", command_history_states)
     hs.add_argument("--selected", required=True)
     return result

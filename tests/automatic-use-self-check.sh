@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="$(tr -d '[:space:]' <"$repo_root/VERSION")"
+hook_state="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-hook-state.XXXXXX")"
+trap 'rm -rf "$hook_state"' EXIT
+export XDG_STATE_HOME="$hook_state"
 contract="$("$repo_root/hooks/session-start.sh")"
 archive_members="$(tar -tzf "$repo_root/dist/llm-brain-${version}-plugin.tar.gz")"
 standalone_members="$(tar -tzf "$repo_root/dist/llm-brain-${version}-standalone.tar.gz")"

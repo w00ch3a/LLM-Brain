@@ -56,4 +56,29 @@ plain="$(b pack build "$pid" --task 'tariff rate percent' | sed -n 's/.*file=\([
 ! grep -Fq 'Resolver:' "$plain" || fail '#2 default pack gained resolver lines (token cost)'
 printf 'idea-2=ok\n'
 
+# ---- #3 session handover: changes since the last session and other agents' work.
+claim deploy-new 'Deploy window' 'Deploys happen on Tuesdays.' 2026-05-02T00:00:00Z 'brain_observed_at: "2026-05-02T00:00:00Z"'
+brief="$(b brief "$pid" --since 2026-04-01T00:00:00Z)"
+grep -Fq 'Since your last session (2026-04-01):' <<<"$brief" || fail "#3 handover heading missing: $brief"
+grep -Fq 'new or re-verified: Deploy window' <<<"$brief" || fail '#3 new record missing from handover'
+! grep -Fq 'new or re-verified: Tariff rate (revised)' <<<"$brief" || fail '#3 handover listed a change older than --since'
+grep -Fq -- '- no approved changes' <<<"$(b brief "$pid" --since 2030-01-01T00:00:00Z --max-bytes 8000)" || fail '#3 empty handover not stated'
+! grep -Fq 'Since your last session' <<<"$(b brief "$pid")" || fail '#3 default brief grew a handover without --since'
+b working add "$pid" 'Refactor lib/okf.py parser' --session agent:codex >/dev/null
+b working add "$pid" 'Tidy lib/okf.py imports' --session agent:hermes >/dev/null
+brief="$(b brief "$pid" --session agent:hermes)"
+grep -Fq "Other agents' open work here:" <<<"$brief" || fail "#3 other agents section missing: $brief"
+grep -Fq '[agent:codex] Refactor lib/okf.py parser' <<<"$brief" || fail '#3 other agent item missing'
+grep -Fq 'COLLISION on `lib/okf.py`: agent:codex, agent:hermes' <<<"$brief" || fail '#3 collision not flagged'
+# The hook keeps its marker outside the vault and passes --since next time.
+hook_state="$fixture/hook-state"
+(cd "$workspace" && XDG_STATE_HOME="$hook_state" LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh") >/dev/null
+[ "$(find "$hook_state/llm-brain/sessions" -type f | wc -l | tr -d ' ')" = 1 ] || fail '#3 hook did not record the session marker'
+second="$(cd "$workspace" && XDG_STATE_HOME="$hook_state" LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh")"
+grep -Fq 'Since your last session' <<<"$second" || fail '#3 hook did not pass --since on the next session'
+[ ! -d "$pdir/sessions" ] || fail '#3 handover wrote into the vault'
+b working done "$pid" "$(b working list "$pid" | awk -F '\t' 'NR>1 {print $1}' | head -1)" >/dev/null
+b working done "$pid" "$(b working list "$pid" | awk -F '\t' 'NR>1 {print $1}' | head -1)" >/dev/null
+printf 'idea-3=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

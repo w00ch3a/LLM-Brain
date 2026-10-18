@@ -74,10 +74,10 @@ grep -Fq 'HTTP retry limit' <<<"$(b brief "$project_id")" || fail 'brief lacks d
 grep -Fq "$project_id" <<<"$(b brief --source-root "$workspace")" || fail 'brief did not resolve the source root'
 [ -z "$(b brief --source-root "$fixture/bad")" ] || fail 'brief invented a project'
 [ ! -d "$vault/projects/proj_bad" ] || fail 'brief created a project'
-hook_output="$(cd "$workspace" && LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh")"
+hook_output="$(cd "$workspace" && XDG_STATE_HOME="$fixture/state" LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh")"
 grep -Fq 'Do not require the user to name LLM-Brain.' <<<"$hook_output" || fail 'hook lost its contract'
 grep -Fq 'LLM-BRAIN PROJECT BRIEF' <<<"$hook_output" || fail 'hook did not inject the brief'
-hook_output="$(cd "$workspace" && LLM_BRAIN_SESSION_BRIEF=0 LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh")"
+hook_output="$(cd "$workspace" && XDG_STATE_HOME="$fixture/state" LLM_BRAIN_SESSION_BRIEF=0 LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh")"
 ! grep -Fq 'PROJECT BRIEF' <<<"$hook_output" || fail 'LLM_BRAIN_SESSION_BRIEF=0 was ignored'
 
 # 8. Intentions: deterministic triggers, due ones first in packs.

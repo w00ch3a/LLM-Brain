@@ -1274,6 +1274,11 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
     sections: list[tuple[str, list[str]]] = []
     if payload["due_intentions"]:
         sections.append(("Due intentions:", [f"- {item}" for item in payload["due_intentions"]]))
+    if payload.get("handover"):
+        since, changes = payload["handover"]
+        sections.append((f"Since your last session ({since.date().isoformat()}):", changes or ["- no approved changes"]))
+    if payload.get("others"):
+        sections.append(("Other agents' open work here:", payload["others"]))
     if payload.get("working"):
         sections.append(("Open working items (short-horizon, not durable):", payload["working"]))
     if payload.get("notices"):
@@ -1323,10 +1328,21 @@ def command_brief(args: argparse.Namespace) -> int:
     try:
         import memory_lineage
         payload["working"] = [
-            f"- [{item['kind']}] {item['text']} ({item['item_id']})" for item in memory_lineage.open_working(vault.root)[:6]
+            f"- [{item['kind']}] {item['text']} ({item['item_id']})" for item in memory_lineage.open_working(vault.root, getattr(args, "session", "") or "")[:6]
         ]
     except Exception:  # an older partial install without the lineage helper
         payload["working"] = []
+    # Session handover (0.10): what changed since the caller's last session
+    # and other agents' open work, with collisions on shared paths/state keys.
+    payload["handover"], payload["others"] = None, []
+    try:
+        import memory_lineage
+        since = parse_time(getattr(args, "since", "")) if getattr(args, "since", "") else None
+        if since is not None:
+            payload["handover"] = (since, memory_lineage.handover_changes(vault, since, now))
+        payload["others"] = memory_lineage.handover_collisions(vault, getattr(args, "session", "") or "")
+    except Exception:
+        pass
     text, omitted = render_brief(args.project_id, payload, max_bytes, args.recent_days, now)
     compacted = False
     if omitted and not args.no_compact:
@@ -1499,6 +1515,8 @@ def parser() -> argparse.ArgumentParser:
     brief.add_argument("--recent-days", type=int, default=14)
     brief.add_argument("--json", action="store_true")
     brief.add_argument("--no-compact", action="store_true")
+    brief.add_argument("--since", default="")
+    brief.add_argument("--session", default="")
 
     notices = base("notices", command_notices)
     notices.add_argument("--task", default="")

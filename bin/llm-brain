@@ -91,7 +91,7 @@ Commands:
   work run-once PROJECT_ID [--provider EXECUTABLE]
   work status|recover PROJECT_ID
   maintenance preview|run|status PROJECT_ID [--principal ID] [--limit N] [--json] [--strict]
-  brief [PROJECT_ID] [--source-root PATH] [--max-bytes N] [--recent-days N] [--principal ID] [--json]
+  brief [PROJECT_ID] [--source-root PATH] [--max-bytes N] [--recent-days N] [--principal ID] [--since ISO] [--session ID] [--json]   --since adds the session handover
   intention add PROJECT_ID --action TEXT --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY [--principal ID]
   intention list PROJECT_ID [--status open|done|cancelled|all] [--due] [--task TEXT] [--path FILE] [--json]
   intention done|cancel PROJECT_ID INTENTION_ID --reason TEXT
@@ -7304,9 +7304,11 @@ project_lookup_readonly() {
 # Size-capped, derived project brief: durable approved facts plus recent
 # changes.  Read-only; safe for SessionStart hooks.
 cmd_brief() {
-  local project_id="" source_root="" principal="" max_bytes=4000 recent_days=14 json=0 no_compact=0 dir
+  local project_id="" source_root="" principal="" max_bytes=4000 recent_days=14 json=0 no_compact=0 dir since="" session=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --since) since="${2:-}"; shift 2 ;;
+      --session) session="${2:-}"; shift 2 ;;
       --source-root) source_root="${2:-}"; shift 2 ;;
       --principal) principal="${2:-}"; shift 2 ;;
       --max-bytes) max_bytes="${2:-}"; shift 2 ;;
@@ -7332,6 +7334,9 @@ cmd_brief() {
   local -a args=(brief --project-dir "$dir" --project-id "$project_id" --max-bytes "$max_bytes" --recent-days "$recent_days")
   [ -z "$principal" ] || args+=(--principal "$principal")
   [ "$json" = 0 ] || args+=(--json)
+  [ -z "$since" ] || { brain_datetime_valid "$since" || die 65 "--since must be an ISO-8601 UTC datetime"; args+=(--since "$since"); }
+  validate_scalar "$session" || die 65 "--session must be a single line"
+  [ -z "$session" ] || args+=(--session "$session")
   { [ "$no_compact" = 0 ] && [ "${LLM_BRAIN_BRIEF_COMPACT:-1}" != 0 ]; } || args+=(--no-compact)
   memory_signals "${args[@]}"
 }

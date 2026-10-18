@@ -16,10 +16,33 @@ done
 command -v bash >/dev/null 2>&1 || exit 0
 brief_bytes=${LLM_BRAIN_SESSION_BRIEF_BYTES:-4000}
 case "$brief_bytes" in ''|*[!0-9]*) brief_bytes=4000 ;; esac
-if command -v timeout >/dev/null 2>&1; then
-  brief=$(timeout 3 bash "$cli" brief --source-root "$PWD" --max-bytes "$brief_bytes" 2>/dev/null) || brief=""
-else
-  brief=$(bash "$cli" brief --source-root "$PWD" --max-bytes "$brief_bytes" 2>/dev/null) || brief=""
+set -- brief --source-root "$PWD" --max-bytes "$brief_bytes"
+# Session handover: a host-side marker (outside the vault) remembers when this
+# agent last started here, so the brief can say what changed since then.
+# Disable with LLM_BRAIN_HANDOVER=0.
+marker=""
+if [ "${LLM_BRAIN_HANDOVER:-1}" != "0" ]; then
+  agent=${LLM_BRAIN_AGENT:-claude-code}
+  state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/sessions
+  key=$(printf '%s|%s' "$PWD" "$agent" | cksum 2>/dev/null | awk '{ print $1 }')
+  if [ -n "$key" ]; then
+    marker="$state_dir/$key"
+    since=$(head -n 1 "$marker" 2>/dev/null || true)
+    case "$since" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) set -- "$@" --since "$since" ;;
+    esac
+    [ -z "${LLM_BRAIN_AGENT:-}" ] || set -- "$@" --session "$agent"
+  fi
 fi
-[ -n "$brief" ] && printf '\n%s\n' "$brief"
+if command -v timeout >/dev/null 2>&1; then
+  brief=$(timeout 3 bash "$cli" "$@" 2>/dev/null) || brief=""
+else
+  brief=$(bash "$cli" "$@" 2>/dev/null) || brief=""
+fi
+if [ -n "$brief" ]; then
+  printf '\n%s\n' "$brief"
+  if [ -n "$marker" ]; then
+    (umask 077; mkdir -p "$state_dir" 2>/dev/null && date -u '+%Y-%m-%dT%H:%M:%SZ' >"$marker" 2>/dev/null) || true
+  fi
+fi
 exit 0
