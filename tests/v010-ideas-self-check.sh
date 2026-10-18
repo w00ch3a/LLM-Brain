@@ -202,4 +202,38 @@ cp "$fixture/writer.bak" "$vault/writer.format"
 b working add "$pid" 'allowed again' >/dev/null || fail '#8 same-level write refused'
 printf 'idea-8=ok\n'
 
+# ---- #9 per-person privacy: every surface respects principal visibility.
+claim alice-old 'Alice clinic appointment' 'Alice sees the cardiologist on Friday.' 2026-01-05T00:00:00Z 'brain_principal: "alice"' 'brain_observed_at: "2026-01-05T00:00:00Z"'
+claim alice-new 'Alice clinic update' 'Alice moved the cardiologist visit to Monday.' 2026-02-05T00:00:00Z 'brain_principal: "alice"' 'brain_supersedes: ["okf/claims/alice-old.md"]' 'brain_observed_at: "2026-02-05T00:00:00Z"'
+b association build "$pid" okf/claims/deploy-new.md okf/claims/alice-new.md --reason 'co-used' >/dev/null
+for surface in \
+  "search $pid cardiologist --principal bob" \
+  "search $pid cardiologist --principal bob --historical --as-of 2026-06-01T00:00:00Z" \
+  "search $pid deploy-window-tuesdays --principal bob --expand-graph" \
+  "brief $pid --principal bob --since 2026-01-01T00:00:00Z --max-bytes 8000" \
+  "forgotten $pid --principal bob --days 1" \
+  "lineage show $pid --topic clinic" \
+  "state index $pid"; do
+  # shellcheck disable=SC2086
+  out="$(b $surface 2>&1 || true)"
+  ! grep -Eqi 'cardiologist|alice-(old|new)|Alice clinic' <<<"$out" || fail "#9 leak via '$surface': $out"
+done
+"$py" -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["matched"]==0 and d["gates"]["applicability"]==0, d' "$(b gates "$pid" cardiologist --principal bob --json)" || fail '#9 gates revealed that hidden memory matches'
+hist="$(b pack build "$pid" --task 'deploy window tuesdays' --historical --principal bob | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+! grep -Eqi 'cardiologist|Alice' "$hist" || fail '#9 historical pack leaked a scoped record'
+b browse build "$pid" >/dev/null
+! grep -rEqi 'cardiologist|Alice clinic' "$pdir/indexes/summaries" || fail '#9 folder summaries leaked a scoped record'
+b index build "$pid" >/dev/null 2>&1
+LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 b neural-expansion export "$pid" --principal bob --output "$fixture/ne-bob.html" >/dev/null
+! grep -Eqi 'cardiologist|Alice clinic' "$fixture/ne-bob.html" || fail '#9 Neural Expansion export leaked a scoped record'
+LLM_BRAIN_NEURAL_EXPANSION_EXPORT=1 b neural-expansion export "$pid" --principal alice --output "$fixture/ne-alice.html" >/dev/null
+grep -Fq 'cardiologist' "$fixture/ne-alice.html" || fail '#9 owner lost their own record in the export'
+# Unscoped callers see scoped records by default (unchanged); strict mode hides them.
+grep -Fq okf/claims/alice-new.md <<<"$(b search "$pid" cardiologist)" || fail '#9 default unscoped behaviour changed'
+! grep -Fq okf/claims/alice-new.md <<<"$(LLM_BRAIN_STRICT_PRINCIPAL=1 b search "$pid" cardiologist)" || fail '#9 strict mode leaked to an unscoped caller'
+printf 'cardiologist visit\n' >"$fixture/q-card.txt"
+! grep -Fq 'cardiologist' <<<"$(LLM_BRAIN_STRICT_PRINCIPAL=1 recall_md "$fixture/q-card.txt")" || fail '#9 strict mode leaked through bridge recall'
+grep -Fq 'cardiologist' <<<"$(recall_md "$fixture/q-card.txt" --principal alice)" || fail '#9 owner lost recall'
+printf 'idea-9=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

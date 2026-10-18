@@ -557,6 +557,10 @@ def gate_report(vault: Vault, query: str, now: dt.datetime) -> dict[str, Any]:
     resolver = vault.resolver
     for path in vault.semantic_files():
         meta = vault.meta(path)
+        # 0.10 #9: a record scoped to another principal does not exist for
+        # this caller, so its words must not even be matched or counted.
+        if (clean(meta.get("brain_sensitivity")) or "internal") == "internal" and not resolver.visible(path, strict_principal=True):
+            continue
         hay = (vault.title(path) + " " + vault.body(path) + " " + clean(meta.get("brain_state_key"))).lower()
         if not terms or not any(term in hay for term in terms):
             continue

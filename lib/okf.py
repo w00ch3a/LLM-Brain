@@ -977,7 +977,9 @@ class LifecycleResolver:
         if not identities:
             return True
         if not self.principal:
-            return not strict_principal
+            # LLM_BRAIN_STRICT_PRINCIPAL=1: callers without a principal see
+            # only unscoped records (per-person brains on shared hosts).
+            return not strict_principal and os.environ.get("LLM_BRAIN_STRICT_PRINCIPAL", "0") != "1"
         return self.principal in identities
 
     def effective(self, path: Path) -> bool:

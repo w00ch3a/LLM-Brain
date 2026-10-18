@@ -5223,10 +5223,13 @@ visibility_matches() {
 
 principal_visible() {
   local file="$1" principal="$2" scope audience
-  [ -z "$principal" ] && return 0
+  # Without a principal every record is visible unless the operator opts into
+  # strict per-person scoping (0.10 #9): then only unscoped records are.
+  [ -z "$principal" ] && [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] && return 0
   scope="$(frontmatter_field "$file" brain_principal)"
   audience="$(frontmatter_field "$file" brain_audience)"
   [ -z "$scope" ] && [ -z "$audience" ] && return 0
+  [ -n "$principal" ] || return 1
   visibility_matches "$scope" "$principal" && return 0
   visibility_matches "$audience" "$principal"
 }
