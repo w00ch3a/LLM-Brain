@@ -78,7 +78,7 @@ Commands:
   ingest FILE [--topic ID] [--capture-only|--manual-only] [--provider EXECUTABLE]
   ingest-source PROJECT_ID FILE [ROOT]                 Compatibility custody command
   reflect list|prepare|submit|run PROJECT_ID [ARGS]
-  review list|show|decide PROJECT_ID [ARGS]
+  review list|show|decide PROJECT_ID [ARGS]   decide ... approved --as-fact promotes a hypothetical/proposal you have agreed to
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
@@ -2679,6 +2679,7 @@ auto_promote_eligible() {
   origin="$(frontmatter_field "$file" brain_authority_origin)"
   provenance="$(frontmatter_field "$file" brain_provenance)"
   case "$kind" in claim|procedure|reference) ;; *) return 1 ;; esac
+  case "$(frontmatter_field "$file" brain_capture_tag)" in hypothetical|proposal) return 1 ;; esac
   [ "$risk" = "low" ] || return 1
   [ "$sensitivity" != "restricted" ] || return 1
   awk -v value="$confidence" 'BEGIN { exit !(value + 0 >= 0.90) }' || return 1
@@ -2819,6 +2820,12 @@ promote_review_locked() {
   state="$(frontmatter_field "$review" brain_review_state review_state)"
   case "$kind" in claim) dest="$dir/okf/claims/$review_id.md" ;; procedure) dest="$dir/okf/procedures/$review_id.md" ;; reference) dest="$dir/okf/references/$review_id.md" ;; *) say_error "review kind cannot be promoted: $kind"; return 65 ;; esac
   case "$state" in proposed|needs-validation|approved) ;; *) say_error "review cannot be promoted from state: $state"; return 65 ;; esac
+  case "$(frontmatter_field "$review" brain_capture_tag)" in
+    hypothetical|proposal)
+      say_error "review $review_id is tagged $(frontmatter_field "$review" brain_capture_tag); only facts are promoted (review decide ... --as-fact if it is now agreed)"
+      return 65
+      ;;
+  esac
   if [ -f "$dest" ]; then
     if grep -Fq "review://$review_id" "$dest"; then printf 'promotion=idempotent review_id=%s canonical=%s\n' "$review_id" "$dest"; return 0; fi
     local conflict
@@ -2900,6 +2907,7 @@ promote_review() {
 }
 
 submit_candidate() {
+  local capture_tag_value=""
   local project_id="$1" candidate="$2" auto="${3:-1}" dir kind id title file hash policy proposed effective decision transition transition_state transition_reason provider_actor status=0 promoted=0
   require_project "$project_id" dir
   if candidate_valid "$candidate"; then
@@ -2927,6 +2935,14 @@ submit_candidate() {
     set_frontmatter_field "$file" brain_candidate_id "$id"
     set_frontmatter_field "$file" brain_review_state proposed
     set_frontmatter_field "$file" brain_schema_version "$SCHEMA_VERSION"
+    # 0.10 capture tag: fact|hypothetical|proposal, deterministic and
+    # automatic; only facts are promoted (see promote_review_locked).
+    case "$kind" in
+      claim|procedure|reference)
+        capture_tag_value="$(memory_lineage capture-tag --file "$file" 2>/dev/null | cut -f1)"
+        case "$capture_tag_value" in fact|hypothetical|proposal) set_frontmatter_field "$file" brain_capture_tag "$capture_tag_value" ;; esac
+        ;;
+    esac
     audit_v2 "$dir" "reflection-submit" "$id" "" "proposed" "$hash" "kind=$kind"
   fi
   policy="$(commitment_policy)"
@@ -2946,8 +2962,15 @@ submit_candidate() {
     if [ "$policy" = enforce ]; then
       case "$effective" in
         persist)
+          case "$(frontmatter_field "$file" brain_capture_tag)" in
+            hypothetical|proposal)
+              set_frontmatter_field "$file" brain_review_reason "capture-tag-$(frontmatter_field "$file" brain_capture_tag)"
+              ;;
+            *)
           provider_actor="provider:$(frontmatter_field "$file" brain_provider_id)"
           if promote_review_locked "$project_id" "$id" "$provider_actor" "automatic-policy"; then promoted=1; else status=$?; fi
+              ;;
+          esac
           ;;
         quarantine)
           commitment_quarantine_locked "$project_id" "$file" "commitment-quarantine"
@@ -4474,9 +4497,9 @@ cmd_review() {
       cat "$dir/review/$id.md" 2>/dev/null || die 66 "review missing: $id"
       ;;
     decide)
-      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind
+      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       case "$state" in proposed|needs-validation|approved|rejected|superseded) ;; *) die 64 "invalid review state" ;; esac
       local dir file old
@@ -4512,7 +4535,13 @@ cmd_review() {
             return 0
             ;;
         esac
-        local promotion_status=0
+        local promotion_status=0 previous_tag
+        previous_tag="$(frontmatter_field "$file" brain_capture_tag)"
+        if [ "$as_fact" = 1 ] && [ -n "$previous_tag" ] && [ "$previous_tag" != fact ]; then
+          set_frontmatter_field "$file" brain_capture_tag fact
+          set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
+          audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
+        fi
         if promote_review_locked "$project_id" "$id" "$actor" "$reason"; then :; else promotion_status=$?; fi
         release_lock
         return "$promotion_status"

@@ -149,4 +149,43 @@ before="$(cd "$hc" && ls -l --time-style=+%s . | shasum -a 256)"; b health "$hpi
 [ "$before" = "$(cd "$hc" && ls -l --time-style=+%s . | shasum -a 256)" ] || fail '#6 health changed files'
 printf 'idea-6=ok\n'
 
+# ---- #7 automatic capture tags: deterministic, only facts promote.
+cand() { # id title statement
+  cat >"$fixture/cand-$1.md" <<EOT
+---
+type: Claim
+title: "$2"
+brain_review_kind: claim
+brain_candidate_id: $1
+brain_confidence: 0.5
+brain_risk: medium
+brain_sensitivity: internal
+brain_provenance: "review://$1"
+brain_provider_id: "self-check"
+brain_provider_version: "1"
+brain_source_authority: external-observation
+---
+# $2
+
+Candidate statement: $3
+EOT
+  b reflect submit "$pid" "$fixture/cand-$1.md" >/dev/null 2>&1 || true
+}
+cand cap_fact 'Backups run nightly' 'Backups run nightly at 02:00 on the NAS.'
+cand cap_hypo 'Backup outage scenario' 'What if the NAS fails during the nightly backup window?'
+cand cap_prop 'Backup schedule idea' 'I suggest we move backups to 03:00 to avoid the sync.'
+for pair in cap_fact:fact cap_hypo:hypothetical cap_prop:proposal; do
+  grep -Fxq "brain_capture_tag: ${pair#*:}" "$pdir/review/${pair%%:*}.md" || fail "#7 ${pair%%:*} not tagged ${pair#*:}"
+done
+b review decide "$pid" cap_hypo approved --reason 'try' >/dev/null 2>&1 && fail '#7 hypothetical was promoted'
+[ ! -f "$claims/cap_hypo.md" ] || fail '#7 hypothetical reached canonical memory'
+b review decide "$pid" cap_fact approved --reason 'checked' >/dev/null || fail '#7 fact did not promote'
+[ -f "$claims/cap_fact.md" ] || fail '#7 promoted fact missing'
+b review decide "$pid" cap_prop approved --as-fact --reason 'agreed in chat' >/dev/null || fail '#7 --as-fact override failed'
+grep -Fxq 'brain_capture_tag_previous: proposal' "$pdir/review/cap_prop.md" || fail '#7 override lost the previous tag'
+grep -Fq 'capture-tag-override' "$pdir/audit.v2.tsv" || fail '#7 override not audited'
+printf -- '---\ntype: Claim\ntitle: "x"\nbrain_capture_tag: hypothetical\n---\nplain fact text\n' >"$fixture/declared.md"
+[ "$(lineage capture-tag --file "$fixture/declared.md" | cut -f1)" = hypothetical ] || fail '#7 declared tag ignored'
+printf 'idea-7=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

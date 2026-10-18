@@ -1599,6 +1599,43 @@ def command_health(args: argparse.Namespace) -> int:
     return 0 if args.fail_under is None or score >= args.fail_under else 1
 
 
+# ------------------------------------------- 0.10: capture tags (#7)
+
+CAPTURE_TAGS = ("fact", "hypothetical", "proposal")
+HYPOTHETICAL_RE = re.compile(r"\b(what if|suppose|supposing|hypothetical(?:ly)?|imagine|imagining|in a simulation|simulated (?:run|result|outcome)s?|would happen if|assuming (?:that|we)|if we were to|thought experiment)\b", re.I)
+PROPOSAL_RE = re.compile(r"\b(i (?:suggest|propose|recommend)|we (?:could|might) (?:try|use|switch|add|move)|we should consider|let'?s (?:try|use|switch|add|move|go with)|shall we|how about|proposal:|proposed plan|draft plan|one option is|option [0-9a-c]\b|consider (?:using|switching|adding|moving))", re.I)
+
+
+def capture_tag(meta: dict[str, Any], body: str) -> tuple[str, str]:
+    """Deterministic fact/hypothetical/proposal tag for a capture candidate."""
+    declared = clean(meta.get("brain_capture_tag")).lower()
+    if declared in CAPTURE_TAGS:
+        return declared, "declared"
+    if clean(meta.get("brain_grounding")).lower() == "unacknowledged":
+        return "proposal", "grounding:unacknowledged"
+    statement = ""
+    match = re.search(r"^Candidate statement:\s*(.+)$", body or "", re.M)
+    text = f"{clean(meta.get('title'))}\n{match.group(1) if match else (body or '')[:600]}"
+    hit = HYPOTHETICAL_RE.search(text)
+    if hit:
+        return "hypothetical", f"cue:{hit.group(1).lower()}"
+    hit = PROPOSAL_RE.search(text)
+    if hit:
+        return "proposal", f"cue:{hit.group(1).lower()}"
+    return "fact", "default"
+
+
+def command_capture_tag(args: argparse.Namespace) -> int:
+    try:
+        meta, body = okf.split_frontmatter(Path(args.file))
+    except okf.OkfError as exc:
+        print(f"capture-tag: {exc}", file=sys.stderr)
+        return 65
+    tag, why = capture_tag(meta, body)
+    print(f"{tag}\t{why}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1714,6 +1751,9 @@ def parser() -> argparse.ArgumentParser:
     hl.add_argument("--hosts", choices=("none", "auto"), default="none")
     hl.add_argument("--fail-under", type=int, default=None)
     hl.add_argument("--json", action="store_true")
+    ct = commands.add_parser("capture-tag")
+    ct.add_argument("--file", required=True)
+    ct.set_defaults(func=command_capture_tag)
     ho = base("handover", command_handover)
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")
