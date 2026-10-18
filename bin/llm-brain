@@ -22,6 +22,10 @@ else
   DETECTED_PACKAGE_ROOT="$SCRIPT_DIR"
 fi
 SCHEMA_VERSION="3"
+# Writer format level (0.10 #8): bump when a release changes on-disk formats
+# that an older build would misread or corrupt.  A vault records the highest
+# level that has written it; builds with a lower level refuse to write.
+WRITER_FORMAT_LEVEL=1
 OKF_VERSION="0.2"
 PYYAML_VERSION="6.0.3"
 PLATFORM_DEFAULT_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/llm-brain/vault"
@@ -2086,7 +2090,31 @@ acquire_lock() {
     release_lock
     sleep "$LOCK_POLL_SECONDS"
     acquire_lock "$scope"
+    return
   fi
+  writer_guard_locked
+}
+
+# Refuse writes from a build older than the newest one that wrote this vault
+# (shared NAS brains with mixed versions).  Runs under the lease lock.
+writer_guard_locked() {
+  local guard="$ROOT/writer.format" level writer tmp
+  [ "${LLM_BRAIN_WRITER_GUARD:-1}" != 0 ] || return 0
+  if [ -f "$guard" ] && [ ! -L "$guard" ]; then
+    level="$(awk -F= '$1 == "format_level" { print $2; exit }' "$guard" 2>/dev/null)"
+    writer="$(awk -F= '$1 == "writer_version" { print $2; exit }' "$guard" 2>/dev/null)"
+    case "$level" in ''|*[!0-9]*) level=0 ;; esac
+    if [ "$level" -gt "$WRITER_FORMAT_LEVEL" ]; then
+      release_lock
+      die 75 "this brain was written by a newer LLM-Brain (format level $level, version ${writer:-unknown}); this build ($VERSION, level $WRITER_FORMAT_LEVEL) refuses to write. Upgrade this machine first."
+    fi
+    [ "$level" -lt "$WRITER_FORMAT_LEVEL" ] || return 0
+  fi
+  tmp="$ROOT/.writer.format.$$"
+  if printf 'format_level=%s\nwriter_version=%s\nrecorded_at=%s\n' "$WRITER_FORMAT_LEVEL" "$VERSION" "$(now_utc)" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$guard" 2>/dev/null || rm -f "$tmp"
+  fi
+  return 0
 }
 
 release_lock() {

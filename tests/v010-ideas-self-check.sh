@@ -188,4 +188,18 @@ printf -- '---\ntype: Claim\ntitle: "x"\nbrain_capture_tag: hypothetical\n---\np
 [ "$(lineage capture-tag --file "$fixture/declared.md" | cut -f1)" = hypothetical ] || fail '#7 declared tag ignored'
 printf 'idea-7=ok\n'
 
+# ---- #8 writer guard: an older build cannot write a vault a newer build wrote.
+grep -Fxq 'format_level=1' "$vault/writer.format" || fail '#8 writer format not recorded'
+cp "$vault/writer.format" "$fixture/writer.bak"
+printf 'format_level=99\nwriter_version=9.9.9\n' >"$vault/writer.format"
+set +e; out="$(b working add "$pid" 'should be refused' 2>&1)"; rc=$?; set -e
+[ "$rc" = 75 ] || fail "#8 older build wrote a newer vault (rc=$rc): $out"
+grep -Fq 'written by a newer LLM-Brain (format level 99, version 9.9.9)' <<<"$out" || fail "#8 refusal unclear: $out"
+[ ! -d "$vault/.locks/project-$pid.lock" ] || fail '#8 refusal left the lock behind'
+b search "$pid" 'tariff rate' >/dev/null || fail '#8 reads blocked by the guard'
+grep -Fxq 'format_level=99' "$vault/writer.format" || fail '#8 guard downgraded the vault level'
+cp "$fixture/writer.bak" "$vault/writer.format"
+b working add "$pid" 'allowed again' >/dev/null || fail '#8 same-level write refused'
+printf 'idea-8=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'
