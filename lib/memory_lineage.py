@@ -1784,6 +1784,51 @@ def command_belief_check(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------- #12 recall after compaction / sub-agents
+
+REATTACH_BYTES = 2500
+
+
+def reattach_text(vault: Vault, since: dt.datetime, max_bytes: int = REATTACH_BYTES) -> str:
+    """The newest context pack built since `since`, without frontmatter and
+    capped on a line boundary.  Read-only; empty when nothing was built."""
+    folder = vault.root / "context-packs"
+    newest: tuple[float, Path] | None = None
+    if folder.is_dir() and not folder.is_symlink():
+        for path in folder.glob("*.md"):
+            if path.name.startswith(".") or path.is_symlink():
+                continue
+            mtime = path.stat().st_mtime
+            # The marker has whole-second precision and is written after the
+            # hook's own run; skip that second so a pack is re-attached once.
+            if mtime >= since.timestamp() + 1 and (newest is None or mtime > newest[0]):
+                newest = (mtime, path)
+    if newest is None:
+        return ""
+    text = newest[1].read_text(encoding="utf-8", errors="replace")
+    body = re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S).strip("\n")
+    built = dt.datetime.fromtimestamp(newest[0], dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    head = f"Re-attached after compaction (once): context pack {newest[1].name}, built {built}. Recall again for new tasks."
+    out, used = [head], len(head.encode()) + 1
+    for line in body.splitlines():
+        size = len(line.encode()) + 1
+        if used + size > max_bytes:
+            out.append("[pack truncated; run llm-brain pack build for the full pack]")
+            break
+        out.append(line)
+        used += size
+    return "\n".join(out) + "\n"
+
+
+def command_reattach(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    since = parse_time(args.since)
+    if since is None:
+        return 0
+    sys.stdout.write(reattach_text(vault, since, max(200, args.max_bytes)))
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1902,6 +1947,9 @@ def parser() -> argparse.ArgumentParser:
     ct = commands.add_parser("capture-tag")
     ct.add_argument("--file", required=True)
     ct.set_defaults(func=command_capture_tag)
+    ra = base("reattach", command_reattach)
+    ra.add_argument("--since", required=True)
+    ra.add_argument("--max-bytes", type=int, default=REATTACH_BYTES)
     bc = base("belief-check", command_belief_check)
     bc.add_argument("--review", required=True)
     bc.add_argument("--json", action="store_true")

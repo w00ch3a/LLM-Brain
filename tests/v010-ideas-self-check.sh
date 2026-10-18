@@ -318,4 +318,28 @@ b review decide "$pid" bel_dns approved --overrule-belief --reason 'I changed it
 [ -f "$claims/bel_dns.md" ] && grep -Fq 'belief-overrule' "$pdir/audit.v2.tsv" || fail '#11 overrule not promoted or not audited'
 printf 'idea-11=ok\n'
 
+# ---- #12 recall after compaction (one capped pack re-attach) and for sub-agents (opt-in).
+"$py" -c 'import json,sys; d=json.load(open(sys.argv[1]))["hooks"]; assert "compact" in d["SessionStart"][0]["matcher"]; assert "subagent --stdin" in d["SubagentStart"][0]["hooks"][0]["command"]' "$repo_root/hooks/hooks.json" || fail '#12 hooks.json lacks compact/SubagentStart wiring'
+b pack build "$pid" --task 'router MTU firmware' >/dev/null
+hs12="$fixture/hook-state-12"
+key="$(cd "$workspace" && printf '%s|%s' "$PWD" claude-code | cksum | awk '{print $1}')"
+mkdir -p "$hs12/llm-brain/sessions" && printf '2000-01-01T00:00:00Z\n' >"$hs12/llm-brain/sessions/$key"
+hook12() { (cd "$workspace" && printf '{"session_id":"s1","source":"%s"}' "$1" | XDG_STATE_HOME="$hs12" LLM_BRAIN_ROOT="$vault" "${@:2}" sh "$repo_root/hooks/session-start.sh" session --stdin); }
+out="$(hook12 compact env LLM_BRAIN_REATTACH_BYTES=1200)"
+grep -Fq 'Re-attached after compaction (once): context pack' <<<"$out" || fail "#12 no pack re-attached after compaction: $out"
+reattached="$(sed -n '/Re-attached after compaction/,$p' <<<"$out")"
+[ "$(printf '%s' "$reattached" | wc -c | tr -d ' ')" -le 1300 ] || fail '#12 re-attached pack ignored the byte cap'
+! grep -Fq 'Re-attached after compaction' <<<"$(hook12 compact env)" || fail '#12 pack re-attached twice with no new pack'
+printf '2000-01-01T00:00:00Z\n' >"$hs12/llm-brain/sessions/$key"
+! grep -Fq 'Re-attached after compaction' <<<"$(hook12 startup env)" || fail '#12 pack re-attached on a normal start'
+printf '2000-01-01T00:00:00Z\n' >"$hs12/llm-brain/sessions/$key"
+! grep -Fq 'Re-attached after compaction' <<<"$(hook12 compact env LLM_BRAIN_COMPACT_REATTACH=0)" || fail '#12 re-attach ignored its off switch'
+manual="$(cd "$workspace" && XDG_STATE_HOME="$hs12" LLM_BRAIN_ROOT="$vault" sh "$repo_root/hooks/session-start.sh" </dev/null)"
+grep -Fq 'AUTOMATIC USE CONTRACT' <<<"$manual" || fail '#12 plain hook run broke'
+sub() { (cd "$workspace" && printf '{"agent_type":"general-purpose"}' | LLM_BRAIN_ROOT="$vault" "$@" sh "$repo_root/hooks/session-start.sh" subagent --stdin); }
+[ -z "$(sub env)" ] || fail '#12 sub-agent recall is not opt-in'
+json="$(sub env LLM_BRAIN_SUBAGENT_RECALL=1 LLM_BRAIN_SUBAGENT_BYTES=900)"
+"$py" -c 'import json,sys; d=json.loads(sys.argv[1])["hookSpecificOutput"]; assert d["hookEventName"]=="SubagentStart"; c=d["additionalContext"]; assert "LLM-Brain project memory" in c and len(c.encode())<=1100, len(c)' "$json" || fail "#12 sub-agent context malformed or over cap: $json"
+printf 'idea-12=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'
