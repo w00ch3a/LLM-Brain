@@ -149,7 +149,8 @@ Commands:
   map PROJECT_ID [ROOT]
   secret-scan FILE
   stats [--project PROJECT_ID] [ROOT]
-  doctor [--strict] [--stale-days N] [ROOT]
+  doctor [--strict] [--stale-days N] [--fail-under N] [ROOT]
+  health PROJECT_ID|--all [--fail-under N] [--hosts auto] [--host-config PATH]... [--json]   Silent-failure checks and a 0-100 score
   lint [--project PROJECT_ID] [--strict] [ROOT]
   migrate check|apply|verify [--all]
   migrate reconcile-sources PROJECT_ID [--finalise-missing --reason TEXT]
@@ -7243,9 +7244,54 @@ iso_to_epoch() {
   fi
 }
 
+# Silent-failure health checks (0.10 #6): broken frontmatter, smuggled body
+# headers, unproven "human verified" claims, near-name duplicates, state-key
+# near-collisions, mass rewrites and dropped host config.  Read-only; the
+# score (0-100) and --fail-under suit a scheduled health check.
+cmd_health() {
+  local project_id="" all=0 fail_under="" json=0 dir project rc=0 score min_score=100 output
+  local -a extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --fail-under) fail_under="${2:-}"; case "$fail_under" in ''|*[!0-9]*) die 64 "--fail-under must be 0-100" ;; esac; shift 2 ;;
+      --hosts) case "${2:-}" in auto|none) extra+=(--hosts "$2") ;; *) die 64 "--hosts must be auto or none" ;; esac; shift 2 ;;
+      --host-config) [ -n "${2:-}" ] || die 64 "--host-config requires PATH"; extra+=(--host-config "$2"); shift 2 ;;
+      --json) json=1; shift ;;
+      --*) die 64 "unknown health option: $1" ;;
+      *) [ -z "$project_id" ] || die 64 "health accepts one PROJECT_ID"; project_id="$1"; shift ;;
+    esac
+  done
+  [ "$json" = 0 ] || extra+=(--json)
+  if [ "$all" = 0 ]; then
+    [ -n "$project_id" ] || die 64 "health requires PROJECT_ID or --all"
+    require_project "$project_id" dir
+    [ -z "$fail_under" ] || extra+=(--fail-under "$fail_under")
+    memory_lineage health --project-dir "$dir" ${extra[@]+"${extra[@]}"}
+    return
+  fi
+  for project in "$ROOT"/projects/*; do
+    [ -d "$project/okf" ] || continue
+    output="$(memory_lineage health --project-dir "$project" ${extra[@]+"${extra[@]}"} || true)"
+    if [ "$json" = 1 ]; then
+      score="$(printf '%s' "$output" | sed -n 's/.*"score":\([0-9]*\).*/\1/p')"
+      printf '{"project_id":"%s",%s\n' "$(basename "$project")" "${output#\{}"
+    else
+      score="$(printf '%s\n' "$output" | sed -n 's/^health_score=//p')"
+      printf '%s\n' "$output" | awk -F '\t' -v p="$(basename "$project")" 'NR > 1 && !/^health_score=/ { print p "\t" $0 }'
+      printf 'project=%s health_score=%s\n' "$(basename "$project")" "$score"
+    fi
+    [ -z "$score" ] || [ "$score" -ge "$min_score" ] || min_score="$score"
+  done
+  [ "$json" = 1 ] || printf 'health=done min_score=%s\n' "$min_score"
+  if [ -n "$fail_under" ] && [ "$min_score" -lt "$fail_under" ]; then rc=1; fi
+  return "$rc"
+}
+
 cmd_doctor() {
-  local strict=0 stale_days=180 root_arg="" age=0
-  while [ $# -gt 0 ]; do case "$1" in --strict) strict=1; shift ;; --stale-days) stale_days="${2:-180}"; shift 2 ;; *) root_arg="$1"; shift ;; esac; done
+  local strict=0 stale_days=180 root_arg="" age=0 doctor_fail_under=""
+  while [ $# -gt 0 ]; do case "$1" in --strict) strict=1; shift ;; --stale-days) stale_days="${2:-180}"; shift 2 ;; --fail-under) doctor_fail_under="${2:-}"; shift 2 ;; *) root_arg="$1"; shift ;; esac; done
+  case "$doctor_fail_under" in *[!0-9]*) die 64 "--fail-under must be 0-100" ;; esac
   case "$stale_days" in ''|*[!0-9]*) die 64 "--stale-days must be a non-negative integer" ;; esac
   [ -n "$root_arg" ] && ROOT="$root_arg"
   [ -d "$ROOT" ] || die 66 "brain root missing: $ROOT"
@@ -7287,6 +7333,9 @@ cmd_doctor() {
       fi
     done < <(find "$project/okf/claims" "$project/okf/procedures" "$project/okf/references" -type f -name '*.md' 2>/dev/null)
   done
+  if [ -n "$doctor_fail_under" ]; then
+    cmd_health --all --fail-under "$doctor_fail_under" >&2 || age=1
+  fi
   printf 'version=%s schema_version=%s root=%s doctor=%s\n' "$VERSION" "$SCHEMA_VERSION" "$ROOT" "$([ "$age" = 0 ] && printf ok || printf findings)"
   [ "$age" = 0 ]
 }
@@ -10071,6 +10120,7 @@ main() {
     secret-scan) cmd_secret_scan "$@" ;;
     stats) cmd_stats "$@" ;;
     doctor) cmd_doctor "$@" ;;
+    health) cmd_health "$@" ;;
     lint) cmd_lint "$@" ;;
     migrate) cmd_migrate "$@" ;;
     upgrade) cmd_upgrade "$@" ;;

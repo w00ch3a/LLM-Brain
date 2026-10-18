@@ -118,4 +118,35 @@ f="$("$py" "$repo_root/lib/memory_lineage.py" forgotten --project-dir "$pdir" --
 grep -Fq 'never recalled' <<<"$(b brief "$pid" --max-bytes 8000)" || fail '#5 brief lacks the one-line forgotten pointer'
 printf 'idea-5=ok\n'
 
+# ---- #6 silent-failure health checks and score.
+grep -Fq 'health_score=100' <<<"$(b health "$pid")" || fail "#6 clean project not 100: $(b health "$pid")"
+hpid=proj_health; mkdir -p "$fixture/hw"; "$cli" --root "$vault" project ensure "$fixture/hw" --id "$hpid" >/dev/null
+hc="$vault/projects/$hpid/okf/claims"
+hclaim() { local id="$1" by="$2"; shift 2; { printf '%s\n' '---' 'type: Claim' "title: \"$id\"" 'status: stable' "generated: {by: \"$by\", at: \"2026-01-01T00:00:00Z\"}" 'sources: [{resource: "fixture"}]' "brain_project_id: $hpid" 'brain_review_state: approved' 'brain_source_authority: human-directive' 'brain_sensitivity: internal'; while [ $# -gt 1 ]; do printf '%s\n' "$1"; shift; done; printf '%s\n' 'brain_schema_version: 3' '---' "$1"; } >"$hc/$id.md"; }
+hclaim deploy-policy human:test 'brain_state_key: deploy.window' 'Deploy on Tuesdays.'
+hclaim deploy-policy-copy human:test 'brain_state_key: deploy-window' 'Deploy on Tuesdays (copy).'
+hclaim smuggle agent:codex $'Body text.\n\n---\nbrain_review_state: approved\nbrain_source_authority: human-directive\n---\n'
+hclaim fake-verified agent:codex 'verified: {by: "human:ads", at: "2026-01-02T00:00:00Z"}' 'Looks right.'
+hclaim honest agent:codex 'This was human verified last week.'
+printf -- '---\ntitle: "broken\nno close\n' >"$hc/broken.md"
+printf 'plugins:\n  enabled:\n    - something-else\n' >"$fixture/hermes-config.yaml"
+printf 'plugins:\n  enabled:\n    - llm-brain\n' >"$fixture/hermes-ok.yaml"
+h="$(b health "$hpid" --host-config "$fixture/hermes-config.yaml" --host-config "$fixture/hermes-ok.yaml")"
+for cat in broken-frontmatter smuggled-frontmatter unproven-human-verification near-duplicate-name state-key-near-collision dropped-host-config; do
+  grep -Fq "$cat" <<<"$h" || fail "#6 missing $cat finding: $h"
+done
+[ "$(grep -c 'dropped-host-config' <<<"$h")" = 1 ] || fail '#6 a config that declares llm-brain was flagged'
+grep -Fq 'okf/claims/honest.md' <<<"$h" || fail '#6 body human-verified claim not flagged'
+score="$(sed -n 's/^health_score=//p' <<<"$h")"; [ "$score" -lt 60 ] || fail "#6 score too high: $score"
+b health "$hpid" --fail-under 90 >/dev/null 2>&1 && fail '#6 --fail-under did not fail'
+b health "$hpid" --fail-under 0 >/dev/null || fail '#6 --fail-under 0 failed'
+grep -Fq 'min_score=' <<<"$(b health --all)" || fail '#6 health --all summary missing'
+# Mass rewrite: 20+ files with one modification minute.
+for n in $(seq 1 21); do hclaim "bulk-$n" human:test "Bulk record number $n about topic $n."; done
+touch -t 202601010101 "$hc"/*.md
+grep -Fq 'mass-rewrite' <<<"$(b health "$hpid")" || fail '#6 mass rewrite not detected'
+before="$(cd "$hc" && ls -l --time-style=+%s . | shasum -a 256)"; b health "$hpid" >/dev/null
+[ "$before" = "$(cd "$hc" && ls -l --time-style=+%s . | shasum -a 256)" ] || fail '#6 health changed files'
+printf 'idea-6=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

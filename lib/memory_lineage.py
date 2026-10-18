@@ -1460,6 +1460,145 @@ def command_forgotten(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------- 0.10: silent-failure health (#6)
+
+RESERVED_BODY_KEYS = re.compile(r"^(brain_[a-z_]+|verified|generated)\s*:", re.M)
+HUMAN_CLAIM = re.compile(r"\b(human[- ]verified|verified by (?:a )?human|human[- ]approved)\b", re.I)
+HEALTH_WEIGHTS = {
+    "broken-frontmatter": (10, 40), "smuggled-frontmatter": (10, 30), "unproven-human-verification": (8, 24),
+    "dropped-host-config": (15, 30), "mass-rewrite": (10, 10), "near-duplicate-name": (2, 20),
+    "state-key-near-collision": (3, 15),
+}
+
+
+def _norm_name(text: str) -> str:
+    text = re.sub(r"(?i)[ _-]*(copy|final|new|old|\(\d+\)|v\d+)$", "", text)
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _close(a: str, b: str) -> bool:
+    import difflib
+    return a == b or (min(len(a), len(b)) >= 8 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.92)
+
+
+def health_findings(root: Path, host_configs: list[str]) -> list[tuple[str, str, str, str]]:
+    findings: list[tuple[str, str, str, str]] = []
+    # Records live in okf/<kind>/; okf/log.md and okf/index.md are generated maps.
+    files = sorted(p for p in (root / "okf").glob("*/**/*.md") if p.is_file() and not p.is_symlink()) if (root / "okf").is_dir() else []
+    parsed: list[tuple[Path, dict[str, Any], str]] = []
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        try:
+            meta, body = okf.split_frontmatter(path)
+        except okf.OkfError as exc:
+            findings.append(("broken-frontmatter", rel, _one(str(exc), 120), "fix the YAML header; the record is invisible to recall"))
+            continue
+        parsed.append((path, meta, body))
+        # A second '---' block in the body that carries reserved keys looks
+        # like frontmatter to naive readers and can smuggle authority.
+        for block in re.findall(r"(?ms)^---[ \t]*\n(.*?)^---[ \t]*$", body):
+            keys = RESERVED_BODY_KEYS.findall(block)
+            if keys:
+                findings.append(("smuggled-frontmatter", rel, "body block sets " + ",".join(sorted(set(keys))[:4]), "remove the body block or move the fields into the real header"))
+                break
+        generated = meta.get("generated") if isinstance(meta.get("generated"), dict) else {}
+        verified = meta.get("verified") if isinstance(meta.get("verified"), dict) else {}
+        author = clean(generated.get("by"))
+        human_author = author.startswith("human:")
+        reviewed_by = clean(meta.get("brain_reviewed_by"))
+        if not human_author and not reviewed_by.startswith("human:"):
+            if clean(verified.get("by")).startswith("human:"):
+                findings.append(("unproven-human-verification", rel, f"verified.by={clean(verified.get('by'))} but written by {author or 'unknown'}", "confirm with the person or drop the claim"))
+            elif HUMAN_CLAIM.search(body):
+                findings.append(("unproven-human-verification", rel, f"body claims human verification; written by {author or 'unknown'}", "confirm with the person or drop the claim"))
+    # Records already linked by a lifecycle relation (v1 -> v2) are versions, not duplicates.
+    linked: set[tuple[str, str]] = set()
+    for path, meta, _ in parsed:
+        for field in ms.RELATION_FIELDS:
+            for ref in ref_list(meta.get(field)):
+                target = ref if ref.startswith("okf/") else f"{path.parent.relative_to(root).as_posix()}/{ref.removesuffix('.md')}.md"
+                rel = path.relative_to(root).as_posix()
+                linked.add((rel, target))
+                linked.add((target, rel))
+    # Near-name duplicate files in the same folder.
+    by_folder: dict[Path, list[Path]] = {}
+    for path in files:
+        by_folder.setdefault(path.parent, []).append(path)
+    for folder, members in sorted(by_folder.items()):
+        names = [(path, _norm_name(path.stem)) for path in members]
+        buckets: dict[str, list[tuple[Path, str]]] = {}
+        for path, name in names:
+            buckets.setdefault(name[:5], []).append((path, name))
+        for bucket in buckets.values():
+            if len(bucket) > 200:
+                continue
+            for index, (left, a) in enumerate(bucket):
+                for right, b2 in bucket[index + 1:]:
+                    pair = (left.relative_to(root).as_posix(), right.relative_to(root).as_posix())
+                    if a and _close(a, b2) and pair not in linked:
+                        findings.append(("near-duplicate-name", left.relative_to(root).as_posix(), f"~{right.relative_to(root).as_posix()}", "merge or supersede one of them"))
+    # Distinct state keys that are almost the same key.
+    keys = sorted({clean(meta.get("brain_state_key")) for _, meta, _ in parsed if clean(meta.get("brain_state_key"))})
+    normalised = [(key, re.sub(r"[^a-z0-9]", "", key.lower())) for key in keys]
+    for index, (a, na) in enumerate(normalised):
+        for b2, nb in normalised[index + 1:]:
+            if na == nb or (min(len(na), len(nb)) >= 6 and _close(na, nb)):
+                findings.append(("state-key-near-collision", f"state:{a}", f"~state:{b2}", "use one state key so updates resolve"))
+    # Mass rewrite: most canonical files share one modification minute.
+    if len(files) >= 20:
+        minutes: dict[int, int] = {}
+        for path in files:
+            minute = int(path.stat().st_mtime // 60)
+            minutes[minute] = minutes.get(minute, 0) + 1
+        minute, count = max(minutes.items(), key=lambda item: (item[1], item[0]))
+        if count >= 20 and count >= 0.8 * len(files):
+            when = dt.datetime.fromtimestamp(minute * 60, dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+            findings.append(("mass-rewrite", "okf/", f"{count}/{len(files)} files modified at {when}", "check for a sync or tool that rewrote the vault; do not trust mtimes"))
+    for config in host_configs:
+        path = Path(config).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "llm-brain" not in text and "llm_brain" not in text:
+            findings.append(("dropped-host-config", str(path), "host config no longer declares llm-brain (MCP, hook or plugin)", "re-run the host install or re-add the llm-brain entry"))
+    return findings
+
+
+def health_score(findings: list[tuple[str, str, str, str]]) -> int:
+    penalty: dict[str, int] = {}
+    for category, *_ in findings:
+        weight, cap = HEALTH_WEIGHTS.get(category, (2, 10))
+        penalty[category] = min(cap, penalty.get(category, 0) + weight)
+    return max(0, 100 - sum(penalty.values()))
+
+
+def default_host_configs() -> list[str]:
+    home = Path(os.environ.get("HOME", "~")).expanduser()
+    hermes = Path(os.environ.get("HERMES_HOME", str(home / ".hermes")))
+    return [str(hermes / "config.yaml"), str(home / ".codex" / "config.toml"), str(home / ".claude" / "settings.json"), str(home / ".gemini" / "settings.json")]
+
+
+def command_health(args: argparse.Namespace) -> int:
+    root = Path(args.project_dir).resolve()
+    hosts = list(args.host_config or [])
+    if args.hosts == "auto":
+        hosts += default_host_configs()
+    findings = sorted(set(health_findings(root, hosts)))
+    score = health_score(findings)
+    if args.json:
+        print(json.dumps({"status": "ok", "derived": True, "score": score, "findings": [
+            {"category": c, "ref": r, "detail": d, "recommendation": a} for c, r, d, a in findings]}, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print("category\tref\tdetail\trecommendation")
+        for row in findings:
+            print("\t".join(row))
+        print(f"health_score={score}")
+    return 0 if args.fail_under is None or score >= args.fail_under else 1
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1570,6 +1709,11 @@ def parser() -> argparse.ArgumentParser:
     fg.add_argument("--days", type=int, default=30)
     fg.add_argument("--limit", type=int, default=20)
     fg.add_argument("--json", action="store_true")
+    hl = base("health", command_health)
+    hl.add_argument("--host-config", action="append")
+    hl.add_argument("--hosts", choices=("none", "auto"), default="none")
+    hl.add_argument("--fail-under", type=int, default=None)
+    hl.add_argument("--json", action="store_true")
     ho = base("handover", command_handover)
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")
