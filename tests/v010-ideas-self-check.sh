@@ -342,4 +342,62 @@ json="$(sub env LLM_BRAIN_SUBAGENT_RECALL=1 LLM_BRAIN_SUBAGENT_BYTES=900)"
 "$py" -c 'import json,sys; d=json.loads(sys.argv[1])["hookSpecificOutput"]; assert d["hookEventName"]=="SubagentStart"; c=d["additionalContext"]; assert "LLM-Brain project memory" in c and len(c.encode())<=1100, len(c)' "$json" || fail "#12 sub-agent context malformed or over cap: $json"
 printf 'idea-12=ok\n'
 
+# ---- #13 procedure lifecycle from recent run outcomes, reset on change; contrasts warned in packs.
+mkdir -p "$pdir/okf/procedures"
+proc() { # id title body [extra frontmatter lines...]
+  local id="$1" title="$2" body="$3"; shift 3
+  {
+    printf '%s\n' '---' 'type: Procedure' "title: \"$title\"" 'status: stable'
+    printf '%s\n' 'generated: {by: "human:test", at: "2026-01-01T00:00:00Z"}' 'sources: [{resource: "self-check fixture"}]'
+    printf '%s\n' "brain_project_id: $pid" "brain_procedure_id: $id" 'brain_review_state: approved' 'brain_source_authority: human-directive' 'brain_sensitivity: internal'
+    while [ $# -gt 0 ]; do printf '%s\n' "$1"; shift; done
+    printf '%s\n' 'brain_schema_version: 3' '---' "# $title" '' "$body"
+  } >"$pdir/okf/procedures/$id.md"
+}
+runs() { # procedure status count [verifier]
+  local i r
+  for i in $(seq 1 "$3"); do
+    r="$(b run start "$pid" "okf/procedures/$1.md" --task "t$i" | sed -n 's/.*run_id=\([^ ]*\).*/\1/p')"
+    b run outcome "$pid" "$r" --status "$2" --summary "run $i of $1" ${4:+--verified-by "$4"} >/dev/null
+  done
+}
+pstate() { b procedures "$pid" "${@:2}" | awk -F '\t' -v p="okf/procedures/$1.md" '$1 == p {print $2}'; }
+proc nas-upgrade 'NAS firmware upgrade' 'Steps: snapshot, stop sync, apply the firmware upgrade, reboot, verify shares.'
+proc nas-rollback 'NAS firmware rollback' 'Steps: snapshot, stop sync, apply the firmware rollback, reboot, verify shares.' 'brain_contrasts: ["okf/procedures/nas-upgrade.md"]'
+proc old-backup 'Legacy backup script' 'Run the legacy backup script.'
+[ "$(pstate nas-upgrade)" = trial ] || fail '#13 a procedure with no runs is not trial'
+runs nas-upgrade success 2
+[ "$(pstate nas-upgrade)" = active ] || fail "#13 two successes did not make it active: $(b procedures "$pid")"
+runs nas-upgrade success 2; runs nas-upgrade success 1 human:test
+[ "$(pstate nas-upgrade)" = stable ] || fail "#13 five recent successes (one verified) did not make it stable: $(b procedures "$pid")"
+grep -Fq 'procedure:stable' <<<"$(b label list "$pid" okf/procedures/nas-upgrade.md)" || fail '#13 lifecycle label not derived'
+pack="$(b pack build "$pid" --task 'NAS firmware upgrade steps' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq '## Procedure Status' "$pack" || fail "#13 pack lacks procedure status: $(cat "$pack")"
+grep -Fq 'CONTRASTS with `okf/procedures/nas-rollback.md` (NAS firmware rollback)' "$pack" || grep -Fq 'CONTRASTS with `okf/procedures/nas-upgrade.md` (NAS firmware upgrade)' "$pack" || fail '#13 contrasts link not warned in the pack'
+# Changing the procedure resets trust: earlier wins do not carry over.
+printf '\nAlso check the UPS first.\n' >>"$pdir/okf/procedures/nas-upgrade.md"
+[ "$(pstate nas-upgrade)" = trial ] || fail '#13 edited procedure kept its old trust'
+runs old-backup failed 3
+[ "$(pstate old-backup)" = retired ] || fail '#13 three failures in a row did not retire it'
+pack="$(b pack build "$pid" --task 'legacy backup script' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq 'RETIRED (last 3 runs failed since its last change) — do not follow without checking' "$pack" || fail '#13 retired procedure not flagged in the pack'
+# Evidence change resets.
+printf 'manual v1\n' >"$pdir/sources/ups-manual.md"
+proc ups-check 'UPS check' 'Check the UPS battery.' 'brain_source_ref: "sources/ups-manual.md"' "brain_source_hash_sha256: $(shasum -a 256 "$pdir/sources/ups-manual.md" | awk '{print $1}')"
+runs ups-check success 2
+[ "$(pstate ups-check)" = active ] || fail '#13 ups-check not active before the evidence change'
+printf 'manual v2\n' >"$pdir/sources/ups-manual.md"
+[ "$(pstate ups-check)" = trial ] || fail '#13 evidence change did not reset the lifecycle'
+# Code change resets (only when a source root is given; git reads are opt-in).
+repo13="$fixture/repo13"; mkdir -p "$repo13"
+git -C "$repo13" init -q && printf 'v1\n' >"$repo13/deploy.sh" && git -C "$repo13" add deploy.sh && git -C "$repo13" -c user.email=t@example.invalid -c user.name=t commit -qm one
+anchor="$(git -C "$repo13" rev-parse HEAD)"
+proc deploy-run 'Deploy script run' 'Run deploy.sh with the staging flag.' "brain_code_anchors: [\"deploy.sh@$anchor\"]"
+runs deploy-run success 2
+[ "$(pstate deploy-run --source-root "$repo13")" = active ] || fail '#13 deploy-run not active before the code change'
+printf 'v2\n' >"$repo13/deploy.sh" && git -C "$repo13" -c user.email=t@example.invalid -c user.name=t commit -qam two
+[ "$(pstate deploy-run --source-root "$repo13")" = trial ] || fail '#13 code change did not reset the lifecycle'
+[ "$(pstate deploy-run)" = active ] || fail '#13 git was consulted without --source-root'
+printf 'idea-13=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

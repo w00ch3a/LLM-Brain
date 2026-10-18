@@ -143,6 +143,8 @@ def derived_labels(vault: Vault) -> dict[str, list[tuple[str, str, str]]]:
             gen = meta.get("generated")
             when = parse_time(gen.get("at")) if isinstance(gen, dict) else None
             out.setdefault(vault.rel(target), []).append(("retracted", f"okf/retractions/{path.name}", iso(when) if when else ""))
+    for rel, row in procedure_lifecycle(vault, now_from("")).items():
+        out.setdefault(rel, []).append((f"procedure:{row['state']}", "", ""))
     for path, meta, _ in vault.frontmatter_dir("intentions"):
         if meta.get("type") != "Intention":
             continue
@@ -1100,6 +1102,11 @@ def command_pack_extras(args: argparse.Namespace) -> int:
             out.append("## Lineage Labels — see `llm-brain lineage show` for where the decision changed\n")
             out += lines
             out.append("")
+    procedures = procedure_pack_lines(vault, now, selected)
+    if procedures:
+        out.append("## Procedure Status — derived from runs since the last change\n")
+        out += procedures
+        out.append("")
     if args.state_index:
         rows = state_rows(vault, now)
         if rows:
@@ -1829,6 +1836,138 @@ def command_reattach(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- #13 procedure lifecycle (derived)
+
+PROCEDURE_STATES = ("trial", "active", "stable", "retired")
+
+
+def _sha_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def procedure_lifecycle(vault: Vault, now: dt.datetime, source_root: str = "") -> dict[str, dict[str, Any]]:
+    """Derived trial/active/stable/retired state per procedure, from run
+    outcomes since the procedure, its evidence or its code last changed.
+    Recent outcomes decide, not lifetime win counts.  Never stored."""
+    procedures = [p for p in vault.semantic_files()
+                  if (p.parent.name == "procedures" or vault.meta(p).get("type") == "Procedure")
+                  and vault.resolver.effective(p) and vault.resolver.visible(p, strict_principal=True)]
+    if not procedures:
+        return {}
+    runs: dict[str, dict[str, Any]] = {}
+    for path, meta, _ in vault.frontmatter_dir("runs"):
+        if meta.get("type") == "ProcedureRun":
+            runs[clean(meta.get("brain_run_id"))] = meta
+    outcomes: dict[Path, list[tuple[dt.datetime, str, bool, dict[str, Any]]]] = {}
+    for _, meta, _ in vault.frontmatter_dir("runs/outcomes"):
+        run = runs.get(clean(meta.get("brain_run_id")))
+        if run is None:
+            continue
+        target = vault.resolver.canonical_ref(clean(run.get("brain_procedure_ref")))
+        when = parse_time(meta.get("brain_observed_at"))
+        if target is None or when is None:
+            continue
+        outcomes.setdefault(target, []).append((when, clean(meta.get("brain_outcome_status")),
+                                                clean(meta.get("brain_verification_state")) == "verified", run))
+    drift: dict[str, str] = {}
+    if source_root:
+        for kind, rel, _, _, detail, _ in ms.anchor_findings(vault, now, source_root):
+            if kind == "code-drift":
+                drift.setdefault(rel, detail.split("~", 1)[0])
+    stored = active_labels(vault)
+    result: dict[str, dict[str, Any]] = {}
+    for path in procedures:
+        rel = vault.rel(path)
+        meta = vault.meta(path)
+        current = _sha_file(path)
+        gen = meta.get("generated")
+        changed = max([t for t in (parse_time(gen.get("at")) if isinstance(gen, dict) else None,
+                                   parse_time(meta.get("last_validated_at"))) if t is not None], default=None)
+        reset = ""
+        source_ref = clean(meta.get("brain_source_ref"))
+        source_hash = clean(meta.get("brain_source_hash_sha256"))
+        if source_ref.startswith("sources/") and source_hash:
+            if _sha_file(vault.root / source_ref) != source_hash:
+                reset = "evidence-changed"
+        for dep in ref_list(meta.get("brain_depends_on")):
+            target = vault.resolver.canonical_ref(dep)
+            if target is None or target in vault.superseded() or not vault.resolver.effective(target):
+                reset = reset or "dependency-changed"
+        if rel in drift:
+            reset = reset or "code-changed"
+        epoch = []
+        for when, status, verified, run in sorted(outcomes.get(path, []), key=lambda row: row[0]):
+            run_hash = clean(run.get("brain_procedure_hash_sha256"))
+            if run_hash:
+                if run_hash != current:
+                    continue  # run of an earlier version of this procedure
+            elif changed is not None and (parse_time(run.get("brain_started_at")) or when) < changed:
+                continue
+            epoch.append((status, verified))
+        recent = [status for status, _ in epoch[-5:]]
+        successes = sum(1 for status in recent if status == "success")
+        if "retired" in stored.get(rel, {}) or clean(meta.get("status")) == "deprecated":
+            state, why = "retired", "retired by label or status"
+        elif reset:
+            state, why = "trial", f"reset: {reset}; re-run to rebuild trust"
+        elif len(epoch) >= 3 and all(status == "failed" for status, _ in epoch[-3:]):
+            state, why = "retired", "last 3 runs failed since its last change"
+        elif len(recent) >= 5 and successes >= 4 and "failed" not in recent[-3:] and any(v for s, v in epoch[-5:] if s == "success"):
+            state, why = "stable", f"{successes} of the last {len(recent)} runs succeeded, at least one verified"
+        elif len(epoch) >= 2 and recent[-1] == "success" and recent[-2] != "failed":
+            state, why = "active", f"{successes} of the last {len(recent)} runs succeeded"
+        else:
+            state, why = "trial", "no runs since its last change" if not epoch else f"{successes} of the last {len(recent)} runs succeeded"
+        contrasts = set()
+        for ref in ref_list(meta.get("brain_contrasts")):
+            target = vault.resolver.canonical_ref(ref)
+            if target is not None and target != path:
+                contrasts.add(vault.rel(target))
+        result[rel] = {"state": state, "reason": why, "runs": len(epoch), "contrasts": contrasts, "title": vault.title(path)}
+    for rel, row in result.items():  # contrasts are symmetric
+        for other in list(row["contrasts"]):
+            if other in result:
+                result[other]["contrasts"].add(rel)
+    for row in result.values():
+        row["contrasts"] = sorted(row["contrasts"])
+    return result
+
+
+def procedure_pack_lines(vault: Vault, now: dt.datetime, selected: list[str]) -> list[str]:
+    wanted = [ref for ref in selected if "/procedures/" in ref]
+    if not wanted:
+        return []
+    states = procedure_lifecycle(vault, now)
+    lines = []
+    for ref in wanted:
+        row = states.get(ref)
+        if not row:
+            continue
+        line = f"- `{ref}`: {row['state'].upper()} ({row['reason']})"
+        if row["state"] == "retired":
+            line += " — do not follow without checking"
+        for other in row["contrasts"]:
+            title = states.get(other, {}).get("title", other)
+            line += f"; CONTRASTS with `{other}` ({title}): similar steps, opposite effect — confirm which one the task needs"
+        lines.append(line)
+    return lines
+
+
+def command_procedures(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    states = procedure_lifecycle(vault, now_from(args.now), args.source_root or "")
+    if args.json:
+        print(json.dumps(states, sort_keys=True))
+        return 0
+    print("procedure\tstate\truns_since_change\treason\tcontrasts")
+    for rel, row in sorted(states.items()):
+        print(f"{rel}\t{row['state']}\t{row['runs']}\t{row['reason']}\t{','.join(row['contrasts']) or '-'}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -1947,6 +2086,9 @@ def parser() -> argparse.ArgumentParser:
     ct = commands.add_parser("capture-tag")
     ct.add_argument("--file", required=True)
     ct.set_defaults(func=command_capture_tag)
+    pl = base("procedures", command_procedures)
+    pl.add_argument("--source-root", default="")
+    pl.add_argument("--json", action="store_true")
     ra = base("reattach", command_reattach)
     ra.add_argument("--since", required=True)
     ra.add_argument("--max-bytes", type=int, default=REATTACH_BYTES)

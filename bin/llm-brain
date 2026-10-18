@@ -118,6 +118,7 @@ Commands:
   ruled-out reopen PROJECT_ID ITEM_ID --reason TEXT | ruled-out list PROJECT_ID [--task TEXT] [--json]
   usage PROJECT_ID [--principal ID] [--json]
   forgotten PROJECT_ID [--days N] [--principal ID] [--json]   Saved-but-never-recalled records and stale requests
+  procedures PROJECT_ID [--source-root PATH] [--json]   Derived procedure lifecycle (trial/active/stable/retired) from runs since the last change
   stability show PROJECT_ID [REF] [--json]
   stability apply PROJECT_ID CANONICAL_ID --reason TEXT
   mcp serve [--brain PATH] [--project-id ID] [--read-only]   One process = one brain (vault root)
@@ -2656,7 +2657,7 @@ candidate_valid() {
   [ -z "$reverify_after" ] || brain_datetime_valid "$reverify_after" || return 65
   question="$(frontmatter_field "$file" brain_clarification_question)"
   [ "$action" != "ask" ] || [ -n "$question" ] || return 65
-  for field in brain_state_key brain_depends_on brain_supersedes brain_conflicts brain_supports; do
+  for field in brain_state_key brain_depends_on brain_supersedes brain_conflicts brain_supports brain_contrasts; do
     value="$(frontmatter_field "$file" "$field")"
     [ -z "$value" ] || validate_scalar "$value" || return 65
   done
@@ -2926,7 +2927,7 @@ promote_review_locked() {
     printf 'brain_provider_id: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")"
     printf 'brain_provider_version: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")"
     printf 'brain_candidate_hash_sha256: %s\n' "$(sha256_file "$review")"
-    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_conflicts brain_supports brain_required_bindings brain_applicability brain_prerequisites brain_verification; do
+    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_conflicts brain_supports brain_contrasts brain_required_bindings brain_applicability brain_prerequisites brain_verification; do
       field_value="$(frontmatter_field "$review" "$field")"
       [ -z "$field_value" ] || printf '%s: %s\n' "$field" "$(yaml_quote "$field_value")"
     done
@@ -3914,6 +3915,10 @@ run_start() {
     run_id="run_$(date -u '+%Y%m%dT%H%M%SZ')_$(sha256_text "$project_id|$procedure_ref|$task|$branch|$obligations|$$" | cut -c1-12)"
   fi
   run_file="$dir/runs/$run_id.md"
+  # 0.10: the procedure's hash at start lets the lifecycle reset when it changes.
+  local run_procedure_file run_procedure_hash="none"
+  run_procedure_file="$(canonical_ref_file "$dir" "$procedure_ref" 2>/dev/null || true)"
+  [ -z "$run_procedure_file" ] || [ ! -f "$run_procedure_file" ] || run_procedure_hash="$(sha256_file "$run_procedure_file")"
   acquire_lock "project-$project_id"
   if [ -n "$capsule_ref" ]; then
     [ "$(sha256_file "$capsule_file")" = "$capsule_hash_value" ] || { release_lock; die 73 "run capsule changed before commit"; }
@@ -3924,7 +3929,7 @@ run_start() {
     {
       printf '%s\n' '---'
       printf 'type: ProcedureRun\ntitle: %s\nbrain_project_id: %s\nbrain_run_id: %s\n' "$(yaml_quote "Run $procedure_ref")" "$project_id" "$run_id"
-      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\nbrain_principal: %s\nbrain_capsule_ref: %s\nbrain_capsule_hash_sha256: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${capsule_ref:-none}")" "$capsule_hash_value"
+      printf 'brain_procedure_ref: %s\nbrain_request_id: %s\nbrain_branch: %s\nbrain_task: %s\nbrain_obligations: %s\nbrain_principal: %s\nbrain_capsule_ref: %s\nbrain_capsule_hash_sha256: %s\nbrain_procedure_hash_sha256: %s\n' "$(yaml_quote "$procedure_ref")" "$(yaml_quote "${request_id:-none}")" "$(yaml_quote "$branch")" "$(yaml_quote "${task:-none}")" "$(yaml_quote "${obligations:-none}")" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${capsule_ref:-none}")" "$capsule_hash_value" "$run_procedure_hash"
       printf 'brain_run_state: active\nbrain_verification_state: unverified\nbrain_artifact_state: noncanonical\nbrain_started_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
       printf '%s\n' '---'
       printf '# Procedure run\n\nProcedure: `%s`  \nBranch: `%s`  \nTask: %s\n\nThis is append-only working state, not canonical OKF memory.\n' "$procedure_ref" "$branch" "${task:-none}"
@@ -7500,6 +7505,22 @@ cmd_brief() {
   fi
 }
 
+cmd_procedures() {
+  local project_id="${1:-}" dir; shift || true
+  [ -n "$project_id" ] || die 64 "procedures requires PROJECT_ID"
+  require_project "$project_id" dir
+  local -a args=(procedures --project-dir "$dir")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source-root) [ -d "${2:-}" ] || die 64 "--source-root must be a directory"; args+=(--source-root "$2"); shift 2 ;;
+      --principal) validate_scalar "${2:-}" || die 65 "--principal must be a single line"; args+=(--principal "$2"); shift 2 ;;
+      --json) args+=(--json); shift ;;
+      *) die 64 "unknown procedures option: $1" ;;
+    esac
+  done
+  memory_lineage "${args[@]}"
+}
+
 cmd_forgotten() {
   local project_id="${1:-}" dir; shift || true
   [ -n "$project_id" ] || die 64 "forgotten requires PROJECT_ID"
@@ -10189,6 +10210,7 @@ main() {
     brief) cmd_brief "$@" ;;
     usage) cmd_usage "$@" ;;
     forgotten) cmd_forgotten "$@" ;;
+    procedures) cmd_procedures "$@" ;;
     stability) cmd_stability "$@" ;;
     intention) cmd_intention "$@" ;;
     label) cmd_label "$@" ;;
