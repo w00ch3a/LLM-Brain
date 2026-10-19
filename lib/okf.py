@@ -38,8 +38,8 @@ CODE_ANCHOR_RE = re.compile(r"^[^@\s][^@]*@[0-9a-fA-F]{7,40}$")
 
 # Same detector as bin/llm-brain secret_scan_file (grep -Ei, line based).
 SECRET_BEARING = re.compile(
-    rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}'
-    rb'|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\r\f\v]*[:=][ \t\r\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
+    rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![A-Za-z0-9_])sk-(proj-)?[A-Za-z0-9_-]{16,}|(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}|(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{20,}'
+    rb'|(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\r\f\v]*[:=][ \t\r\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
     re.I,
 )
 

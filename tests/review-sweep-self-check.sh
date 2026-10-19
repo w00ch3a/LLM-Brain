@@ -249,4 +249,58 @@ else
   printf '%s\n' "review-sweep self-check: strict baseline $base_ref unavailable; byte-identity case skipped"
 fi
 
+# Key-prefix detectors match only at a word/token start: every copy (bash
+# secret-scan used by ingest, the batch capture path, review_policy, okf,
+# memory_signals, replication) must agree. Values are built at run time.
+det="$(mktemp -d "${TMPDIR:-/tmp}/lb-detector.XXXXXX")"
+tail16="$(printf 'Q%.0s' 1 2 3 4)7f3K9pLmN2xR8vT4wY6z"
+pos_lines=(
+  "sk-${tail16}"
+  "OPENAI_API_KEY=sk-proj-${tail16}"
+  "key: \"sk-${tail16}\""
+  "see (sk-${tail16}) here"
+  "aws AKIA$(printf 'ABCD%.0s' 1 2 3 4)"
+  "gh: ghp_${tail16}"
+  "slack=xoxb-1234567890-abc"
+)
+neg_lines=(
+  "task-review-the-weekly-plan-and-follow-ups"
+  "risk-assessment-for-weekend-deploys-v2"
+  "desk-booking-calendar-sync-notes"
+  "brisk-walk_reminder_every_morning_please"
+  "slug project-task-${tail16}"
+)
+i=0; for line in "${pos_lines[@]}"; do printf '%s\n' "$line" > "$det/pos$i.md"; i=$((i+1)); done
+i=0; for line in "${neg_lines[@]}"; do printf '%s\n' "$line" > "$det/neg$i.md"; i=$((i+1)); done
+for f in "$det"/pos*.md; do
+  "$cli" secret-scan "$f" >/dev/null 2>&1 && fail "bash secret-scan missed a key-like value ($(basename "$f"))"
+done
+for f in "$det"/neg*.md; do
+  "$cli" secret-scan "$f" >/dev/null 2>&1 || fail "bash secret-scan flagged a hyphenated word ($(basename "$f"))"
+done
+python3 - "$repo_root" "$det" <<'PY' || fail 'python secret detectors disagree with word-start rule'
+import re, sys
+from pathlib import Path
+repo, det = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(repo / "lib"))
+import review_policy, okf, memory_signals, replication
+src = (repo / "bin" / "llm-brain").read_text()
+m = re.search(r'^secret = (re\.compile\(r".*", re\.I\))$', src, re.M)
+assert m, "batch capture detector not found"
+batch = eval(m.group(1), {"re": re})
+text = [review_policy.SECRET, replication._SECRET, batch]
+raw = [okf.SECRET_BEARING, memory_signals._SECRET_RE]
+bad = 0
+for f in sorted(det.glob("*.md")):
+    want = f.name.startswith("pos")
+    data = f.read_bytes()
+    got = [bool(rx.search(data.decode())) for rx in text] + [bool(rx.search(data)) for rx in raw]
+    union = any(rx.search(data.decode()) for _, rx in review_policy.DETECTORS)
+    if any(g != want for g in got) or union != want:
+        bad += 1
+        print("detector mismatch:", f.name, got, union, file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+rm -rf "$det"
+
 printf '%s\n' 'llm-brain review-sweep self-check passed'

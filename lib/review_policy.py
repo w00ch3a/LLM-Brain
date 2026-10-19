@@ -24,18 +24,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 SECRET = re.compile(
-    r'-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}'
-    r'|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\f\v]*[:=][ \t\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
+    r'-----BEGIN [A-Z ]*PRIVATE KEY-----|(?<![A-Za-z0-9_])sk-(proj-)?[A-Za-z0-9_-]{16,}|(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}|(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{20,}'
+    r'|(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\f\v]*[:=][ \t\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
     re.I,
 )
 # Named detectors for counts only; their union is exactly SECRET (and the
 # bash secret_scan_file pattern).
 DETECTORS = (
     ("private-key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
-    ("openai-key", re.compile(r'sk-(proj-)?[A-Za-z0-9_-]{16,}')),
-    ("aws-key", re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("github-token", re.compile(r'gh[pousr]_[A-Za-z0-9_]{20,}')),
-    ("slack-token", re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,}')),
+    ("openai-key", re.compile(r'(?<![A-Za-z0-9_])sk-(proj-)?[A-Za-z0-9_-]{16,}')),
+    ("aws-key", re.compile(r'(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}')),
+    ("github-token", re.compile(r'(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{20,}')),
+    ("slack-token", re.compile(r'(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}')),
     ("assignment", re.compile(r'(api[_-]?key|secret|password|token)[ \t\f\v]*[:=][ \t\f\v]*"?[A-Za-z0-9_./+=-]{16,}', re.I)),
 )
 REDACTED = re.compile(r'\[redacted sha256:[0-9a-f]{12}\]')
