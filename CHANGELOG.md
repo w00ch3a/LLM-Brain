@@ -9,6 +9,30 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
+## 0.10.0 - unreleased (prepared 2026-10-19)
+
+- Fixed evidence views splitting on `---` inside values or bodies (run
+  `index build` once to refresh cached views).
+- Historical/as-of packs label resolver state (HISTORICAL, superseded by X).
+- Session handover in `brief --since/--session` and the Claude hook.
+- `ruled-out` ledger surfaced in packs and bridge recall.
+- `forgotten` report; `LLM_BRAIN_RECEIPTS=1`.
+- `health` checks with a 0-100 score; `doctor --fail-under`.
+- Automatic fact/hypothetical/proposal capture tags; only facts promote.
+- Writer format guard (`writer.format`): older 0.10+ builds refuse to write a
+  vault a newer build has written. Upgrade machines sharing a vault together.
+- Gate reports respect principals; opt-in `LLM_BRAIN_STRICT_PRINCIPAL=1`.
+- Retraction now also clears summaries, derived packs and projections; preview
+  lists inferable neighbours.
+- Belief holds: an outlier cannot supersede a better-supported fact.
+- Pack re-attach after compaction; opt-in SubagentStart brief.
+- Derived procedure lifecycle (`procedures`), `brain_contrasts` warnings.
+- `attempt record|list|show` keeps diffs of reverted attempts.
+- Eval control arms (`--controls`) and per-step store checks (`--step-checks`).
+- Neural Expansion for Hermes Desktop (page, project picker, View all, pending
+  items) and the `reflection/commitments/` fix.
+- No vault migration; schema 3 and OKF v0.2 unchanged.
+
 ## 0.9.2 - 2026-10-12
 
 - Documentation only: short new README with measured results and Hermes

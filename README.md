@@ -167,6 +167,17 @@ Labels also show in Neural Expansion's detail panel:
 UNKNOWN, and search and packs accept `--label` / `--without-label`. See the
 [v0.9.0 notes](docs/releases/v0.9.0.md).
 
+## What's new in 0.10
+
+Safer belief updates (one outlier cannot overwrite a well-supported fact),
+session and agent handover in the brief, "already ruled out" and
+tried-and-reverted diffs in packs, health checks with a score, forgetting that
+also clears summaries and derived files, and recall after host compaction.
+No vault migration. **If several machines share a vault, upgrade them
+together:** 0.10 stops older 0.10+ builds from writing a vault a newer build
+has written, but 0.9.x cannot be stopped. Details:
+[v0.10.0 notes](docs/releases/v0.10.0.md).
+
 ## Upgrading
 
 ```bash

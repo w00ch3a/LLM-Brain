@@ -43,6 +43,35 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## What's new in 0.10
+
+Version 0.10 closes silent failure modes and makes belief updates and
+handovers safer. Schema 3 and OKF v0.2 are unchanged; no vault migration. See
+the [v0.10.0 notes](releases/v0.10.0.md) for details and defaults.
+
+- **Upgrade machines that share a vault together.** 0.10 writes
+  `writer.format`; a build with a lower format level refuses to write
+  (`LLM_BRAIN_WRITER_GUARD=0` overrides). 0.9.x builds cannot be stopped.
+- **Handover.** `llm-brain brief PROJECT --since ISO --session ID` shows what
+  changed since your last session and other agents' open work, with path
+  collisions. The Claude hook passes `--since` for you.
+- **Recall that keeps up.** After compaction the hook re-attaches the newest
+  pack once (2500 bytes); `LLM_BRAIN_SUBAGENT_RECALL=1` gives sub-agents a
+  small brief.
+- **Do not repeat mistakes.** `ruled-out add PROJECT --approach TEXT --reason TEXT`
+  and `attempt record PROJECT --title TEXT --commit SHA` (real diff kept in
+  `sources/`) show up in packs for matching tasks.
+- **Safer updates.** Capture tags (fact, hypothetical, proposal) are set
+  automatically and only facts promote. A single source cannot supersede a
+  better-supported fact; it waits for review or corroboration
+  (`review decide … approved --overrule-belief` to overrule).
+- **Forgetting that sticks.** `retract` clears summaries, derived packs and
+  projections too; `--preview` lists records from which it could be inferred.
+- **Checks.** `health PROJECT` (score 0–100), `forgotten PROJECT`,
+  `procedures PROJECT` (trial, active, stable or retired from recent runs).
+- **Historical packs** label superseded records; `--controls` and
+  `--step-checks` strengthen the evaluation harnesses.
+
 ## What's new in 0.9
 
 Version 0.9 makes memory change traceable without deleting anything, and adds

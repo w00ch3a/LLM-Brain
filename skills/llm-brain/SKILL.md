@@ -23,6 +23,8 @@ For ordinary non-trivial project work:
 
 Use the local `llm-brain` CLI for `detect`, `search`, `pack build`, `stats`, `doctor`, and capture. When the task names or touches files, pass them with `--path FILE` so concepts with matching `brain_paths` are recalled. Treat "Corrections and Retractions" in a pack or brief as newer than the documents they correct: use the corrected value and cite the notice with the original. Act on any "Due Intentions" at the top of a pack or session brief first, and close them with `intention done|cancel` only when writes are authorised; record new ones with `intention add` only when the user asks to be reminded. Do not create projects, ingest, promote, migrate, overwrite adapters, commit, push, publish, or deploy without explicit authority.
 
+Treat "Already Ruled Out" and "Tried and Reverted" in a pack as things not to retry without new evidence, a RETIRED procedure as not to follow without checking, and a CONTRASTS warning as a cue to confirm which of two similar procedures the task needs. When writes are authorised and an approach fails, record it with `ruled-out add` (and, for code, `attempt record --commit SHA` for the reverted diff). A `promotion=held … reason=belief-outlier` result means the fact you tried to replace has more independent support: leave it for review or add corroborating sources; do not use `--overrule-belief` unless the user asks.
+
 Set `LLM_BRAIN_PASSIVE=0` to suppress the automatic status check as well as
 automatic retrieval and capture. Use the [maintenance skill](../llm-brain-maintenance/SKILL.md)
 only when a maintenance review, report or host-schedule declaration is

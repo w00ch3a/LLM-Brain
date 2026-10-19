@@ -89,6 +89,7 @@ core_checks() {
     bash "$repo_root/tests/research-upgrades-self-check.sh" -- \
     bash "$repo_root/tests/memory-signals-self-check.sh" -- \
     bash "$repo_root/tests/lineage-ideas-self-check.sh" -- \
+    bash "$repo_root/tests/v010-ideas-self-check.sh" -- \
     bash "$repo_root/tests/mcp-self-check.sh" -- \
     bash "$repo_root/tests/mcp-multi-brain-self-check.sh" -- \
     bash "$repo_root/tests/upgrade-from-previous-self-check.sh" -- \
