@@ -253,10 +253,12 @@ require_positive_integer() {
 }
 
 sha256_file() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
+  # sha256sum (C) first: same digest and output format as shasum (Perl),
+  # which costs about 10 ms more to start on every call.
+  if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
   else
     openssl dgst -sha256 "$1" | awk '{print $NF}'
   fi
@@ -266,10 +268,10 @@ sha256_file() {
 # sha256_file; prints "HASH  PATH" lines in input order.
 sha256_files_batch() {
   local list="$1"
-  if command -v shasum >/dev/null 2>&1; then
-    tr '\n' '\0' <"$list" | xargs -0 shasum -a 256 --
-  elif command -v sha256sum >/dev/null 2>&1; then
+  if command -v sha256sum >/dev/null 2>&1; then
     tr '\n' '\0' <"$list" | xargs -0 sha256sum --
+  elif command -v shasum >/dev/null 2>&1; then
+    tr '\n' '\0' <"$list" | xargs -0 shasum -a 256 --
   else
     return 69
   fi
@@ -3491,6 +3493,11 @@ cmd_bridge() {
       fi
       tmp="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-bridge.XXXXXX")"
       metadata="$tmp/metadata"; results="$tmp/results"; context="$tmp/context"
+      # Recall only reads canonical records: share one frontmatter field cache
+      # (removed with $tmp) between search, evidence and context rendering.
+      local MAINT_FIELDS_CACHE_STRIP="${MAINT_FIELDS_CACHE_STRIP:-}"
+      if [ -z "${MAINT_FIELDS_CACHE_DIR:-}" ] && mkdir "$tmp/fields"; then MAINT_FIELDS_CACHE_STRIP="$dir/"; fi
+      local MAINT_FIELDS_CACHE_DIR="${MAINT_FIELDS_CACHE_DIR:-$tmp/fields}"
       local -a search_args
       search_args=("$id" "$query" "--limit" "20" "--strategy" "$requested_strategy" "--metadata-file" "$metadata" "--intent" "$intent" "--explain")
       [ -z "$principal" ] || search_args+=("--principal" "$principal")
@@ -5206,6 +5213,9 @@ index_validate_generation() {
 
 index_documents_state() {
   local dir="$1" file expected actual
+  # cmd_search computes this once per query and shares it with the graph and
+  # vector checks (same inputs, same answer).
+  [ -z "${INDEX_DOCS_STATE_MEMO:-}" ] || { printf '%s\n' "$INDEX_DOCS_STATE_MEMO"; return; }
   file="$(index_file_path "$dir" documents.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
@@ -5215,6 +5225,7 @@ index_documents_state() {
 
 index_manifest_state() {
   local dir="$1" file expected actual
+  [ -z "${INDEX_MANIFEST_STATE_MEMO:-}" ] || { printf '%s\n' "$INDEX_MANIFEST_STATE_MEMO"; return; }
   file="$(index_file_path "$dir" manifest.tsv)"
   [ -f "$file" ] || { printf 'missing\n'; return; }
   if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then expected="$INDEX_EXPECTED_SIGNATURE"; else expected="$(canonical_signature "$dir")"; fi
@@ -5409,6 +5420,7 @@ state_visible_eligible() {
 }
 
 reference_lines() {
+  [ -n "$1" ] || return 0
   printf '%s\n' "$1" | sed 's/^\[//; s/\]$//; s/"//g; s/'"'"'//g' | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d'
 }
 
@@ -5897,10 +5909,10 @@ evidence_root_hashes() {
   case "$seen" in *"|$rel|"*) return 0 ;; esac
   seen="${seen}|${rel}|"
   [ "$depth" -le 8 ] || return 0
-  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  fm_get sensitivity "$file" brain_sensitivity sensitivity
   [ "$sensitivity" != restricted ] || return 0
   principal_visible "$file" "$principal" || return 0
-  source_ref="$(frontmatter_field "$file" brain_source_ref)"
+  fm_get source_ref "$file" brain_source_ref
   case "$source_ref" in
     sources/*)
       if bridge_render_record_visible "$dir" "$source_ref" "$principal"; then
@@ -5909,7 +5921,7 @@ evidence_root_hashes() {
       fi
       ;;
   esac
-  provenance="$(frontmatter_field "$file" brain_provenance)"
+  fm_get provenance "$file" brain_provenance
   case "$provenance" in
     episode://*)
       nested="$(find "$dir/episodes" -type f -name '*.md' -exec grep -l "^brain_episode_id: ${provenance#episode://}$" {} + 2>/dev/null | head -n 1)"
@@ -5924,11 +5936,13 @@ evidence_root_hashes() {
       if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
       ;;
   esac
+  local derived_from
+  fm_get derived_from "$file" brain_derived_from
   while IFS= read -r dep; do
     [ -n "$dep" ] || continue
     nested="$(canonical_ref_file "$dir" "$dep" 2>/dev/null || true)"
     if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
-  done < <(reference_lines "$(frontmatter_field "$file" brain_derived_from)")
+  done < <(reference_lines "$derived_from")
   if [ "$followed" = 0 ]; then
     hash="$(frontmatter_field "$file" brain_source_hash_sha256)"
     [ -n "$hash" ] || hash="$(frontmatter_field "$file" brain_content_hash_sha256)"
@@ -5939,11 +5953,11 @@ evidence_root_hashes() {
 
 evidence_provenance_known() {
   local dir="$1" file="$2" source_ref provenance derived nested
-  source_ref="$(frontmatter_field "$file" brain_source_ref)"
+  fm_get source_ref "$file" brain_source_ref
   case "$source_ref" in
     sources/*) [ -f "$dir/$source_ref" ] && return 0 ;;
   esac
-  provenance="$(frontmatter_field "$file" brain_provenance)"
+  fm_get provenance "$file" brain_provenance
   case "$provenance" in
     episode://*)
       nested="$(find "$dir/episodes" -type f -name '*.md' -exec grep -l "^brain_episode_id: ${provenance#episode://}$" {} + 2>/dev/null | head -n 1)"
@@ -5953,21 +5967,21 @@ evidence_provenance_known() {
     okf://*) [ -n "$(canonical_ref_file "$dir" "okf/${provenance#okf://}" 2>/dev/null || true)" ] && return 0 ;;
     human://*|runtime://*) return 0 ;;
   esac
-  derived="$(frontmatter_field "$file" brain_derived_from)"
+  fm_get derived "$file" brain_derived_from
   [ -n "$derived" ]
 }
 
 evidence_refs_for_file() {
   local dir="$1" file="$2" depth="${3:-0}" principal="${4:-}" rel provenance review episode source_ref source sensitivity scope audience
   [ -f "$file" ] || return 0
-  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  fm_get sensitivity "$file" brain_sensitivity sensitivity
   [ "$sensitivity" != restricted ] || return 0
   principal_visible "$file" "$principal" || return 0
   rel="${file#"$dir"/}"
   printf '%s\n' "$rel"
-  source_ref="$(frontmatter_field "$file" brain_source_ref)"
+  fm_get source_ref "$file" brain_source_ref
   case "$source_ref" in sources/*) bridge_render_record_visible "$dir" "$source_ref" "$principal" && printf '%s\n' "$source_ref" ;; esac
-  provenance="$(frontmatter_field "$file" brain_provenance)"
+  fm_get provenance "$file" brain_provenance
   [ "$depth" -lt 2 ] || return 0
   case "$provenance" in
     review://*)
@@ -5980,7 +5994,7 @@ evidence_refs_for_file() {
         if [ "$(frontmatter_field "$episode" brain_sensitivity sensitivity)" != restricted ]; then
           principal_visible "$episode" "$principal" || return 0
           printf '%s\n' "${episode#"$dir"/}"
-          source_ref="$(frontmatter_field "$episode" brain_source_ref)"
+          fm_get source_ref "$episode" brain_source_ref
           case "$source_ref" in
             sources/*) bridge_render_record_visible "$dir" "$source_ref" "$principal" && printf '%s\n' "$source_ref" ;;
           esac
@@ -6035,9 +6049,40 @@ search_eligible_memo() {
   search_file_eligible "$@"
 }
 
+# file_conflict_state for a search row without a subshell or one awk per row:
+# CONFLICT_RELS (built once per search) lists both ends of every
+# conflicts_with edge. Paths awk would read differently (backslashes,
+# numeric-looking) use file_conflict_state itself.
+search_row_conflicted() {
+  local file="$1" graph_file="${2:-}" rels_file="$3" conflicts rel graph_root line
+  fm_get conflicts "$file" brain_conflicts
+  [ -z "$conflicts" ] || return 0
+  [ -n "$graph_file" ] && [ -f "$graph_file" ] || return 1
+  case "$graph_file" in
+    */indexes/generations/*/graph.tsv) graph_root="${graph_file%%/indexes/generations/*}" ;;
+    */indexes/graph.tsv) graph_root="${graph_file%/indexes/graph.tsv}" ;;
+    *) graph_root="" ;;
+  esac
+  rel="${file#"$graph_root"/}"
+  case "$rel" in
+    *\\*|*[!0-9eE.+-]*) ;;
+    *) [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return ;;
+  esac
+  case "$rel" in *\\*) [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return ;; esac
+  if [ ! -f "$rels_file" ]; then
+    awk -F '\t' '$2 == "conflicts_with" { print $1; print $3 }' "$graph_file" >"$rels_file" 2>/dev/null || { rm -f "$rels_file"; [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return; }
+  fi
+  while IFS= read -r line; do
+    [ "$line" != "$rel" ] || return 0
+  done <"$rels_file"
+  return 1
+}
+
 file_conflict_state() {
   local file="$1" graph_file="${2:-}" rel graph_root
-  [ -n "$(frontmatter_field "$file" brain_conflicts)" ] && { printf 'conflicted\n'; return; }
+  local conflicts
+  fm_get conflicts "$file" brain_conflicts
+  [ -n "$conflicts" ] && { printf 'conflicted\n'; return; }
   if [ -n "$graph_file" ] && [ -f "$graph_file" ]; then
     case "$graph_file" in
       */indexes/generations/*/graph.tsv) graph_root="${graph_file%%/indexes/generations/*}" ;;
@@ -6419,11 +6464,34 @@ cmd_search() {
   [ -n "$as_of" ] || SEARCH_NOW_UTC="$(now_utc)"
   mkdir -p "$MAINT_FIELDS_CACHE_DIR" "$OKF_VALID_MEMO_DIR" "$SEARCH_ELIGIBLE_MEMO_DIR"
   canonical_files "$dir" >"$tmp_dir/canonical.paths"
-  okf_valid_memo_fill "$tmp_dir/canonical.paths"
+  # Fast path: one Python pass (memory_signals search-prepare) computes the
+  # canonical signature, supersession map, every file's eligibility verdict
+  # and the BM25F rows, reproducing the shell readings byte for byte. Files
+  # it cannot be sure about come back as "?" and are decided below the old
+  # way; if the pass fails, everything below runs the old way.
+  local prep="" prep_unsure=0 prep_verdict prep_valid prep_memo
+  if [ "$lexical_scorer" = bm25f ]; then
+    local -a prep_args=(search-prepare --project-dir "$dir" --paths-file "$tmp_dir/canonical.paths" --out-dir "$tmp_dir/prep"
+      --include-proposed "$include_proposed" --include-cold "$include_cold" --historical "$historical" --topic "$topic"
+      --principal "$principal" --strict-principal "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" --as-of "$as_of" --now "$SEARCH_NOW_UTC" --query "$query")
+    if [ "${#path_hints[@]}" -gt 0 ]; then
+      for term in "${path_hints[@]}"; do prep_args+=(--hint-path "$term"); done
+    fi
+    if mkdir "$tmp_dir/prep" && memory_signals "${prep_args[@]}" 2>/dev/null && [ -f "$tmp_dir/prep/eligible.tsv" ]; then
+      prep="$tmp_dir/prep"
+    fi
+  fi
+  [ -n "$prep" ] || okf_valid_memo_fill "$tmp_dir/canonical.paths"
   [ "$MAINT_FIELDS_CACHE_DIR" != "$tmp_dir/fields" ] || fields_cache_prewarm "$tmp_dir/canonical.paths"
-  INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
+  if [ -n "$prep" ]; then
+    INDEX_EXPECTED_SIGNATURE="$(cat "$prep/signature.tsv")"
+  else
+    INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
+  fi
   INDEX_EXPECTED_SIGNATURE_READY=1
   docs_state="$(index_documents_state "$dir")"
+  local INDEX_DOCS_STATE_MEMO="$docs_state" INDEX_MANIFEST_STATE_MEMO=""
+  INDEX_MANIFEST_STATE_MEMO="$(index_manifest_state "$dir")"
   graph_state="$(index_graph_state "$dir")"
   vectors_state="$(index_vectors_state "$dir")"
   manifest_hash="$(index_manifest_hash "$dir")"
@@ -6435,12 +6503,31 @@ cmd_search() {
   base_records="$tmp_dir/base.tsv"; graph_records="$tmp_dir/graph.tsv"; final_ranked="$tmp_dir/final.tsv"
   SEARCH_SUPERSESSION_MAP="$tmp_dir/supersession.tsv"
   SEARCH_GRAPH_FILE="$graph_file"
-  build_supersession_map "$dir" "$SEARCH_SUPERSESSION_MAP"
+  if [ -n "$prep" ]; then
+    SEARCH_SUPERSESSION_MAP="$prep/supersession.tsv"
+  else
+    build_supersession_map "$dir" "$SEARCH_SUPERSESSION_MAP"
+  fi
   seen_titles="$tmp_dir/seen.titles"; selected_evidence="$tmp_dir/evidence.refs"
   selected_paths="$tmp_dir/selected.paths"; independence_map="$tmp_dir/independence.tsv"
   : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"; : >"$seen_titles"; : >"$selected_evidence"; : >"$selected_paths"; : >"$independence_map"
   : >"$tmp_dir/eligible.paths"
-  while IFS= read -r file; do
+  if [ -n "$prep" ]; then
+    while IFS=$'\t' read -r prep_verdict prep_valid file; do
+      [ -n "$file" ] || continue
+      prep_memo="${file#"$SEARCH_MEMO_PREFIX"}"; prep_memo="${prep_memo//\//__}"
+      case "$prep_verdict" in
+        1) : >"$SEARCH_ELIGIBLE_MEMO_DIR/$prep_memo.1" 2>/dev/null || true; printf '%s\n' "$file" ;;
+        0) : >"$SEARCH_ELIGIBLE_MEMO_DIR/$prep_memo.0" 2>/dev/null || true ;;
+        *)
+          prep_unsure=1
+          case "$prep_valid" in 0|1) : >"$OKF_VALID_MEMO_DIR/$prep_memo.$prep_valid" 2>/dev/null || true ;; esac
+          if search_eligible_memo "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal"; then printf '%s\n' "$file"; fi
+          ;;
+      esac
+    done <"$prep/eligible.tsv" >"$tmp_dir/eligible.paths"
+  fi
+  [ -z "$prep" ] && while IFS= read -r file; do
     search_eligible_memo "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
     if [ "$lexical_scorer" = bm25f ]; then
       printf '%s\n' "$file" >>"$tmp_dir/eligible.paths"
@@ -6456,7 +6543,10 @@ cmd_search() {
     done
     [ "$score" -gt 0 ] && printf '%s\t%s\n' "$rel" "$score" >>"$lexical_raw"
   done < <(canonical_files "$dir")
-  if [ "$lexical_scorer" = bm25f ] && [ -s "$tmp_dir/eligible.paths" ]; then
+  if [ "$lexical_scorer" = bm25f ] && [ -s "$tmp_dir/eligible.paths" ] && [ -n "$prep" ] && [ "$prep_unsure" = 0 ] && [ -f "$prep/bm25.tsv" ]; then
+    cut -f1,2 "$prep/bm25.tsv" >"$lexical_raw"
+    path_matched="$(awk -F '\t' '$3 != "-" && $3 != "" { count++ } END { print count + 0 }' "$prep/bm25.tsv")"
+  elif [ "$lexical_scorer" = bm25f ] && [ -s "$tmp_dir/eligible.paths" ]; then
     # BM25F over the eligible set: deterministic, stdlib-only and recomputed
     # from canonical files on every query, so there is no index to drift.
     local -a bm25_args=(bm25 --project-dir "$dir" --paths-file "$tmp_dir/eligible.paths" --query "$query")
@@ -6607,10 +6697,16 @@ cmd_search() {
     lifecycle_bundle_for_roots "$dir" "$lifecycle_bundle_roots_file" "$principal" "$as_of" "$lifecycle_bundle_json_file"
     lifecycle_bundle_record_count="$(lifecycle_bundle_total_records "$lifecycle_bundle_json_file")"
   fi
+  local roots_more
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     file="$dir/$rel"
-    roots="$(evidence_root_hashes "$dir" "$file" 0 "" "$principal" | sort -u | paste -sd, -)"
+    # Same as `$(evidence_root_hashes ... | sort -u | paste -sd, -)` (errexit
+    # off, as in a command substitution) without starting sort and paste for
+    # the usual zero- or one-line answer.
+    ( set +e; evidence_root_hashes "$dir" "$file" 0 "" "$principal" ) >"$tmp_dir/roots.raw" || true
+    roots=""
+    { IFS= read -r roots || true; IFS= read -r roots_more && roots="$(sort -u "$tmp_dir/roots.raw" | paste -sd, -)"; } <"$tmp_dir/roots.raw" || true
     [ "$roots" = unknown ] || evidence_provenance_known "$dir" "$file" || roots="unknown"
     [ -n "$roots" ] || roots="unknown"
     printf '%s\t%s\n' "$rel" "$roots" >>"$independence_map"
@@ -6633,7 +6729,7 @@ cmd_search() {
   fi
   # Facts for every row to render come from one `okf facts-list` call; a row
   # whose batched line does not name it falls back to a per-file call.
-  local facts_batch="$tmp_dir/facts.list" facts_path=""
+  local facts_batch="$tmp_dir/facts.list" facts_path="" imap_rel imap_roots
   head -n "$limit" "$final_ranked" | while IFS=$'\t' read -r rel _; do [ -z "$rel" ] || printf '%s/%s\n' "$dir" "$rel"; done >"$tmp_dir/facts.paths"
   okf facts-list "$tmp_dir/facts.paths" >"$facts_batch" 2>/dev/null || : >"$facts_batch"
   exec 5<"$facts_batch"
@@ -6650,9 +6746,9 @@ cmd_search() {
     if [ "$require_evidence" = "1" ]; then
       evidence_refs_for_file "$dir" "$file" 0 "$principal" >>"$selected_evidence"
     fi
-    state="$(frontmatter_field "$file" brain_review_state review_state)"; [ -n "$state" ] || state="$status"; sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"
+    fm_get state "$file" brain_review_state review_state; [ -n "$state" ] || state="$status"; fm_get sensitivity "$file" brain_sensitivity sensitivity; [ -n "$sensitivity" ] || sensitivity="internal"
     [ "$state" = "superseded" ] || [ "$graph_relation" = "supersedes" ] || ! file_superseded_by_current_memory "$dir" "$file" || state="superseded"
-    if [ "$(file_conflict_state "$file" "$graph_file")" = "conflicted" ] || [ "$graph_relation" = "conflicts_with" ]; then state="${state}-conflicted"; fi
+    if [ "$graph_relation" = "conflicts_with" ] || search_row_conflicted "$file" "$graph_file" "$tmp_dir/conflict.rels"; then state="${state}-conflicted"; fi
     state_reason=""; effective_ref="$rel"
     if [ "$intent" = "current_state" ]; then
       state_resolution_for_file "$dir" "$file" "$as_of" "$principal"
@@ -6660,16 +6756,30 @@ cmd_search() {
       case "$state" in current|unknown-validity) ;; *) state_unresolved_count=$((state_unresolved_count + 1)) ;; esac
     fi
     evidence_group="unknown"; provenance_state="unknown"
-    if awk -F '\t' -v path="$rel" '$1 == path { found=1 } END { exit !found }' "$independence_map" 2>/dev/null; then
-      evidence_group="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$independence_map")"
-      [ "$evidence_group" = "unknown" ] || provenance_state="custodied"
-    fi
+    case "$rel" in
+      *\\*)
+        if awk -F '\t' -v path="$rel" '$1 == path { found=1 } END { exit !found }' "$independence_map" 2>/dev/null; then
+          evidence_group="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$independence_map")"
+          [ "$evidence_group" = "unknown" ] || provenance_state="custodied"
+        fi
+        ;;
+      *)
+        # independence_map holds one "rel<TAB>roots" line per selected row.
+        while IFS=$'\t' read -r imap_rel imap_roots; do
+          if [ "$imap_rel" = "$rel" ]; then
+            evidence_group="$imap_roots"
+            [ "$evidence_group" = "unknown" ] || provenance_state="custodied"
+            break
+          fi
+        done <"$independence_map"
+        ;;
+    esac
     lifecycle_bundle=""
     case "$intent" in
       current_state|evidence) lifecycle_bundle="$(lifecycle_bundle_for_root "$lifecycle_bundle_json_file" "$lifecycle_bundle_roots_file" "$rel" || true)" ;;
     esac
     if [ "$explain" = "1" ]; then
-      authority="$(frontmatter_field "$file" brain_source_authority source_authority)"; [ -n "$authority" ] || authority="unknown"
+      fm_get authority "$file" brain_source_authority source_authority; [ -n "$authority" ] || authority="unknown"
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tdocuments=%s,graph=%s,vector=%s\t%s\t%s\t%s\t%s\t%s\t%s' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title" "$lexical_position" "$semantic_position" "$graph_source" "$graph_relation" "$authority" "$docs_state" "$graph_state" "$vectors_state" "$state_reason" "$effective_ref" "$evidence_group" "$independent_source_count" "$correlated_record_count" "$provenance_state"
       case "$intent" in current_state|evidence) printf '\t%s' "$lifecycle_bundle" ;; esac
       printf '\n'

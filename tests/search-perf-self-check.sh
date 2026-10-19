@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Search must not start one process per record: the YAML validity check is
-# one `okf valid-batch` call, result rows come from one `okf facts-list`
-# call, eligibility is memoised across the lexical,
-# vector and graph passes, and file hashes are batched. This guard counts
-# helper starts (load-independent) and checks that the batched path and the
-# per-file fallback return byte-identical results with the same filtering.
+# Search must not start one process per record: eligibility, the canonical
+# signature and BM25F come from one `memory_signals search-prepare` pass,
+# result rows come from one `okf facts-list` call, and file hashes are
+# batched. This guard counts helper starts (load-independent) and checks that
+# the fast path, the old batched path (search-prepare unavailable) and the
+# per-file fallback (no batch helpers at all) return byte-identical results
+# with the same filtering.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -58,7 +59,9 @@ wrapper="$fixture/python-counter"
 cat >"$wrapper" <<'WRAPPER'
 #!/bin/bash
 printf '%s\n' "${2:-}" >>"$SEARCH_PERF_LOG"
-case "${2:-}" in valid-batch|facts-list) [ "${SEARCH_PERF_BREAK_BATCH:-0}" != 1 ] || exit 1 ;; esac
+case "${SEARCH_PERF_BREAK:-}:${2:-}" in
+  prepare:search-prepare|all:search-prepare|all:valid-batch|all:facts-list) exit 1 ;;
+esac
 exec "$SEARCH_PERF_REAL_PYTHON" "$@"
 WRAPPER
 chmod +x "$wrapper"
@@ -71,28 +74,48 @@ run_search() {
     --query-embedder "$embedder" --explain --metadata-file "$fixture/$tag.meta" "$@" >"$fixture/$tag.out"
 }
 
+same_results() {
+  local base="$1" other="$2" what="$3"
+  cmp -s "$fixture/$base.out" "$fixture/$other.out" || fail "$what: results differ"
+  cmp -s "$fixture/$base.meta" "$fixture/$other.meta" || fail "$what: metadata differ"
+}
+count() { grep -c "^$1\$" "$fixture/$2.log" || true; }
+
 for strategy in hybrid lexical; do
   # Index build refuses malformed YAML, so add the invalid record (duplicate
   # key) after the hybrid pass; lexical BM25F reads canonical files directly.
   [ "$strategy" != lexical ] || claim ferry-malformed "Ferry malformed" 'brain_sensitivity: internal'
   run_search "$strategy" "$strategy"
-  SEARCH_PERF_BREAK_BATCH=1 run_search "$strategy-fallback" "$strategy"
-  cmp -s "$fixture/$strategy.out" "$fixture/$strategy-fallback.out" || fail "$strategy: batched and per-file results differ"
-  cmp -s "$fixture/$strategy.meta" "$fixture/$strategy-fallback.meta" || fail "$strategy: batched and per-file metadata differ"
-  [ "$(grep -c '^valid-batch$' "$fixture/$strategy.log")" = 1 ] || fail "$strategy: expected exactly one valid-batch call"
-  ! grep -qx field "$fixture/$strategy.log" || fail "$strategy: per-record okf field calls are back"
-  grep -qx field "$fixture/$strategy-fallback.log" || fail "$strategy: fallback did not validate per file"
+  SEARCH_PERF_BREAK=prepare run_search "$strategy-batch" "$strategy"
+  SEARCH_PERF_BREAK=all run_search "$strategy-fallback" "$strategy"
+  same_results "$strategy" "$strategy-batch" "$strategy: fast and batched paths"
+  same_results "$strategy" "$strategy-fallback" "$strategy: fast and per-file paths"
+  [ "$(count search-prepare "$strategy")" = 1 ] || fail "$strategy: expected exactly one search-prepare call"
+  for helper in valid-batch bm25 field facts; do
+    [ "$(count "$helper" "$strategy")" = 0 ] || fail "$strategy: fast path started okf/memory_signals $helper"
+  done
+  [ "$(count valid-batch "$strategy-batch")" = 1 ] || fail "$strategy: batched path did not use valid-batch"
+  [ "$(count field "$strategy-batch")" = 0 ] || fail "$strategy: batched path validated per file"
+  [ "$(count field "$strategy-fallback")" -gt 0 ] || fail "$strategy: fallback did not validate per file"
+  [ "$(count facts "$strategy-fallback")" -gt 0 ] || fail "$strategy: fallback did not read facts per row"
   results="$(tail -n +2 "$fixture/$strategy.out" | wc -l | tr -d ' ')"
   starts="$(wc -l <"$fixture/$strategy.log" | tr -d ' ')"
-  # valid-batch + BM25F + facts-list: a fixed count, not one per record or row
-  [ "$starts" -le 4 ] || fail "$strategy: $starts Python starts for $results results"
-  ! grep -qx facts "$fixture/$strategy.log" || fail "$strategy: per-row okf facts calls are back"
-  grep -qx facts "$fixture/$strategy-fallback.log" || fail "$strategy: fallback did not read facts per row"
+  # search-prepare + facts-list: a fixed count, not one per record or row
+  [ "$starts" -le 2 ] || fail "$strategy: $starts Python starts for $results results"
   for excluded in ferry-malformed ferry-restricted ferry-cold ferry-expired ferry-old ferry-retracted; do
     ! grep -q "okf/claims/$excluded.md" "$fixture/$strategy.out" || fail "$strategy: $excluded should be filtered"
   done
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
 done
+
+# A value search-prepare cannot judge byte-for-byte (non-ASCII edge) must be
+# handed back to the shell check for that record, with identical results.
+claim ferry-unsure "Ferry unsure timetable" "brain_loading_temperature: caf\\303\\251"
+run_search unsure lexical
+SEARCH_PERF_BREAK=all run_search unsure-fallback lexical
+same_results unsure unsure-fallback "unsure record: fast and per-file paths"
+[ "$(count search-prepare unsure)" = 1 ] || fail "unsure record: search-prepare not tried"
+[ "$(count bm25 unsure)" = 1 ] || fail "unsure record: BM25F was not rescored after the shell check"
 grep -q '^retrieval_mode=hybrid-rrf$' "$fixture/hybrid.meta" || fail "hybrid search degraded"
 printf 'search perf self-check passed\n'

@@ -336,6 +336,10 @@ def hints_from(query: str, explicit: list[str]) -> list[str]:
 def bm25_fields(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
     raw = path.read_bytes().decode("utf-8", "replace")
     metadata, body = okf.split_frontmatter_text(raw)
+    return bm25_fields_from(metadata, body)
+
+
+def bm25_fields_from(metadata: dict[str, Any], body: str) -> tuple[dict[str, str], dict[str, Any]]:
     title = clean(metadata.get("title"))
     meta_values: list[str] = []
     for key in sorted(metadata):
@@ -364,16 +368,34 @@ def term_frequency(field_tokens: list[str], lowered: str, term: str) -> float:
 
 
 def command_bm25(args: argparse.Namespace) -> int:
-    project = Path(args.project_dir).resolve()
     paths = [line.strip() for line in Path(args.paths_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-    terms = query_terms(args.query)
-    phrase = args.query.strip().lower()
-    hints = hints_from(args.query, args.hint_path or [])
+    for rel, score, matched in bm25_rows(args.project_dir, paths, args.query, args.hint_path or []):
+        print(f"{rel}\t{score:.6f}\t{matched or '-'}")
+    return 0
+
+
+def bm25_rows(
+    project_dir: str,
+    paths: list[str],
+    query: str,
+    hint_paths: list[str],
+    parsed: dict[str, tuple[dict[str, Any], str]] | None = None,
+) -> list[tuple[str, float, str]]:
+    """BM25F rows (rel, score, matched path hint), best first.  `parsed`
+    optionally maps a path to its already parsed (metadata, body); it must
+    come from the same bytes bm25_fields would read."""
+    project = Path(project_dir).resolve()
+    terms = query_terms(query)
+    phrase = query.strip().lower()
+    hints = hints_from(query, hint_paths)
     documents: list[tuple[str, dict[str, list[str]], dict[str, str], list[str]]] = []
     for item in paths:
         path = Path(item)
         try:
-            fields, metadata = bm25_fields(path)
+            if parsed is not None and item in parsed:
+                fields, metadata = bm25_fields_from(*parsed[item])
+            else:
+                fields, metadata = bm25_fields(path)
         except (OSError, okf.OkfError):
             continue
         try:
@@ -385,7 +407,7 @@ def command_bm25(args: argparse.Namespace) -> int:
         documents.append((rel, {name: tokens(text) for name, text in fields.items()}, lowered, globs))
     total = len(documents)
     if total == 0:
-        return 0
+        return []
     average = {
         name: max(sum(len(doc[1][name]) for doc in documents) / total, 1.0)
         for name in BM25_FIELD_WEIGHTS
@@ -423,8 +445,276 @@ def command_bm25(args: argparse.Namespace) -> int:
         if score > 0:
             rows.append((rel, round(score, 6), matched))
     rows.sort(key=lambda row: (-row[1], row[0]))
-    for rel, score, matched in rows:
-        print(f"{rel}\t{score:.6f}\t{matched or '-'}")
+    return rows
+
+
+# ------------------------------------------------------- search prepare
+#
+# One pass over a project's canonical files that reproduces, byte for byte,
+# what cmd_search used to compute with per-record shell work: the canonical
+# signature, the supersession map, the eligibility verdict of every file and
+# the BM25F rows over the eligible set.  Field values follow the shell's awk
+# frontmatter reader (not YAML) exactly; any value whose shell reading this
+# pass cannot be sure of (non-ASCII at a value edge, tabs or NULs in keys,
+# backslashes or numeric-looking strings in awk comparisons) makes that
+# file's verdict "?" so the shell decides it the old way, or, when the
+# signature itself is affected, fails the pass so the whole old path runs.
+
+class _Unsure(Exception):
+    pass
+
+
+_AWK_SPACE = b" \t\n\r\x0b\x0c"
+_DATETIME_RE = re.compile(rb"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_AWK_NUMBER_RE = re.compile(rb"[ \t\n\r\x0b\x0c]*[-+]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?[ \t\n\r\x0b\x0c]*")
+
+
+def _awk_header(raw: bytes) -> tuple[list[tuple[bytes, bytes]], bool]:
+    """Frontmatter (key, value) pairs as frontmatter_field's cache awk and
+    `IFS=<TAB> read` see them, plus whether a key could confuse that read."""
+    lines = raw.split(b"\n")
+    if raw.endswith(b"\n"):
+        lines.pop()
+    pairs: list[tuple[bytes, bytes]] = []
+    unsure_keys = False
+    if not lines or lines[0] != b"---":
+        return pairs, unsure_keys
+    for line in lines[1:]:
+        if line == b"---":
+            break
+        colon = line.find(b":")
+        if colon < 1:
+            continue
+        key = line[:colon]
+        value = line[colon + 1 :].strip(_AWK_SPACE)
+        if value.startswith(b'"'):
+            value = value[1:]
+        if value.endswith(b'"'):
+            value = value[:-1]
+        value = value.replace(b"\t", b" ").replace(b"\r", b" ")
+        if b"\t" in key or b"\0" in key or b"\0" in value:
+            unsure_keys = True
+        pairs.append((key, value))
+    return pairs, unsure_keys
+
+
+class _Record:
+    def __init__(self, path: bytes, raw: bytes) -> None:
+        self.path = path
+        self.raw = raw
+        self.pairs, self.unsure = _awk_header(raw)
+
+    def field(self, key: bytes, aliases: bytes = b"") -> bytes:
+        if self.unsure:
+            raise _Unsure()
+        wanted = b"," + key + b"," + aliases + b","
+        for name, value in self.pairs:
+            if b"," + name + b"," in wanted:
+                if value and (value[0] >= 0x80 or value[-1] >= 0x80):
+                    raise _Unsure()
+                return value
+        return b""
+
+
+def _record_id(path: bytes) -> bytes:
+    name = path.rsplit(b"/", 1)[-1]
+    if name.endswith(b".md") and name != b".md":
+        name = name[:-3]
+    return name
+
+
+def _retracted(project: bytes, path: bytes) -> bool:
+    return os.path.isfile(project + b"/okf/retractions/" + _record_id(path) + b".md")
+
+
+def _effective(project: bytes, record: _Record) -> bool:
+    if _retracted(project, record.path):
+        return False
+    state = record.field(b"brain_review_state", b"review_state")
+    status = record.field(b"status")
+    if status == b"deprecated":
+        return False
+    if state:
+        if state != b"approved":
+            return False
+    elif (status or b"stable") != b"stable":
+        return False
+    return record.field(b"brain_sensitivity", b"sensitivity") != b"restricted"
+
+
+def _awk_risky(value: bytes) -> bool:
+    return b"\\" in value or _AWK_NUMBER_RE.fullmatch(value) is not None
+
+
+def _reference_lines(value: bytes) -> list[bytes]:
+    if any(byte >= 0x80 for byte in value):
+        raise _Unsure()
+    if value.startswith(b"["):
+        value = value[1:]
+    if value.endswith(b"]"):
+        value = value[:-1]
+    value = value.replace(b'"', b"").replace(b"'", b"")
+    return [part.strip(_AWK_SPACE) for part in value.split(b",") if part.strip(_AWK_SPACE)]
+
+
+def _principal_visible(record: _Record, principal: bytes, strict: bool) -> bool:
+    if not principal and not strict:
+        return True
+    scope = record.field(b"brain_principal")
+    audience = record.field(b"brain_audience")
+    if not scope and not audience:
+        return True
+    if not principal:
+        return False
+    for values in (scope, audience):
+        if values and principal in _reference_lines(values):
+            return True
+    return False
+
+
+def _temporal(record: _Record, as_of: bytes, now: bytes, historical: bool) -> bool:
+    if historical and not as_of:
+        return True
+    moment = as_of or now
+    if not moment:
+        raise _Unsure()
+    valid_from = record.field(b"brain_valid_from")
+    valid_to = record.field(b"brain_valid_to")
+    if valid_from and not _DATETIME_RE.fullmatch(valid_from):
+        return False
+    if valid_to and not _DATETIME_RE.fullmatch(valid_to):
+        return False
+    if valid_from and not valid_from <= moment:
+        return False
+    if valid_to and not moment < valid_to:
+        return False
+    return True
+
+
+def _basename_md(rel: bytes) -> bytes:
+    stripped = rel.rstrip(b"/")
+    name = stripped.rsplit(b"/", 1)[-1] if stripped else b"/"
+    if name.endswith(b".md") and name != b".md":
+        name = name[:-3]
+    return name
+
+
+def _eligible(project: bytes, record: _Record, valid: bool, options: dict[str, Any], supersession: list[bytes]) -> bool:
+    if not valid or _retracted(project, record.path):
+        return False
+    state = record.field(b"brain_review_state", b"review_state")
+    status = record.field(b"status") or b"stable"
+    if record.field(b"brain_sensitivity", b"sensitivity") == b"restricted":
+        return False
+    historical = options["historical"]
+    if state == b"superseded" or status == b"deprecated":
+        if not historical:
+            return False
+    elif not options["include_proposed"] and state:
+        if state != b"approved":
+            return False
+    elif not options["include_proposed"]:
+        if status != b"stable":
+            return False
+    if not historical and supersession:
+        prefix = project + b"/"
+        rel = record.path[len(prefix):] if record.path.startswith(prefix) else record.path
+        base = _basename_md(rel)
+        title = record.field(b"title")
+        if _awk_risky(rel) or _awk_risky(base) or _awk_risky(title):
+            raise _Unsure()
+        targets = {rel, rel + b".md", base, title}
+        if any(target in targets for target in supersession):
+            return False
+    if not options["include_cold"] and record.field(b"brain_loading_temperature") == b"cold":
+        return False
+    topic = options["topic"]
+    if topic and record.field(b"brain_topic_id", b"topic_id") != topic:
+        return False
+    if not _principal_visible(record, options["principal"], options["strict"]):
+        return False
+    return _temporal(record, options["as_of"], options["now"], historical)
+
+
+def _yaml_valid(raw: bytes) -> tuple[bool, tuple[dict[str, Any], str] | None]:
+    """Same verdict as `okf.py field PATH type` (any failure is invalid)."""
+    try:
+        metadata, body = okf.split_frontmatter_text(raw.decode("utf-8"))
+        if "type" in metadata:
+            okf.scalar_text(metadata["type"])
+    except Exception:  # noqa: BLE001 - mirrors a failed `field` process
+        return False, None
+    return True, (metadata, body)
+
+
+def command_search_prepare(args: argparse.Namespace) -> int:
+    project = os.fsencode(args.project_dir)
+    out = Path(args.out_dir)
+    paths = [line for line in Path(args.paths_file).read_bytes().split(b"\n") if line]
+    options = {
+        "include_proposed": args.include_proposed == "1",
+        "include_cold": args.include_cold == "1",
+        "historical": args.historical == "1",
+        "topic": os.fsencode(args.topic),
+        "principal": os.fsencode(args.principal),
+        "strict": args.strict_principal == "1",
+        "as_of": os.fsencode(args.as_of),
+        "now": os.fsencode(args.now),
+    }
+    prefix = project + b"/"
+    records: list[_Record] = []
+    signature: list[bytes] = []
+    supersession_lines: list[bytes] = []
+    supersession: list[bytes] = []
+    try:
+        for path in paths:
+            with open(path, "rb") as stream:
+                raw = stream.read()
+            record = _Record(path, raw)
+            records.append(record)
+            if _effective(project, record):
+                rel = path[len(prefix):] if path.startswith(prefix) else path
+                signature.append(rel + b"\t" + hashlib.sha256(raw).hexdigest().encode("ascii"))
+                supersedes = record.field(b"brain_supersedes")
+                if supersedes:
+                    supersession_lines.append(supersedes + b"\t" + rel)
+                    supersession.append(supersedes)
+    except (OSError, _Unsure):
+        return 3
+    verdicts: list[bytes] = []
+    eligible: list[str] = []
+    parsed: dict[str, tuple[dict[str, Any], str]] = {}
+    unsure = False
+    for record in records:
+        valid, document = _yaml_valid(record.raw)
+        try:
+            verdict = b"1" if _eligible(project, record, valid, options, supersession) else b"0"
+        except _Unsure:
+            verdict = b"?"
+            unsure = True
+        verdicts.append(verdict + b"\t" + (b"1" if valid else b"0") + b"\t" + record.path)
+        if verdict == b"1":
+            try:
+                text = record.path.decode("utf-8")
+            except UnicodeDecodeError:
+                unsure = True
+                continue
+            eligible.append(text)
+            if document is not None and text == text.strip():
+                parsed[text] = document
+    (out / "signature.tsv").write_bytes(b"".join(line + b"\n" for line in signature))
+    (out / "supersession.tsv").write_bytes(b"".join(line + b"\n" for line in supersession_lines))
+    if args.query is not None and not unsure and eligible:
+        try:
+            items = [item.strip() for item in eligible if item.strip()]
+            rows = bm25_rows(args.project_dir, items, args.query, args.hint_path or [], parsed)
+        except Exception:  # noqa: BLE001 - the shell reruns bm25 and reports
+            rows = None
+        if rows is not None:
+            with (out / "bm25.tsv").open("w", encoding="utf-8") as stream:
+                for rel, score, matched in rows:
+                    stream.write(f"{rel}\t{score:.6f}\t{matched or '-'}\n")
+    (out / "eligible.tsv").write_bytes(b"".join(line + b"\n" for line in verdicts))
     return 0
 
 
@@ -1492,6 +1782,22 @@ def parser() -> argparse.ArgumentParser:
     bm25.add_argument("--query", required=True)
     bm25.add_argument("--hint-path", action="append")
     bm25.set_defaults(func=command_bm25)
+
+    prepare = commands.add_parser("search-prepare")
+    prepare.add_argument("--project-dir", required=True)
+    prepare.add_argument("--paths-file", required=True)
+    prepare.add_argument("--out-dir", required=True)
+    prepare.add_argument("--include-proposed", default="0")
+    prepare.add_argument("--include-cold", default="0")
+    prepare.add_argument("--historical", default="0")
+    prepare.add_argument("--topic", default="")
+    prepare.add_argument("--principal", default="")
+    prepare.add_argument("--strict-principal", default="0")
+    prepare.add_argument("--as-of", default="")
+    prepare.add_argument("--now", default="")
+    prepare.add_argument("--query")
+    prepare.add_argument("--hint-path", action="append")
+    prepare.set_defaults(func=command_search_prepare)
 
     usage = base("usage", command_usage)
     usage.add_argument("--json", action="store_true")
