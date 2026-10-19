@@ -388,7 +388,7 @@ LLM_BRAIN_EMBEDDER_VERSION=v3 "$cli" --root "$vault" index build "$project_id" -
 hybrid_pack="$($cli --root "$vault" pack build "$project_id" --agent generic --task 'unrelated query' --strategy hybrid --query-embedder "$query_embedder" --budget-tokens 200)"
 hybrid_pack_file="$(printf '%s\n' "$hybrid_pack" | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 assert_file "$hybrid_pack_file"
-grep -Fq 'brain_retrieval: hybrid-rrf' "$hybrid_pack_file" || fail "hybrid pack did not record actual retrieval mode"
+grep -Eq 'brain_retrieval: hybrid-(rrf|zscore|lexical)$' "$hybrid_pack_file" || fail "hybrid pack did not record actual retrieval mode"
 grep -Fq 'brain_retrieval_degraded: false' "$hybrid_pack_file" || fail "hybrid pack was unexpectedly degraded"
 grep -Fq 'brain_index_manifest_hash:' "$hybrid_pack_file" || fail "hybrid pack omitted index manifest hash"
 

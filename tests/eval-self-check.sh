@@ -42,7 +42,7 @@ output="$(printf '%s\n' "$first" | sed -n 's/.*output=\([^ ]*\).*/\1/p')"
 [ -f "$output/report.md" ]
 [ -f "$output/trace.tsv" ]
 grep -Fq $'vector\tvector\tfalse' "$output/trace.tsv"
-grep -Eq $'hybrid\thybrid-(rrf|lexical)\tfalse' "$output/trace.tsv"
+grep -Eq $'hybrid\thybrid-(rrf|zscore|lexical)\tfalse' "$output/trace.tsv"
 grep -Fq $'lexical\tlexical\tfalse' "$output/trace.tsv"
 grep -Fq $'source\tsource\tfalse' "$output/trace.tsv"
 grep -Fq 'brain_result_hash_sha256:' "$output/report.md"

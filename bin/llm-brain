@@ -88,7 +88,7 @@ Commands:
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
-  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
+  search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--fusion rrf|zscore] [--fusion-alpha A] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
   pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label L]... [--without-label L]... [--turn N] [--session ID] [--state-index] [--sufficiency]
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
@@ -6510,7 +6510,7 @@ resolve_graph_target() {
 
 cmd_search() {
   if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
-    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label LABEL]... [--without-label LABEL]...'
+    printf '%s\n' 'Usage: llm-brain search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--fusion rrf|zscore] [--fusion-alpha A] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--explain] [--include-proposed] [--include-cold] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label LABEL]... [--without-label LABEL]...'
     return 0
   fi
   [ "$#" -ge 2 ] || die 64 "search requires PROJECT_ID and QUERY (try: llm-brain search --help)"
@@ -6518,7 +6518,7 @@ cmd_search() {
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local usage_boost="${LLM_BRAIN_USAGE_BOOST:-0}" diversity_reserve="${LLM_BRAIN_DIVERSITY_RESERVE:-2}" diversity_reserved=0 path_matched=0 lexical_scorer="${LLM_BRAIN_LEXICAL_SCORER:-bm25f}"
   local -a path_hints=() with_labels=() without_labels=()
-  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.2}" vector_gate_skip=0 lexical_margin=""
+  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.2}" fusion="${LLM_BRAIN_FUSION:-zscore}" fusion_alpha="${LLM_BRAIN_FUSION_ALPHA:-0.4}" vector_gate_skip=0 lexical_margin=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -6531,6 +6531,8 @@ cmd_search() {
       --query-embedder) query_embedder="${2:-}"; shift 2 ;;
       --vector-weight) vector_weight="${2:-}"; shift 2 ;;
       --vector-gate) vector_gate="${2:-}"; shift 2 ;;
+      --fusion) fusion="${2:-}"; shift 2 ;;
+      --fusion-alpha) fusion_alpha="${2:-}"; shift 2 ;;
       --expand-graph) expand_graph=1; shift ;;
       --historical) historical=1; shift ;;
       --as-of) as_of="${2:-}"; shift 2 ;;
@@ -6559,6 +6561,8 @@ cmd_search() {
   case "$lexical_scorer" in bm25f|legacy) ;; *) die 64 "LLM_BRAIN_LEXICAL_SCORER must be bm25f or legacy" ;; esac
   [[ "$vector_weight" =~ ^[0-9]{1,2}(\.[0-9]{1,6})?$ ]] || die 64 "--vector-weight / LLM_BRAIN_VECTOR_WEIGHT must be a decimal from 0 to 99 (for example 0.5)"
   case "$vector_gate" in always|never) ;; *) [[ "$vector_gate" =~ ^(0(\.[0-9]{1,6})?|1(\.0{1,6})?)$ ]] || die 64 "--vector-gate / LLM_BRAIN_VECTOR_GATE must be always, never or a margin from 0 to 1 (for example 0.3)" ;; esac
+  case "$fusion" in rrf|zscore) ;; *) die 64 "--fusion / LLM_BRAIN_FUSION must be rrf or zscore" ;; esac
+  [[ "$fusion_alpha" =~ ^(0(\.[0-9]{1,6})?|1(\.0{1,6})?)$ ]] || die 64 "--fusion-alpha / LLM_BRAIN_FUSION_ALPHA must be a decimal from 0 to 1 (for example 0.4)"
   # Older or partial installs without the signals helper keep the legacy scorer.
   [ "$lexical_scorer" != bm25f ] || sibling_helper memory_signals.py >/dev/null || lexical_scorer=legacy
   if [ "${#path_hints[@]}" -gt 0 ]; then
@@ -6750,7 +6754,8 @@ cmd_search() {
     fi
   fi
   if [ "$strategy" = "hybrid" ] && [ "$vector_gate_skip" = "1" ]; then semantic_ok=1; : >"$semantic_rank"; fi
-  if [ "$strategy" = "hybrid" ] && [ "$semantic_ok" = "1" ]; then mode="hybrid-rrf"; [ "$vector_gate_skip" = "0" ] || mode="hybrid-lexical"; fi
+  [ "$strategy" = "hybrid" ] && [ "$semantic_ok" = "1" ] && [ "$vector_gate_skip" = "0" ] || fusion="rrf"
+  if [ "$strategy" = "hybrid" ] && [ "$semantic_ok" = "1" ]; then mode="hybrid-$fusion"; [ "$vector_gate_skip" = "0" ] || mode="hybrid-lexical"; fi
   if [ "$strategy" = "vector" ]; then mode="vector"; [ "$semantic_ok" = "1" ] || degraded=1; fi
 
   {
@@ -6759,13 +6764,30 @@ cmd_search() {
   } | sort -u >"$union"
   # One join for the whole union (was five awk starts per candidate): first
   # row per path wins, RRF k=60 for hybrid, raw scores otherwise.
-  awk -F '\t' -v lexical_file="$lexical_rank" -v semantic_file="$semantic_rank" -v strategy="$strategy" -v semantic_ok="$semantic_ok" -v vector_weight="$vector_weight" '
-    FILENAME == lexical_file { if (!($1 in lexical_position)) { lexical_position[$1] = $2; lexical_score[$1] = $3 } next }
-    FILENAME == semantic_file { if (!($1 in semantic_position)) { semantic_position[$1] = $2; semantic_score[$1] = $3 } next }
+  awk -F '\t' -v lexical_file="$lexical_rank" -v semantic_file="$semantic_rank" -v strategy="$strategy" -v semantic_ok="$semantic_ok" -v vector_weight="$vector_weight" -v fusion="$fusion" -v alpha="$fusion_alpha" '
+    # zscore fusion: standardise BM25F and cosine over each list'"'"'s top 100,
+    # a record missing from one list takes that list'"'"'s lowest z, and
+    # alpha * z_lexical + (1 - alpha) * z_vector is squashed into (0, 1).
+    function zstats(n, v, m, sd, i) { m = 0; for (i = 1; i <= n; i++) m += v[i]; m /= n; sd = 0; for (i = 1; i <= n; i++) sd += (v[i] - m) ^ 2; sd = sqrt(sd / n); if (sd == 0) sd = 1; zm = m; zsd = sd }
+    FILENAME == lexical_file { if (!($1 in lexical_position)) { lexical_position[$1] = $2; lexical_score[$1] = $3; if ($2 <= 100) lv[++ln] = $3 + 0 } next }
+    FILENAME == semantic_file { if (!($1 in semantic_position)) { semantic_position[$1] = $2; semantic_score[$1] = $3; if ($2 <= 100) sv[++sn] = $3 + 0 } next }
     $0 == "" { next }
+    fusion == "zscore" && !zready {
+      zready = 1
+      if (ln > 0) { zstats(ln, lv); lm = zm; lsd = zsd; lmin = (lv[ln] - lm) / lsd } else lmin = 0
+      if (sn > 0) { zstats(sn, sv); sm = zm; ssd = zsd; smin = (sv[sn] - sm) / ssd } else smin = 0
+      for (i = 1; i <= sn; i++) if ((sv[i] - sm) / ssd < smin) smin = (sv[i] - sm) / ssd
+    }
     {
       rel = $0; lp = (rel in lexical_position) ? lexical_position[rel] : ""; sp = (rel in semantic_position) ? semantic_position[rel] : ""
       if (strategy == "vector") final = (rel in semantic_score && semantic_score[rel] != "") ? semantic_score[rel] : "0"
+      else if (fusion == "zscore") {
+        if ((lp != "" && lp <= 100) || (sp != "" && sp <= 100)) {
+          zl = (lp != "" && lp <= 100) ? (lexical_score[rel] - lm) / lsd : lmin
+          zv = (sp != "" && sp <= 100) ? (semantic_score[rel] - sm) / ssd : smin
+          final = sprintf("%.12f", 1 / (1 + exp(-(alpha * zl + (1 - alpha) * zv))))
+        } else { value = 0; if (lp != "") value += 1 / (60 + lp); if (sp != "") value += 1 / (60 + sp); final = sprintf("%.12f", value * 0.000001) }
+      }
       else if (semantic_ok == "1") { value = 0; if (lp != "") value += 1 / (60 + lp); if (sp != "") value += vector_weight / (60 + sp); final = sprintf("%.12f", value) }
       else final = (rel in lexical_score && lexical_score[rel] != "") ? lexical_score[rel] : "0"
       printf "B\t%s\t%s\t%s\t%s\n", rel, final, lp, sp
@@ -6973,6 +6995,7 @@ cmd_search() {
     printf 'retrieval_mode=%s\ndegraded=%s\nas_of=%s\nintent=%s\nprincipal=%s\nrequire_evidence=%s\nexploratory=%s\nplanner=deterministic\nevidence_refs=%s\nmanifest_hash=%s\ndocuments_index=%s\ngraph_index=%s\nvector_index=%s\nindex_generation=%s\nrebuild_state=%s\nstate_resolution=%s\nstate_unresolved_count=%s\nindependent_source_count=%s\ncorrelated_record_count=%s\nlifecycle_bundle_resolution=%s\nlifecycle_bundle_record_count=%s\nlexical_scorer=%s\npath_hints=%s\npath_matched_count=%s\nusage_boost=%s\ndiversity_reserved=%s\n' "$mode" "$([ "$degraded" = "1" ] && printf true || printf false)" "${as_of:-none}" "$intent" "${principal:-none}" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$evidence_refs" "${manifest_hash:-none}" "$docs_state" "$graph_state" "$vectors_state" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" "$([ "$intent" = "current_state" ] && printf enabled || printf disabled)" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$([ "$intent" = current_state ] || [ "$intent" = evidence ] && printf enabled || printf disabled)" "$lifecycle_bundle_record_count" "$lexical_scorer" "$([ "${#path_hints[@]}" -gt 0 ] && printf '%s' "${#path_hints[@]}" || printf 0)" "$path_matched" "$([ "$usage_boost" = 1 ] && printf enabled || printf disabled)" "$diversity_reserved" >"$metadata_file"
     [ "$recency_boost" = 0 ] || printf 'recency_boost=enabled\n' >>"$metadata_file"
     [ "$mode" = "${mode#hybrid-rrf}" ] || printf 'vector_weight=%s\n' "$vector_weight" >>"$metadata_file"
+    [ "$mode" = "${mode#hybrid-zscore}" ] || printf 'fusion=zscore\nfusion_alpha=%s\n' "$fusion_alpha" >>"$metadata_file"
     if [ "$strategy" = "hybrid" ] && [ "$vector_gate" != "always" ]; then
       printf 'vector_gate=%s\n' "$vector_gate" >>"$metadata_file"
       [ -z "$lexical_margin" ] || printf 'lexical_margin=%s\n' "$lexical_margin" >>"$metadata_file"

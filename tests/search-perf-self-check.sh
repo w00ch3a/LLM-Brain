@@ -96,7 +96,7 @@ gate_search() {
   wc -c <"$fixture/embedder.calls" | tr -d ' '
 }
 run_search gate-lexical lexical
-[ "$(gate_search gate-always --vector-gate always)" -gt 0 ] || fail "gate always: embedder not run"
+[ "$(gate_search gate-always --vector-gate always --fusion rrf)" -gt 0 ] || fail "gate always: embedder not run"
 grep -qx 'retrieval_mode=hybrid-rrf' "$fixture/gate-always.meta" || fail "gate always: not fused"
 ! grep -q '^vector_gate=' "$fixture/gate-always.meta" || fail "gate always: metadata changed"
 [ "$(gate_search gate-never --vector-gate never)" = 0 ] || fail "gate never: embedder ran"
@@ -106,9 +106,9 @@ cut -f1 "$fixture/gate-never.out" | cmp -s - <(cut -f1 "$fixture/gate-lexical.ou
 [ "$(LLM_BRAIN_VECTOR_GATE=0 gate_search gate-zero)" = 0 ] || fail "gate 0: embedder ran"
 grep -q '^lexical_margin=0\.' "$fixture/gate-zero.meta" || fail "gate 0: margin not recorded"
 [ "$(gate_search gate-one --vector-gate 1)" -gt 0 ] || fail "gate 1: close lexical scores skipped the vector pass"
-grep -qx 'retrieval_mode=hybrid-rrf' "$fixture/gate-one.meta" || fail "gate 1: not fused"
+grep -qx 'retrieval_mode=hybrid-zscore' "$fixture/gate-one.meta" || fail "gate 1: not fused"
 if "$cli" --root "$vault" search "$project_id" ferry --strategy hybrid --query-embedder "$embedder" --vector-gate sometimes >/dev/null 2>&1; then fail "an invalid vector gate was accepted"; fi
-LLM_BRAIN_VECTOR_GATE=never run_search lexical-gate lexical
+LLM_BRAIN_VECTOR_GATE=never LLM_BRAIN_FUSION=rrf run_search lexical-gate lexical
 cmp -s "$fixture/gate-lexical.out" "$fixture/lexical-gate.out" || fail "lexical: vector gate changed lexical results"
 
 for strategy in hybrid lexical; do
@@ -137,13 +137,19 @@ for strategy in hybrid lexical; do
   done
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
-  # The vector weight only touches hybrid fusion (default 1, recorded), and
-  # the default lexical confidence gate (0.2) is recorded with its margin.
+  # Hybrid defaults to z-score fusion (alpha 0.4) behind the lexical
+  # confidence gate (0.2), all recorded; RRF takes the vector weight.
   if [ "$strategy" = hybrid ]; then
-    grep -qx 'vector_weight=1' "$fixture/hybrid.meta" || fail "hybrid: default vector weight not recorded"
+    grep -qx 'fusion=zscore' "$fixture/hybrid.meta" || fail "hybrid: default fusion not recorded"
+    grep -qx 'fusion_alpha=0.4' "$fixture/hybrid.meta" || fail "hybrid: default fusion alpha not recorded"
     grep -qx 'vector_gate=0.2' "$fixture/hybrid.meta" || fail "hybrid: default vector gate not recorded"
-    run_search hybrid-w05 hybrid --vector-weight 0.5
+    run_search hybrid-w05 hybrid --fusion rrf --vector-weight 0.5
     grep -qx 'vector_weight=0.5' "$fixture/hybrid-w05.meta" || fail "hybrid: --vector-weight not applied"
+    grep -qx 'retrieval_mode=hybrid-rrf' "$fixture/hybrid-w05.meta" || fail "hybrid: --fusion rrf not applied"
+    LLM_BRAIN_FUSION_ALPHA=0.7 run_search hybrid-a07 hybrid
+    grep -qx 'fusion_alpha=0.7' "$fixture/hybrid-a07.meta" || fail "hybrid: LLM_BRAIN_FUSION_ALPHA not applied"
+    if run_search hybrid-bad hybrid --fusion mean 2>/dev/null; then fail "an invalid fusion was accepted"; fi
+    if run_search hybrid-bad hybrid --fusion-alpha 2 2>/dev/null; then fail "an invalid fusion alpha was accepted"; fi
   else
     LLM_BRAIN_VECTOR_WEIGHT=0 run_search lexical-w0 lexical
     same_results lexical lexical-w0 "lexical: vector weight changed lexical results"
@@ -201,5 +207,5 @@ SEARCH_PERF_BREAK=all run_search unsure-fallback lexical
 same_results unsure unsure-fallback "unsure record: fast and per-file paths"
 [ "$(count search-prepare unsure)" = 1 ] || fail "unsure record: search-prepare not tried"
 [ "$(count bm25 unsure)" = 1 ] || fail "unsure record: BM25F was not rescored after the shell check"
-grep -q '^retrieval_mode=hybrid-rrf$' "$fixture/hybrid.meta" || fail "hybrid search degraded"
+grep -q '^retrieval_mode=hybrid-zscore$' "$fixture/hybrid.meta" || fail "hybrid search degraded"
 printf 'search perf self-check passed\n'

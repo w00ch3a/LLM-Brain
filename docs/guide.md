@@ -105,16 +105,18 @@ or vault migration is added.
   Scores are recomputed from canonical files on every query, so there is no
   index to drift. `LLM_BRAIN_LEXICAL_SCORER=legacy` restores the previous
   scorer.
-- **Hybrid confidence gate and fusion weight (0.10).** Hybrid search skips
+- **Hybrid confidence gate and z-score fusion (0.10).** Hybrid search skips
   the embedder when lexical search is already sure: if the top BM25F score
   beats the second by a margin `(top - second) / top` of at least 0.2 (a lone
-  match counts as 1), it keeps the lexical order and records
-  `retrieval_mode=hybrid-lexical`. Otherwise it adds `W / (60 + vector rank)`
-  to `1 / (60 + lexical rank)`. Set the gate with
-  `--vector-gate always|never|MARGIN` or `LLM_BRAIN_VECTOR_GATE` (`always` is
-  the 0.9 behaviour, `never` never runs the vector pass), and the weight with
-  `--vector-weight W` or `LLM_BRAIN_VECTOR_WEIGHT` (default 1). Metadata
-  records `vector_gate=`, `lexical_margin=` and, when fused, `vector_weight=`.
+  match counts as 1), it keeps the lexical order (`hybrid-lexical`).
+  Otherwise it standardises BM25F and cosine scores over each list's top 100
+  and ranks by `alpha * z_lexical + (1 - alpha) * z_vector`, alpha 0.4
+  (`hybrid-zscore`). Set the gate with `--vector-gate always|never|MARGIN` or
+  `LLM_BRAIN_VECTOR_GATE`, the fusion with `--fusion rrf|zscore` or
+  `LLM_BRAIN_FUSION`, alpha with `--fusion-alpha` or `LLM_BRAIN_FUSION_ALPHA`,
+  and the RRF vector weight with `--vector-weight` or
+  `LLM_BRAIN_VECTOR_WEIGHT`. `--fusion rrf --vector-gate always` is the 0.9
+  behaviour.
 - **File-aware recall.** Concepts may declare `brain_paths` globs (quote them:
   `brain_paths: ["src/api/**"]`). A task that names a matching file, or
   `--path FILE`, boosts those concepts.
