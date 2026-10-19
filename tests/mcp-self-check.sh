@@ -67,7 +67,7 @@ assert by_id[11]["error"]["code"] == -32601
 assert by_id[None]["error"]["code"] == -32700
 PY
 review_file="$(python3 -c 'import json,sys; rows=[json.loads(l) for l in open(sys.argv[1])]; print([json.loads(r["result"]["content"][0]["text"])["review_ref"] for r in rows if r.get("id") == 8][0])' "$fixture/responses.jsonl")"
-grep -Fq 'brain_review_state: proposed' "$project_dir/$review_file" || fail 'capture was not review-only'
+grep -Eq 'brain_review_state: (proposed|captured)$' "$project_dir/$review_file" || fail 'capture was not review-only'
 grep -Rqs 'retry limit becomes 9' "$project_dir/okf" && fail 'capture reached canonical memory'
 
 # Read-only mode removes capture entirely.

@@ -141,7 +141,7 @@ if [ ! -f "$new_dir/lib/memory_signals.py" ] || [ ! -f "$new_dir/lib/memory_line
   grep -Fq 'lib/memory_lineage.py' <<<"$repair" || fail "repair did not restore helpers: $repair"
   grep -Fq 'already-complete' <<<"$(env_run "$new" upgrade repair-standalone --source "$repo_root")" || fail 'repair is not idempotent'
 fi
-for f in lib/okf.py lib/replication.py lib/memory_signals.py lib/memory_lineage.py lib/mcp_server.py neural-expansion/index.html; do
+for f in lib/okf.py lib/replication.py lib/memory_signals.py lib/memory_lineage.py lib/review_policy.py lib/mcp_server.py neural-expansion/index.html; do
   [ -f "$new_dir/$f" ] || fail "standalone install lacks $f"
 done
 [ "$before" = "$(canonical_digest "$snapshot_before")" ] || fail 'snapshot drifted'

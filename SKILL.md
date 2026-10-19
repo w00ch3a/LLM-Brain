@@ -46,7 +46,7 @@ First determine which operation is requested:
 4. repair or migrate an existing vault; or
 5. build a context pack or adapter.
 
-Inspection, planning, `detect`, `stats`, `doctor`, `lint`, `search`, `review list/show`, and `migrate check` are read-only. Do not create a project, ingest material, promote a candidate, rebuild indexes, overwrite an adapter, import, migrate, commit, push, tag, publish, or deploy unless the human has authorised that class of change.
+Inspection, planning, `detect`, `stats`, `doctor`, `lint`, `search`, `review list/show`, `review sweep --dry-run`, and `migrate check` are read-only. Do not create a project, ingest material, promote a candidate, rebuild indexes, overwrite an adapter, import, migrate, run `review sweep --apply`, commit, push, tag, publish, or deploy unless the human has authorised that class of change.
 
 For an authorised change, establish project identity from the Git root, normalised origin remote, physical path, existing registry and governing repository documents. The current repository, explicit human instruction and live proof override an older brain entry.
 
@@ -56,8 +56,9 @@ For an authorised change, establish project identity from the Git root, normalis
 - Keep raw custody and episodes separate from canonical knowledge.
 - Never silently overwrite canonical knowledge. Resolve conflicts through review and retain retractions/tombstones.
 - A trusted local provider is explicit: `LLM_BRAIN_REFLECTOR` or `--provider` is an executable, never a shell string. The core makes no network calls.
-- Automatic promotion is normal only for a low-risk claim/procedure/reference with confidence at least `0.90`, valid custody-backed provenance, provider ID/version, clean secret scan, no conflict and sensitivity no higher than `internal`.
-- Never auto-promote healthcare/clinical, security, authentication, privacy, legal, finance, payment, production-control, destructive-migration, secret, restricted, drifted, external-unverified, ambiguous, skill, or source-modifying adapter material.
+- Automatic promotion is normal for a low-risk claim/procedure/reference with confidence at least `0.90`, valid custody-backed provenance, provider ID/version, clean secret scan, no conflict and sensitivity no higher than `internal`. Under the default tiered review policy (`LLM_BRAIN_REVIEW_POLICY=tiered`; `strict` keeps the 0.10 behaviour) a fact-tagged candidate with confidence at least `0.80` (`LLM_BRAIN_REVIEW_MIN_CONFIDENCE`), low or medium risk, resolvable custody, provider ID/version, clean secret scan and no supersession or conflict is also promoted once it has waited `LLM_BRAIN_REVIEW_COOLOFF_HOURS` (24).
+- Never auto-promote security, authentication, secret, credential, production-control, destructive-migration, restricted, drifted, external-unverified, ambiguous, skill, or source-modifying adapter material, and never promote a supersession, conflict or belief-check outlier without review.
+- Health, privacy, legal and finance facts that pass the cool-off rule are stored automatically as owner-only `brain_sensitivity: private` records (hidden from every other principal, never exported or replicated); set `LLM_BRAIN_REVIEW_PERSONAL=hold` to keep them for review instead.
 - Quarantine likely secrets; record safe metadata rather than copying the secret into durable memory.
 - Use `--capture-only` or `--manual-only` when automatic reflection must be paused.
 
@@ -94,7 +95,7 @@ Lexical search uses deterministic BM25F (title, then metadata, then body) recomp
 
 `ingest-source PROJECT FILE [ROOT]` remains the v0.1 capture-only compatibility command. `ingest` reflects and applies automatic policy when a provider is configured. A provider receives a request path and an empty output directory, then writes candidate Markdown files with `ReviewItem` frontmatter.
 
-Use `review list`, `review show` and `review decide` only for real exceptions. Safe candidates should not create human queue work.
+Use `review list`, `review show` and `review decide` only for real exceptions. Safe candidates should not create human queue work. Custody markers are not review items: capture records them as `captured`. Candidates that match no rule are parked after `LLM_BRAIN_REVIEW_PARK_DAYS` (90). Only true exceptions reach a person. `review sweep PROJECT_ID|--all --dry-run` prints tier counts and a confirm token; `--apply --confirm TOKEN` labels every change, writes an audit row and a manifest, and `--undo RUN_ID` reverses it (secret redactions are kept).
 
 Project writes wait behind another writer instead of failing on ordinary lock contention. Stale project ownership is recovered only when the owner is proven dead, with a Markdown recovery record retained under `.locks/`. Do not bypass locks. Migration and upgrade transition locks are whole-vault safety stops while live; current transactions record ownership so dead ones can be recovered, while legacy unowned transition locks require explicit inspection.
 

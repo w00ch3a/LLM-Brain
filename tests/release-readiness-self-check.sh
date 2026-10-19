@@ -55,6 +55,7 @@ static_checks() {
     python3 -m py_compile "$repo_root/lib/replication.py" -- \
     python3 -m py_compile "$repo_root/lib/memory_signals.py" -- \
     python3 -m py_compile "$repo_root/lib/memory_lineage.py" -- \
+    python3 -m py_compile "$repo_root/lib/review_policy.py" -- \
     python3 -m py_compile "$repo_root/lib/mcp_server.py" -- \
     python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py" -- \
     python3 -m py_compile "$repo_root/scripts/eval-outcome.py" -- \
@@ -79,6 +80,7 @@ core_checks() {
     bash "$repo_root/tests/v3-self-check.sh" -- \
     bash "$repo_root/tests/reflection-scheduler-self-check.sh" -- \
     bash "$repo_root/tests/work-self-check.sh" -- \
+    bash "$repo_root/tests/review-sweep-self-check.sh" -- \
     bash "$repo_root/tests/state-commitment-capsule-self-check.sh" -- \
     bash "$repo_root/tests/commitment-dir-self-check.sh" -- \
     bash "$repo_root/tests/temporal-self-check.sh" -- \

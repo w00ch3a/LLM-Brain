@@ -43,6 +43,47 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## What's new in 0.11 (draft)
+
+**The review queue only holds real exceptions.** The default tiered review
+policy stops captures from creating queue work and clears what can be cleared
+safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the 0.10 behaviour exactly.
+
+- **Custody markers are not queue items.** `ingest` and `ingest-source` record
+  the source marker as `captured` rather than `proposed`.
+- **Tiers.** Old custody markers close as `captured`. Exact legacy scaffold
+  stubs close as `superseded` (the same rule as `migrate apply`). Exact duplicate
+  candidates close as `superseded` with `brain_duplicate_of`. Fact-tagged
+  candidates with confidence at least 0.80, custody that resolves and no
+  supersession or conflict are promoted after a 24-hour cool-off. Health,
+  privacy, legal and finance facts are stored as owner-only `private` records.
+  Hypothetical and proposal candidates, unverifiable ones, and anything that
+  matches no rule after 90 days are `parked`. Security and operations topics,
+  supersessions, conflicts, belief-check outliers, external-origin text and
+  skills or adapters stay held for a person. Secret-like review files are
+  redacted in place: each matched span becomes `[redacted sha256:…]`.
+- **Switches.** `LLM_BRAIN_REVIEW_COOLOFF_HOURS` (24),
+  `LLM_BRAIN_REVIEW_MIN_CONFIDENCE` (0.80), `LLM_BRAIN_REVIEW_PARK_DAYS` (90),
+  `LLM_BRAIN_REVIEW_PERSONAL=private|hold` (private),
+  `LLM_BRAIN_OWNER_PRINCIPAL` (optional owner id for private records) and
+  `LLM_BRAIN_REVIEW_CLOSEOUT=0` (turns off the closeout pass).
+- **Backlog sweep.** `review sweep PROJECT_ID|--all --dry-run` prints counts per
+  tier and a confirm token, and writes nothing. `--apply --confirm TOKEN` is an
+  authorised-change class, like `migrate apply --all`. It runs per project under
+  the project lock, labels each file (`brain_reviewed_by: policy:<tier>`,
+  `brain_reviewed_at`, `brain_prev_state`, `brain_review_sweep_run`), writes one
+  audit row per item and keeps a manifest under `migrations/review-sweep/`.
+  `--undo RUN_ID` restores every file byte for byte and retracts anything
+  promoted. Redacted secret values are never kept, so undo restores a redacted
+  file's state but not the secret. A sweep only sees `ROOT/projects/*`, so run it
+  once per vault root.
+- **Closeout.** `work run-once` applies the tiers to candidates received after
+  the project's policy start marker. An existing backlog is only changed by an
+  explicit sweep.
+- **Reflection is still the gap.** Candidates only exist when a local reflector
+  is configured (`LLM_BRAIN_REFLECTOR` or `--provider`). The core still ships
+  none.
+
 ## What's new in 0.10
 
 Version 0.10 closes silent failure modes and makes belief updates and

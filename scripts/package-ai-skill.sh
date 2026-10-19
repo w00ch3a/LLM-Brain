@@ -41,6 +41,7 @@ python3 -m py_compile "$repo_root/lib/okf.py"
 python3 -m py_compile "$repo_root/lib/replication.py"
 python3 -m py_compile "$repo_root/lib/memory_signals.py"
 python3 -m py_compile "$repo_root/lib/memory_lineage.py"
+python3 -m py_compile "$repo_root/lib/review_policy.py"
 python3 -m py_compile "$repo_root/lib/mcp_server.py"
 python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
 python3 -m py_compile "$repo_root/scripts/eval-outcome.py"
@@ -90,6 +91,7 @@ install -m 0755 "$repo_root/lib/okf.py" "$plugin/skills/llm-brain/scripts/okf.py
 install -m 0755 "$repo_root/lib/replication.py" "$plugin/skills/llm-brain/scripts/replication.py"
 install -m 0755 "$repo_root/lib/memory_signals.py" "$plugin/skills/llm-brain/scripts/memory_signals.py"
 install -m 0755 "$repo_root/lib/memory_lineage.py" "$plugin/skills/llm-brain/scripts/memory_lineage.py"
+install -m 0755 "$repo_root/lib/review_policy.py" "$plugin/skills/llm-brain/scripts/review_policy.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$plugin/skills/llm-brain/scripts/mcp_server.py"
 # Neural Expansion ships with synthetic data only; caches and OS junk never ship.
 copy_neural_expansion() {
@@ -113,6 +115,7 @@ install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"
 install -m 0755 "$repo_root/lib/memory_signals.py" "$standalone/lib/memory_signals.py"
 install -m 0755 "$repo_root/lib/memory_lineage.py" "$standalone/lib/memory_lineage.py"
+install -m 0755 "$repo_root/lib/review_policy.py" "$standalone/lib/review_policy.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$standalone/lib/mcp_server.py"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
 install -m 0644 "$repo_root/docs/guide.md" "$standalone/docs/guide.md"
@@ -193,7 +196,7 @@ def verify(path: Path, kind: str) -> None:
         )
         required = {f"{name}/VERSION", cli, f"{name}/requirements-okf.lock", f"{name}/CONTRIBUTING.md", f"{name}/SECURITY.md"}
         helper_dir = f"{name}/skills/llm-brain/scripts" if kind == "plugin" else f"{name}/lib"
-        required |= {f"{helper_dir}/okf.py", f"{helper_dir}/memory_signals.py", f"{helper_dir}/memory_lineage.py", f"{helper_dir}/mcp_server.py"}
+        required |= {f"{helper_dir}/okf.py", f"{helper_dir}/memory_signals.py", f"{helper_dir}/memory_lineage.py", f"{helper_dir}/review_policy.py", f"{helper_dir}/mcp_server.py"}
         required |= {f"{name}/neural-expansion/demo/neural-expansion-synthetic.html", f"{name}/neural-expansion/adapter/snapshot_to_html.py", f"{name}/neural-expansion/PRIVACY.md"}
         if kind == "plugin":
             required |= {

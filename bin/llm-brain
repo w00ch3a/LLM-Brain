@@ -85,6 +85,8 @@ Commands:
   review list|show|decide PROJECT_ID [ARGS]   decide ... approved --as-fact promotes a hypothetical/proposal you have agreed to;
                                               --overrule-belief lets one source replace a better-supported fact
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
+  review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID] [--by-project]
+                                              Tiered backlog clean-up; dry-run prints counts only
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
@@ -2730,7 +2732,7 @@ EOF
   fi
   if [ ! -f "$review_file" ]; then
     created=1
-    write_review_item "$dir" "$review_id" "source-ingest" "Review source $(basename "$source")" "proposed" "0.0" "medium" "internal" "source" "" "episode://$episode_id" "Extract durable candidates only when useful; raw custody is not semantic memory." >/dev/null
+    write_review_item "$dir" "$review_id" "source-ingest" "Review source $(basename "$source")" "$(custody_review_state)" "0.0" "medium" "internal" "source" "" "episode://$episode_id" "Extract durable candidates only when useful; raw custody is not semantic memory." >/dev/null
   fi
   if [ "$created" = 0 ]; then idempotent=true; else audit_v2 "$dir" "ingest-capture" "$episode_id" "" "captured" "$hash" "source_ref=sources/$(basename "$dest")"; fi
   release_lock
@@ -3115,6 +3117,8 @@ submit_candidate() {
     set_frontmatter_field "$file" brain_candidate_id "$id"
     set_frontmatter_field "$file" brain_review_state proposed
     set_frontmatter_field "$file" brain_schema_version "$SCHEMA_VERSION"
+    # 0.11 tiered policy: the cool-off clock starts when the brain receives it.
+    [ "$(review_policy_mode)" = strict ] || set_frontmatter_field "$file" brain_received_at "$(now_utc)"
     # 0.10 capture tag: fact|hypothetical|proposal, deterministic and
     # automatic; only facts are promoted (see promote_review_locked).
     case "$kind" in
@@ -3382,6 +3386,7 @@ work_run_once() {
     break
   done < <(find "$dir/requests" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
   release_lock
+  review_policy_closeout "$project_id" || true
   [ -n "$request_file" ] || { printf 'work=idle project_id=%s\n' "$project_id"; return 0; }
   case "$(frontmatter_field "$request_file" brain_operation)" in
     reflect) ;;
@@ -3701,11 +3706,12 @@ for source in sorted(batch_dir.glob("*.md")):
         created = True
     review_id = f"source_{source_hash[:12]}"
     review = root / "review" / f"{review_id}.md"
+    custody_state = "proposed" if os.environ.get("LLM_BRAIN_REVIEW_POLICY", "tiered") == "strict" else "captured"
     if not review.exists():
         review.write_text(
             "---\n" +
             f"type: ReviewItem\ntitle: {scalar(f'Review source {source.name}')}\nbrain_project_id: {project_id}\n"
-            f"brain_candidate_id: {review_id}\nbrain_review_kind: source-ingest\nbrain_review_state: proposed\n"
+            f"brain_candidate_id: {review_id}\nbrain_review_kind: source-ingest\nbrain_review_state: {custody_state}\n"
             f"brain_confidence: 0.0\nbrain_risk: medium\nbrain_sensitivity: internal\nbrain_loading_temperature: warm\n"
             f"brain_source_authority: source\nbrain_provider_id: \"\"\nbrain_provenance: {scalar(f'episode://{episode_id}')}\n"
             f"brain_schema_version: {schema}\ntimestamp: {scalar(now())}\n---\n# Review source {source.name}\n\n"
@@ -4753,7 +4759,8 @@ cmd_review() {
       release_lock
       printf 'review=decided review_id=%s state=%s\n' "$id" "$state"
       ;;
-    *) die 64 "review requires list, triage, show, or decide" ;;
+    sweep) cmd_review_sweep "$@" ;;
+    *) die 64 "review requires list, triage, show, decide, or sweep" ;;
   esac
 }
 
@@ -5478,7 +5485,13 @@ principal_visible() {
   [ -z "$principal" ] && [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] && return 0
   fm_get scope "$file" brain_principal
   fm_get audience "$file" brain_audience
-  [ -z "$scope" ] && [ -z "$audience" ] && return 0
+  if [ -z "$scope" ] && [ -z "$audience" ]; then
+    # 0.11 private tier: unscoped private records are owner-only.
+    local private_sensitivity
+    fm_get private_sensitivity "$file" brain_sensitivity sensitivity
+    [ "$private_sensitivity" != private ]
+    return
+  fi
   [ -n "$principal" ] || return 1
   visibility_matches "$scope" "$principal" && return 0
   visibility_matches "$audience" "$principal"
@@ -8466,6 +8479,163 @@ memory_lineage() {
   "$OKF_PYTHON" "$helper" "$@"
 }
 
+# 0.11 tiered review policy (lib/review_policy.py).  LLM_BRAIN_REVIEW_POLICY=strict
+# keeps the 0.10 behaviour byte-identically: custody markers stay proposed, no
+# closeout pass runs and `review sweep --apply` refuses.
+review_policy_mode() {
+  case "${LLM_BRAIN_REVIEW_POLICY:-tiered}" in
+    tiered|strict) printf '%s\n' "${LLM_BRAIN_REVIEW_POLICY:-tiered}" ;;
+    *) die 64 "LLM_BRAIN_REVIEW_POLICY must be tiered or strict" ;;
+  esac
+}
+
+custody_review_state() {
+  if [ "$(review_policy_mode)" = strict ]; then printf 'proposed\n'; else printf 'captured\n'; fi
+}
+
+review_policy() {
+  local helper
+  resolve_okf_runtime
+  if ! helper="$(sibling_helper review_policy.py)"; then
+    printf 'llm-brain: lib/review_policy.py is missing beside %s; run: llm-brain upgrade repair-standalone --source RELEASE_DIR\n' "$SCRIPT_SOURCE" >&2
+    return 69
+  fi
+  "$OKF_PYTHON" "$helper" "$@"
+}
+
+review_sweep_run_id() {
+  local prefix="$1"
+  printf '%s_%s_%s\n' "$prefix" "$(date -u '+%Y%m%dT%H%M%SZ')" "$(sha256_text "$$:$RANDOM:$(date +%s)" | cut -c1-6)"
+}
+
+# Promote the AUTO tiers listed by `review_policy.py apply` through the normal
+# promotion gate (custody, conflicts and belief-check outliers still hold).
+review_sweep_promote_locked() {
+  local project_id="$1" dir="$2" run_id="$3" list="$4" review_id tier canonical kind status promoted=0
+  while IFS=$'\t' read -r review_id tier; do
+    [ -n "$review_id" ] || continue
+    validate_id "$review_id" || continue
+    status=0
+    promote_review_locked "$project_id" "$review_id" "policy:$tier" "$(printf '%s' "$tier" | LC_ALL=C tr '[:upper:]' '[:lower:]')" >/dev/null 2>&1 || status=$?
+    [ "$status" = 0 ] || continue
+    kind="$(frontmatter_field "$dir/review/$review_id.md" brain_review_kind)"
+    case "$kind" in claim) canonical="okf/claims/$review_id.md" ;; procedure) canonical="okf/procedures/$review_id.md" ;; reference) canonical="okf/references/$review_id.md" ;; *) continue ;; esac
+    review_policy record-promotion --root "$ROOT" --project "$project_id" --run-id "$run_id" --review-id "$review_id" --tier "$tier" --canonical "$canonical" --actor "$ACTOR" || continue
+    promoted=$((promoted + 1))
+  done <"$list"
+  printf '%s\n' "$promoted"
+}
+
+# Closeout pass (work run-once).  Only items received after the project's
+# policy start marker are considered, so an old backlog is touched only by an
+# explicit `review sweep --apply --confirm TOKEN`.  Silent and best-effort.
+# Reflector hook: candidates only exist when LLM_BRAIN_REFLECTOR/--provider is
+# configured; no reflector ships with the core.
+review_policy_closeout() {
+  local project_id="$1" dir since_file since run_id list
+  [ "$(review_policy_mode)" = tiered ] || return 0
+  [ "${LLM_BRAIN_REVIEW_CLOSEOUT:-1}" != 0 ] || return 0
+  require_project "$project_id" dir
+  [ -d "$dir/review" ] || return 0
+  since_file="$dir/reflection/review-policy.since"
+  acquire_lock "project-$project_id"
+  if [ ! -f "$since_file" ]; then
+    ensure_dir "$dir/reflection"
+    printf '%s\n' "$(now_utc)" >"$since_file"
+    audit_v2 "$dir" "review-policy-start" "review-policy" "" "tiered" "" "closeout=since"
+  fi
+  since="$(sed -n '1p' "$since_file")"
+  run_id="$(review_sweep_run_id closeout)"
+  list="$(mktemp "${TMPDIR:-/tmp}/llm-brain-closeout.XXXXXX")"
+  if review_policy apply --root "$ROOT" --project "$project_id" --run-id "$run_id" --actor "$ACTOR" --since "$since" --promote-list "$list" >/dev/null 2>&1; then
+    review_sweep_promote_locked "$project_id" "$dir" "$run_id" "$list" >/dev/null 2>&1 || true
+  fi
+  rm -f "$list"
+  release_lock
+}
+
+review_sweep_projects() {
+  local scope="$1" project
+  if [ "$scope" = "--all" ]; then
+    find "$ROOT/projects" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | sort | while IFS= read -r project; do
+      [ ! -L "$project" ] || continue
+      [ -d "$project/review" ] || continue
+      basename "$project"
+    done
+  else
+    require_project "$scope" >/dev/null
+    printf '%s\n' "$scope"
+  fi
+}
+
+cmd_review_sweep() {
+  local scope="${1:-}" mode=dry-run token="" undo_run="" by_project=0 project dir line totals="" expected run_id list promoted total_promoted=0 out
+  [ -n "$scope" ] || die 64 "review sweep requires PROJECT_ID or --all"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) mode=dry-run; shift ;;
+      --apply) mode=apply; shift ;;
+      --confirm) token="${2:-}"; shift 2 ;;
+      --undo) mode=undo; undo_run="${2:-}"; shift 2 ;;
+      --by-project) by_project=1; shift ;;
+      *) die 64 "unknown review sweep option: $1" ;;
+    esac
+  done
+  [ -d "$ROOT/projects" ] || die 66 "missing projects directory under root"
+  out="$(mktemp "${TMPDIR:-/tmp}/llm-brain-sweep.XXXXXX")"
+  case "$mode" in
+    dry-run|apply)
+      while IFS= read -r project; do
+        line="$(review_policy dry-run --root "$ROOT" --project "$project" | awk -F '\t' '$1 == "counts" { $1 = ""; sub(/^ /, ""); print }')" || { rm -f "$out"; die 70 "review sweep dry-run failed"; }
+        printf '%s\t%s\n' "$project" "$line" >>"$out"
+      done < <(review_sweep_projects "$scope")
+      totals="$(awk -F '\t' '{ n = split($2, parts, " "); for (i = 1; i <= n; i++) { split(parts[i], kv, "="); if (!(kv[1] in sum)) order[++k] = kv[1]; sum[kv[1]] += kv[2] } projects++ } END { line = "projects=" projects + 0; open = 0; for (i = 1; i <= k; i++) { line = line " " order[i] "=" sum[order[i]]; open += sum[order[i]] } print line " open=" open }' "$out")"
+      expected="$(sha256_text "$(canonical_path "$ROOT")|$scope|$(review_policy_mode)|$(cut -f2- "$out" | tr '\n' ';')" | cut -c1-16)"
+      if [ "$mode" = dry-run ]; then
+        [ "$by_project" = 0 ] || awk -F '\t' '{ print "project=" $1 " " $2 }' "$out"
+        printf 'review_sweep=dry-run policy=%s %s confirm_token=%s\n' "$(review_policy_mode)" "$totals" "$expected"
+        rm -f "$out"
+        return 0
+      fi
+      [ "$(review_policy_mode)" = tiered ] || { rm -f "$out"; die 65 "review sweep --apply needs LLM_BRAIN_REVIEW_POLICY=tiered"; }
+      [ -n "$token" ] || { rm -f "$out"; die 64 "review sweep --apply requires --confirm TOKEN from a matching --dry-run (authorised change class, like migrate apply --all)"; }
+      [ "$token" = "$expected" ] || { rm -f "$out"; die 65 "review sweep confirm token does not match the current plan; re-run --dry-run"; }
+      run_id="$(review_sweep_run_id sweep)"
+      list="$(mktemp "${TMPDIR:-/tmp}/llm-brain-promote.XXXXXX")"
+      while IFS= read -r project; do
+        require_project "$project" dir
+        acquire_lock "project-$project"
+        review_policy apply --root "$ROOT" --project "$project" --run-id "$run_id" --actor "$ACTOR" --promote-list "$list" >/dev/null || { release_lock; rm -f "$out" "$list"; die 70 "review sweep apply failed in a project; undo with: review sweep $scope --undo $run_id"; }
+        promoted="$(review_sweep_promote_locked "$project" "$dir" "$run_id" "$list")"
+        total_promoted=$((total_promoted + promoted))
+        release_lock
+      done < <(cut -f1 "$out")
+      rm -f "$out" "$list"
+      printf 'review_sweep=applied run_id=%s policy=tiered %s promoted=%s\n' "$run_id" "$totals" "$total_promoted"
+      ;;
+    undo)
+      case "$undo_run" in sweep_*|closeout_*) ;; *) rm -f "$out"; die 64 "review sweep --undo requires RUN_ID" ;; esac
+      local restored=0 retracted=0 labels=0 changed=0 missing=0 touched=0
+      while IFS= read -r project; do
+        require_project "$project" dir
+        [ -f "$dir/migrations/review-sweep/$undo_run/manifest.tsv" ] || continue
+        acquire_lock "project-$project"
+        line="$(review_policy undo --root "$ROOT" --project "$project" --run-id "$undo_run" --actor "$ACTOR")" || { release_lock; rm -f "$out"; die 70 "review sweep undo failed"; }
+        release_lock
+        touched=$((touched + 1))
+        restored=$((restored + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "restored" { print $2 }')))
+        retracted=$((retracted + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "retracted" { print $2 }')))
+        labels=$((labels + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "unredacted-labels" { print $2 }')))
+        changed=$((changed + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "skipped-changed" { print $2 }')))
+        missing=$((missing + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "skipped-missing" { print $2 }')))
+      done < <(review_sweep_projects "$scope")
+      rm -f "$out"
+      printf 'review_sweep=undone run_id=%s projects=%s restored=%s retracted=%s redacted_kept=%s skipped_changed=%s skipped_missing=%s\n' "$undo_run" "$touched" "$restored" "$retracted" "$labels" "$changed" "$missing"
+      ;;
+  esac
+}
+
 lineage_common_args() {
   # usage: lineage_common_args DIR PRINCIPAL -> prints nothing; sets LINEAGE_ARGS
   LINEAGE_ARGS=(--project-dir "$1")
@@ -10288,7 +10458,7 @@ cmd_upgrade_repair_standalone() {
   [ -f "$source/bin/llm-brain" ] && [ "$(sha256_file "$source/bin/llm-brain")" = "$(sha256_file "$SCRIPT_SOURCE")" ] ||
     die 65 "release source CLI does not match the installed CLI"
   mkdir -p "$SCRIPT_DIR/lib"
-  for helper in okf.py replication.py memory_signals.py memory_lineage.py mcp_server.py; do
+  for helper in okf.py replication.py memory_signals.py memory_lineage.py review_policy.py mcp_server.py; do
     [ -f "$source/lib/$helper" ] || continue
     if [ ! -f "$SCRIPT_DIR/lib/$helper" ] || ! cmp -s "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; then
       install -m 0644 "$source/lib/$helper" "$SCRIPT_DIR/lib/$helper"; repaired="$repaired lib/$helper"
@@ -10324,7 +10494,7 @@ upgrade_update_host() {
       install -m 0755 "$(upgrade_target_cli "$source")" "$target_dir/llm-brain"
       mkdir -p "$target_dir/lib"
       install -m 0644 "$source/lib/okf.py" "$target_dir/lib/okf.py"
-      for helper in replication.py memory_signals.py memory_lineage.py mcp_server.py; do
+      for helper in replication.py memory_signals.py memory_lineage.py review_policy.py mcp_server.py; do
         [ ! -f "$source/lib/$helper" ] || install -m 0644 "$source/lib/$helper" "$target_dir/lib/$helper"
       done
       if [ -d "$source/neural-expansion" ]; then

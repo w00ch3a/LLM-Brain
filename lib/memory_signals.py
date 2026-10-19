@@ -876,7 +876,9 @@ def _principal_visible(record: _Record, principal: bytes, strict: bool) -> bool:
     scope = record.field(b"brain_principal")
     audience = record.field(b"brain_audience")
     if not scope and not audience:
-        return True
+        # 0.11 private tier: an unscoped private record belongs to the brain's
+        # owner, so it is hidden from every named principal.
+        return record.field(b"brain_sensitivity", b"sensitivity") != b"private"
     if not principal:
         return False
     for values in (scope, audience):

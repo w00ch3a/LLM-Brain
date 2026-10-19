@@ -4,6 +4,8 @@ This file tracks changes after v0.10.0. It is not a release, installation,
 deployment or live-vault migration record. `VERSION` is the package-version
 authority.
 
+- Tiered review policy and `review sweep` (draft: [v0.11.0](v0.11.0.md)).
+
 
 
 See the [v0.10.0 release notes](v0.10.0.md)
