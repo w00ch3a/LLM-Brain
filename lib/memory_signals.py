@@ -870,9 +870,21 @@ def _reference_lines(value: bytes) -> list[bytes]:
     return [part.strip(_AWK_SPACE) for part in value.split(b",") if part.strip(_AWK_SPACE)]
 
 
+# Same detector as bin/llm-brain secret_scan_file (grep -Ei).
+_SECRET_RE = re.compile(
+    rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}'
+    rb'|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\r\f\v]*[:=][ \t\r\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
+    re.I,
+)
+
+
 def _principal_visible(record: _Record, principal: bytes, strict: bool) -> bool:
     if not principal and not strict:
         return True
+    if _SECRET_RE.search(record.raw):
+        # 0.11: secret-bearing records are owner-only whatever their scope.
+        owner = os.environb.get(b"LLM_BRAIN_OWNER_PRINCIPAL", b"")
+        return bool(principal) and bool(owner) and principal == owner
     scope = record.field(b"brain_principal")
     audience = record.field(b"brain_audience")
     if not scope and not audience:

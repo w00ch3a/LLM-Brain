@@ -61,7 +61,10 @@ safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the 0.10 behaviour exactly.
   matches no rule after 90 days are `parked`. Security and operations topics,
   supersessions, conflicts, belief-check outliers, external-origin text and
   skills or adapters stay held for a person. Secret-like review files are
-  redacted in place: each matched span becomes `[redacted sha256:…]`.
+  never redacted, edited or copied: they stay byte-for-byte as written, open
+  for the owner. Any secret-bearing record is owner-only: hidden from every
+  named principal except `LLM_BRAIN_OWNER_PRINCIPAL` and left out of
+  `export knowledge-catalog` and `export bundle`.
 - **Switches.** `LLM_BRAIN_REVIEW_COOLOFF_HOURS` (24),
   `LLM_BRAIN_REVIEW_MIN_CONFIDENCE` (0.80), `LLM_BRAIN_REVIEW_PARK_DAYS` (90),
   `LLM_BRAIN_REVIEW_PERSONAL=private|hold` (private),
@@ -74,8 +77,10 @@ safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the 0.10 behaviour exactly.
   `brain_reviewed_at`, `brain_prev_state`, `brain_review_sweep_run`), writes one
   audit row per item and keeps a manifest under `migrations/review-sweep/`.
   `--undo RUN_ID` restores every file byte for byte and retracts anything
-  promoted. Redacted secret values are never kept, so undo restores a redacted
-  file's state but not the secret. A sweep only sees `ROOT/projects/*`, so run it
+  promoted, with no exceptions. `--scan-sources` is a read-only secret census:
+  counts per area (sources, episodes, review, okf, ...), file kind and detector,
+  and whether the custody behind a secret-like review item holds one too. It
+  prints no names, paths or text. A sweep only sees `ROOT/projects/*`, so run it
   once per vault root.
 - **Closeout.** `work run-once` applies the tiers to candidates received after
   the project's policy start marker. An existing backlog is only changed by an

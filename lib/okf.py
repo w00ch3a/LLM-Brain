@@ -36,6 +36,14 @@ RESERVED = {"index.md", "log.md"}
 CODE_ANCHOR_RE = re.compile(r"^[^@\s][^@]*@[0-9a-fA-F]{7,40}$")
 
 
+# Same detector as bin/llm-brain secret_scan_file (grep -Ei, line based).
+SECRET_BEARING = re.compile(
+    rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-(proj-)?[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}'
+    rb'|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\r\f\v]*[:=][ \t\r\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
+    re.I,
+)
+
+
 class UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader variant that rejects duplicate mapping keys."""
 
@@ -995,6 +1003,15 @@ class LifecycleResolver:
     def relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.root).as_posix()
 
+    def _secret_bearing(self, path: Path) -> bool:
+        cache = self.__dict__.setdefault("_secret_cache", {})
+        if path not in cache:
+            try:
+                cache[path] = bool(SECRET_BEARING.search(path.read_bytes()))
+            except OSError:
+                cache[path] = True
+        return cache[path]
+
     def _record_sensitivity(self, path: Path) -> str:
         metadata = self.load(path)
         value = metadata.get("brain_sensitivity", metadata.get("sensitivity", "internal"))
@@ -1018,6 +1035,11 @@ class LifecycleResolver:
         if scoped is None or audience is None:
             return False
         identities = scoped + audience
+        if self._secret_bearing(path):
+            # 0.11: secret-bearing records stay as written but are owner-only:
+            # treated as scoped to LLM_BRAIN_OWNER_PRINCIPAL (or to nobody).
+            owner = os.environ.get("LLM_BRAIN_OWNER_PRINCIPAL", "")
+            identities = [owner] if owner else ["\x00owner-only"]
         if not identities:
             return True
         if not self.principal:

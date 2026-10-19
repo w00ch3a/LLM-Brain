@@ -78,9 +78,11 @@ brain_source_authority: repository
 ---'
 # Duplicate keys in the header (a poisoning attempt) are held, not trusted.
 item dupkey claim 'Dupkey' 0.50 "$old" 'brain_confidence: 0.99' 'Duplicate header keys.'
-# Secret-like file: redacted, never copied anywhere.
+# Secret-like file: left exactly as written, never copied, held open for the owner.
 secret_value="sk-proj-$(printf 'fixture%.0s' 1 2 3)ABCDEFGH"
 item secret claim 'Leaky' 0.90 "$old" '' "api config was sk value $secret_value in a note"
+# A file redacted by an earlier pre-release sweep stays held.
+item legacy_redacted claim 'Old redaction' 0.90 "$old" 'brain_review_reason: redacted-secret' 'key was [redacted sha256:0123456789ab] here'
 # Existing redaction record: counted, untouched.
 item redaction redaction 'Redaction review for x' 0.0 "$old" '' 'Source matched the secret scanner and was not copied.'
 # Poisoning: provenance points at custody whose bytes were tampered.
@@ -120,6 +122,7 @@ expect conflicted HOLD
 expect inject WAIT
 expect dupkey HOLD
 expect secret FLAG-secret
+expect legacy_redacted FLAG-secret
 expect redaction FLAG-redaction
 expect poisoned PARK
 LLM_BRAIN_REVIEW_PERSONAL=hold helper classify --root "$vault" --project "$project_id" | awk -F '\t' '$1 == "personal" && $2 == "HOLD" { found=1 } END { exit !found }' || fail 'personal hold switch'
@@ -158,9 +161,11 @@ grep -Fq 'brain_reviewed_by: policy:CLOSE-legacy' "$review/legacy_stub.md" && gr
 [ ! -f "$project_dir/okf/claims/inject.md" ] || fail 'injected item promoted'
 grep -Fq 'brain_sensitivity: private' "$project_dir/okf/claims/personal.md" || fail 'personal fact not stored private'
 grep -Fq 'brain_reviewed_by: policy:AUTO-cooloff' "$review/cool_ok.md" || fail 'promotion label missing'
-# Secrets: gone from the review file, never in the manifest, backups or audit.
-grep -Fq "$secret_value" "$review/secret.md" && fail 'secret not redacted'
-grep -Fq '[redacted sha256:' "$review/secret.md" || fail 'redaction marker missing'
+# Secrets: the file is untouched (byte for byte), open, and never copied into
+# the manifest, backups or audit.
+cmp -s "$fixture/pre/secret.md" "$review/secret.md" || fail 'secret-like file was changed'
+cmp -s "$fixture/pre/legacy_redacted.md" "$review/legacy_redacted.md" || fail 'held redacted file was changed'
+[ "$(state secret)" = proposed ] || fail 'secret-like file not left open'
 grep -RFq "$secret_value" "$project_dir/migrations" "$project_dir/audit.v2.tsv" && fail 'secret copied by the sweep'
 printf '%s\n' "$applied" | grep -Fq "$secret_value" && fail 'secret printed'
 "$cli" --root "$vault" lint >"$fixture/lint.out" 2>&1 || true
@@ -171,20 +176,46 @@ grep -c "lint:error" "$fixture/lint.out" | grep -qx 1 || { cat "$fixture/lint.ou
 [ ! -e "$project_dir/exports/knowledge-catalog/documents/claims/personal.md" ] || fail 'private record exported to the catalog'
 "$cli" --root "$vault" export bundle "$project_id" >/dev/null
 tar -tzf "$project_dir/exports/${project_id}-okf.tar.gz" | grep -Fq 'okf/claims/personal.md' && fail 'private record exported in the bundle'
+# Secret-bearing canonical records are owner-only: no other principal, no
+# catalog or bundle export.  The owner (no principal, or LLM_BRAIN_OWNER_PRINCIPAL) still finds it.
+printf '%s\n' '---' 'type: Claim' 'title: Vault login' 'status: stable' "brain_project_id: $project_id" 'brain_claim_id: vault-login' 'brain_review_state: approved' 'brain_sensitivity: internal' 'brain_source_authority: repository' 'brain_schema_version: 3' '---' '# Vault login' '' "The zebra vault login uses $secret_value today." >"$project_dir/okf/claims/vault-login.md"
+"$cli" --root "$vault" search "$project_id" "zebra vault login" --principal someone-else 2>/dev/null | grep -Fq 'okf/claims/vault-login.md' && fail 'secret-bearing record visible to another principal'
+"$cli" --root "$vault" search "$project_id" "zebra vault login" 2>/dev/null | grep -Fq 'okf/claims/vault-login.md' || fail 'owner cannot find the secret-bearing record'
+LLM_BRAIN_OWNER_PRINCIPAL=owner-fixture "$cli" --root "$vault" search "$project_id" "zebra vault login" --principal owner-fixture 2>/dev/null | grep -Fq 'okf/claims/vault-login.md' || fail 'named owner cannot find the secret-bearing record'
+"$cli" --root "$vault" brief "$project_id" --principal someone-else 2>/dev/null | grep -Fq "$secret_value" && fail 'secret-bearing record in another principal brief'
+"$cli" --root "$vault" pack build "$project_id" --task "zebra vault login" --principal someone-else >/dev/null 2>&1 || true
+grep -RFq "$secret_value" "$project_dir/context-packs" 2>/dev/null && fail 'secret-bearing record packed for another principal'
+"$cli" --root "$vault" export knowledge-catalog "$project_id" >/dev/null
+[ ! -e "$project_dir/exports/knowledge-catalog/documents/claims/vault-login.md" ] || fail 'secret-bearing record exported to the catalog'
+"$cli" --root "$vault" export bundle "$project_id" >/dev/null
+tar -tzf "$project_dir/exports/${project_id}-okf.tar.gz" | grep -Fq 'okf/claims/vault-login.md' && fail 'secret-bearing record exported in the bundle'
+# Counts-only source scan: finds the secrets, prints no values, names or paths.
+scan="$(helper scan-sources --root "$vault")"
+printf '%s\n' "$scan" | tr '\t' '\n' | grep -qx 'area:review:with_secret=1' || fail "scan missed the review secret: $scan"
+printf '%s\n' "$scan" | tr '\t' '\n' | grep -qx 'area:okf:with_secret=1' || fail "scan missed the canonical secret: $scan"
+printf '%s\n' "$scan" | tr '\t' '\n' | grep -qx 'detector:openai-key=2' || fail "scan detector counts: $scan"
+printf '%s\n' "$scan" | grep -Eq "$secret_value|secret\.md|vault-login|$fixture" && fail 'scan printed a value, name or path'
+"$cli" --root "$vault" review sweep --all --scan-sources | grep -Fq 'review_sweep=scan-sources' || fail 'scan-sources CLI'
+rm -f "$project_dir/okf/claims/vault-login.md"; rm -rf "$project_dir/exports"
+# A second sweep after apply keeps the secret-like and held items open and unchanged.
+dry2="$("$cli" --root "$vault" review sweep "$project_id" --dry-run)"
+classified2="$(helper classify --root "$vault" --project "$project_id")"
+printf '%s\n' "$classified2" | awk -F '\t' '$1 == "secret" && $2 == "FLAG-secret" { a=1 } $1 == "legacy_redacted" && $2 == "FLAG-secret" { b=1 } END { exit !(a && b) }' || fail 'second sweep re-classified held secret items'
+token2="$(printf '%s\n' "$dry2" | sed -n 's/.*confirm_token=\([0-9a-f]*\).*/\1/p')"
+"$cli" --root "$vault" review sweep "$project_id" --apply --confirm "$token2" >/dev/null
+cmp -s "$fixture/pre/secret.md" "$review/secret.md" && cmp -s "$fixture/pre/legacy_redacted.md" "$review/legacy_redacted.md" || fail 'second sweep changed a held secret item'
+[ "$(state secret)" = proposed ] || fail 'second sweep closed the secret-like item'
 private_hits="$("$cli" --root "$vault" search "$project_id" "medication breakfast" --principal someone-else 2>/dev/null || true)"
 printf '%s\n' "$private_hits" | grep -Fq 'okf/claims/personal.md' && fail 'private record visible to another principal'
 
-# 5. Undo restores every review file byte for byte (redaction is kept) and
+# 5. Undo (of the first run, after the second sweep) restores every review file byte for byte, no exceptions, and
 # retracts the promoted canonical records.
 undone="$("$cli" --root "$vault" review sweep "$project_id" --undo "$run_id")"
 printf '%s\n' "$undone" | grep -Fq 'retracted=5' || fail "undo retractions: $undone"
 for f in "$fixture/pre"/*.md; do
   id="$(basename "$f" .md)"
-  [ "$id" = secret ] && continue
   cmp -s "$f" "$review/$id.md" || fail "undo did not restore $id"
 done
-[ "$(state secret)" = proposed ] || fail 'undo did not restore the redacted file state'
-grep -Fq "$secret_value" "$review/secret.md" && fail 'undo restored a secret value'
 for id in cool_ok edge_080 personal dup_a ops_word; do [ -f "$project_dir/okf/retractions/$id.md" ] || fail "undo did not retract $id"; done
 if "$cli" --root "$vault" review sweep "$project_id" --undo "$run_id" >/dev/null 2>&1; then fail 'second undo accepted'; fi
 

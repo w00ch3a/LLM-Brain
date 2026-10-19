@@ -3,12 +3,13 @@
 
 Reads and edits only ``PROJECT/review/*.md`` (maxdepth 1) of one project at a
 time; the caller (bin/llm-brain) holds the project lock.  Every change is
-labelled, written to a per-run manifest with the prior bytes (except for
-secret-matched files, whose secret spans are never copied) and recorded as a
+labelled, written to a per-run manifest with the prior bytes and recorded as a
 hash-chained ``audit.v2.tsv`` row identical in format to ``audit_v2``.
 
 Output is counts and opaque ids only: no titles, bodies or secret values.
 Review text is untrusted data; nothing in a body can change its tier.
+Secret-like files are never edited, copied or redacted: they are counted,
+left byte-for-byte as written and stay open for the owner.
 """
 from __future__ import annotations
 
@@ -27,6 +28,20 @@ SECRET = re.compile(
     r'|xox[baprs]-[A-Za-z0-9-]{10,}|(api[_-]?key|secret|password|token)[ \t\f\v]*[:=][ \t\f\v]*"?[A-Za-z0-9_./+=-]{16,}',
     re.I,
 )
+# Named detectors for counts only; their union is exactly SECRET (and the
+# bash secret_scan_file pattern).
+DETECTORS = (
+    ("private-key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
+    ("openai-key", re.compile(r'sk-(proj-)?[A-Za-z0-9_-]{16,}')),
+    ("aws-key", re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("github-token", re.compile(r'gh[pousr]_[A-Za-z0-9_]{20,}')),
+    ("slack-token", re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,}')),
+    ("assignment", re.compile(r'(api[_-]?key|secret|password|token)[ \t\f\v]*[:=][ \t\f\v]*"?[A-Za-z0-9_./+=-]{16,}', re.I)),
+)
+REDACTED = re.compile(r'\[redacted sha256:[0-9a-f]{12}\]')
+# Items redacted by the 0.11 pre-release sweep (no longer done) stay held for
+# a person through every later sweep until someone reviews them.
+HELD_REASONS = {"redacted-secret", "review-sweep-undo-redaction-kept"}
 # Same scaffold lines that `migrate apply` supersedes (is_scaffold_content).
 SCAFFOLD = re.compile(
     r'^Candidate statement: source .* was ingested into episodic memory|^Candidate statement: source context for '
@@ -50,7 +65,6 @@ ACTIONS = {
     "CLOSE-legacy": ("superseded", "legacy-scaffold"),
     "CLOSE-duplicate": ("superseded", "duplicate"),
     "PARK": ("parked", None),
-    "FLAG-secret": ("needs-validation", "redacted-secret"),
 }
 
 
@@ -247,6 +261,8 @@ def classify(item: Item, project: Project, settings: Settings, now: _dt.datetime
     kind = item.kind
     if kind == "redaction":
         return "FLAG-redaction", "redaction"
+    if meta.get("brain_review_reason", "") in HELD_REASONS or REDACTED.search(item.text):
+        return "FLAG-secret", "redacted-held"
     if kind == "source-ingest":
         return "CLOSE-custody", "custody-marker"
     if kind in ("claim", "procedure") and SCAFFOLD.search(item.body):
@@ -362,17 +378,6 @@ def audit_row(project_dir: Path, actor: str, action: str, object_id: str, old: s
         stream.write("\t".join((timestamp, actor, action, project_id, object_id, old, new, content_hash, details, prev, event)) + "\n")
 
 
-def redact(text: str) -> Tuple[str, int]:
-    count = 0
-
-    def repl(match: "re.Match[str]") -> str:
-        nonlocal count
-        count += 1
-        return f"[redacted sha256:{sha256_bytes(match.group(0).encode())[:12]}]"
-
-    return SECRET.sub(repl, text), count
-
-
 def atomic_write(path: Path, data: bytes) -> None:
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     with open(tmp, "wb") as stream:
@@ -393,7 +398,9 @@ def apply(project: Project, settings: Settings, run_id: str, actor: str, since: 
     stamp = now_utc()
     for item, tier, reason in planned:
         counts[tier] += 1
-        if tier in ("HOLD", "WAIT", "FLAG-redaction"):
+        # Secret-like files are never edited, copied or redacted: they stay
+        # byte-for-byte as written, open for the owner (see is_secret_bearing).
+        if tier in ("HOLD", "WAIT", "FLAG-redaction", "FLAG-secret"):
             continue
         if not directory.exists():
             (directory / "prior").mkdir(parents=True, exist_ok=True)
@@ -405,10 +412,6 @@ def apply(project: Project, settings: Settings, run_id: str, actor: str, since: 
             continue
         new_state, fixed_reason = ACTIONS[tier]
         text = item.text
-        backup = True
-        if tier == "FLAG-secret":
-            text, _ = redact(text)
-            backup = False  # never keep a second copy of a secret
         fields = [
             ("brain_review_state", new_state),
             ("brain_reviewed_by", f"policy:{tier}"),
@@ -420,11 +423,10 @@ def apply(project: Project, settings: Settings, run_id: str, actor: str, since: 
         if tier == "CLOSE-duplicate":
             fields.append(("brain_duplicate_of", f"review://{first_duplicate(planned, item)}"))
         new = set_fields(text, fields).encode("utf-8")
-        if backup:
-            (directory / "prior" / f"{item.id}.md").write_bytes(item.raw)
+        (directory / "prior" / f"{item.id}.md").write_bytes(item.raw)
         atomic_write(item.path, new)
         new_hash = sha256_bytes(new)
-        manifest_rows.append("\t".join(("edit" if backup else "redact", item.id, tier, fixed_reason or reason, item.state, new_state, prior_hash, new_hash)))
+        manifest_rows.append("\t".join(("edit", item.id, tier, fixed_reason or reason, item.state, new_state, prior_hash, new_hash)))
         audit_row(project.dir, actor, "review-sweep", item.id, item.state, new_state, new_hash, f"tier={tier} run={run_id}")
     if manifest_rows:
         with (directory / "manifest.tsv").open("a", encoding="utf-8") as stream:
@@ -473,7 +475,7 @@ def record_promotion(project: Project, run_id: str, review_id: str, tier: str, c
 
 
 def undo(project: Project, run_id: str, actor: str) -> Dict[str, int]:
-    counts = {"restored": 0, "unredacted-labels": 0, "retracted": 0, "skipped-changed": 0, "skipped-missing": 0}
+    counts = {"restored": 0, "retracted": 0, "skipped-changed": 0, "skipped-missing": 0}
     directory = run_dir(project.dir, run_id)
     manifest = directory / "manifest.tsv"
     if not manifest.is_file():
@@ -512,13 +514,6 @@ def undo(project: Project, run_id: str, actor: str) -> Dict[str, int]:
                     ).encode("utf-8"))
                     counts["retracted"] += 1
             audit_row(project.dir, actor, "review-sweep-undo", review_id, row[5], row[4], sha256_bytes(prior), f"run={run_id}")
-        elif action == "redact":
-            text = current.decode("utf-8")
-            meta, _ = parse_header(split_frontmatter(text)[0] or [])
-            text = set_fields(text, [("brain_review_state", row[4]), ("brain_review_reason", "review-sweep-undo-redaction-kept")])
-            atomic_write(review, text.encode("utf-8"))
-            counts["unredacted-labels"] += 1
-            audit_row(project.dir, actor, "review-sweep-undo", review_id, row[5], row[4], sha256_bytes(text.encode()), f"run={run_id} redaction=kept")
     done_marker.write_text(f"undone_at={now_utc()}\n", encoding="utf-8")
     return counts
 
@@ -535,11 +530,137 @@ def project_dir_checked(root: Path, project: str) -> Path:
     return path
 
 
+SCAN_MAX_BYTES = 32 * 1024 * 1024
+EXT_KINDS = {".md": "md", ".txt": "txt", ".json": "json", ".jsonl": "json", ".yaml": "yaml", ".yml": "yaml",
+             ".tsv": "tsv-csv", ".csv": "tsv-csv", ".sha256": "checksum"}
+
+
+def _scan_file(path: Path, counts: Dict[str, int], area: str, detectors: Dict[str, int]) -> Optional[bool]:
+    try:
+        size = path.stat().st_size
+        if size > SCAN_MAX_BYTES:
+            counts["skipped-large"] = counts.get("skipped-large", 0) + 1
+            return None
+        data = path.read_bytes()
+    except OSError:
+        counts["skipped-unreadable"] = counts.get("skipped-unreadable", 0) + 1
+        return None
+    kind = EXT_KINDS.get(path.suffix.lower(), "other")
+    if b"\x00" in data[:8192]:
+        kind = "binary"
+    text = data.decode("utf-8", errors="replace")
+    hits = 0
+    for match in SECRET.finditer(text):
+        hits += 1
+        for name, pattern in DETECTORS:
+            if pattern.fullmatch(match.group(0)):
+                detectors[name] = detectors.get(name, 0) + 1
+                break
+    for key in (f"area:{area}:files", f"kind:{kind}:files"):
+        counts[key] = counts.get(key, 0) + 1
+    if hits:
+        for key in (f"area:{area}:with_secret", f"kind:{kind}:with_secret"):
+            counts[key] = counts.get(key, 0) + 1
+        counts["matches"] = counts.get("matches", 0) + hits
+    return hits > 0
+
+
+def scan_sources(root: Path, project: str) -> Dict[str, int]:
+    """Counts-only secret census of a vault root (or one project): which areas
+    and file kinds hold secret-like text, and whether the custody behind a
+    secret-like review item also holds it.  Never returns names or text."""
+    root = root.resolve()
+    counts: Dict[str, int] = {}
+    detectors: Dict[str, int] = {}
+    projects_dir = root / "projects"
+    if project:
+        project_dirs = [project_dir_checked(root, project)]
+    else:
+        project_dirs = sorted(path for path in projects_dir.iterdir() if path.is_dir() and not path.is_symlink() and not path.name.startswith(".")) if projects_dir.is_dir() else []
+    nested = set()
+    if not project:
+        for dirpath, dirnames, filenames in os.walk(root):
+            here = Path(dirpath)
+            if here == root:
+                dirnames[:] = [d for d in dirnames if d not in ("projects", ".locks")]
+            elif (here / "writer.format").is_file() or (here / "registry" / "roots.tsv").is_file() or (here / "projects").is_dir():
+                nested.add(here)
+                dirnames[:] = []
+                continue
+            for name in filenames:
+                path = here / name
+                if path.is_symlink():
+                    counts["skipped-symlink"] = counts.get("skipped-symlink", 0) + 1
+                    continue
+                if here == root and name == "writer.format":
+                    continue
+                _scan_file(path, counts, "root-other", detectors)
+            dirnames[:] = [d for d in dirnames if not (here / d).is_symlink()]
+    counts["nested-roots-skipped"] = len(nested)
+    for project_dir in project_dirs:
+        counts["projects"] = counts.get("projects", 0) + 1
+        secret_files = set()
+        for dirpath, dirnames, filenames in os.walk(project_dir):
+            here = Path(dirpath)
+            dirnames[:] = [d for d in dirnames if not (here / d).is_symlink() and d != ".locks"]
+            rel = here.relative_to(project_dir)
+            area = rel.parts[0] if rel.parts else "project-top"
+            for name in filenames:
+                path = here / name
+                if path.is_symlink():
+                    counts["skipped-symlink"] = counts.get("skipped-symlink", 0) + 1
+                    continue
+                if _scan_file(path, counts, area, detectors):
+                    secret_files.add(path.resolve())
+        # Custody behind secret-like (or previously redacted) review items.
+        proj = Project(project_dir)
+        paths: Dict[str, Path] = {}
+        base = project_dir / "episodes"
+        if base.is_dir():
+            for path in base.rglob("*.md"):
+                if path.is_symlink():
+                    continue
+                try:
+                    header, _ = split_frontmatter(path.read_text(encoding="utf-8", errors="replace")[:4096])
+                except OSError:
+                    continue
+                meta, _ = parse_header(header or [])
+                if meta.get("brain_episode_id"):
+                    paths.setdefault(meta["brain_episode_id"], path)
+        for item in load_items(proj):
+            held = SECRET.search(item.text) or item.meta.get("brain_review_reason", "") in HELD_REASONS or REDACTED.search(item.text)
+            if not held:
+                continue
+            counts["custody:items"] = counts.get("custody:items", 0) + 1
+            provenance = item.meta.get("brain_provenance", "")
+            if not provenance.startswith("episode://"):
+                key = "custody:other-provenance" if provenance else "custody:no-provenance"
+                counts[key] = counts.get(key, 0) + 1
+                continue
+            episode = paths.get(provenance[len("episode://"):])
+            if episode is None:
+                counts["custody:episode-missing"] = counts.get("custody:episode-missing", 0) + 1
+                continue
+            if episode.resolve() in secret_files:
+                counts["custody:episode-with-secret"] = counts.get("custody:episode-with-secret", 0) + 1
+            ref = proj.episodes().get(provenance[len("episode://"):], {}).get("brain_source_ref", "")
+            source = project_dir / ref
+            if not ref.startswith("sources/") or ".." in ref or not source.is_file():
+                counts["custody:source-missing"] = counts.get("custody:source-missing", 0) + 1
+            elif source.resolve() in secret_files:
+                counts["custody:source-with-secret"] = counts.get("custody:source-with-secret", 0) + 1
+            else:
+                counts["custody:source-clean"] = counts.get("custody:source-clean", 0) + 1
+    for name, value in detectors.items():
+        counts[f"detector:{name}"] = value
+    return counts
+
+
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(prog="review_policy.py")
-    parser.add_argument("command", choices=("dry-run", "apply", "record-promotion", "undo", "classify"))
+    parser.add_argument("command", choices=("dry-run", "apply", "record-promotion", "undo", "classify", "scan-sources"))
     parser.add_argument("--root", required=True)
-    parser.add_argument("--project", required=True)
+    parser.add_argument("--project", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--actor", default="policy:review-sweep")
     parser.add_argument("--since", default="")
@@ -549,6 +670,12 @@ def main(argv: List[str]) -> int:
     parser.add_argument("--canonical", default="")
     args = parser.parse_args(argv)
     settings = Settings(dict(os.environ))
+    if args.command == "scan-sources":
+        counts = scan_sources(Path(args.root), args.project)
+        print("scan\t" + "\t".join(f"{key}={value}" for key, value in sorted(counts.items())))
+        return 0
+    if not args.project:
+        raise SystemExit("--project is required")
     project = Project(project_dir_checked(Path(args.root), args.project))
     if args.command in ("apply", "record-promotion", "undo") and not RUN_ID.match(args.run_id):
         raise SystemExit("invalid run id")

@@ -85,7 +85,7 @@ Commands:
   review list|show|decide PROJECT_ID [ARGS]   decide ... approved --as-fact promotes a hypothetical/proposal you have agreed to;
                                               --overrule-belief lets one source replace a better-supported fact
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
-  review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID] [--by-project]
+  review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
                                               Tiered backlog clean-up; dry-run prints counts only
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--preview [--principal ID]|--confirm TOKEN]
@@ -5483,6 +5483,17 @@ principal_visible() {
   # Without a principal every record is visible unless the operator opts into
   # strict per-person scoping (0.10 #9): then only unscoped records are.
   [ -z "$principal" ] && [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] && return 0
+  # 0.11: secret-bearing records are kept as written but are owner-only,
+  # whatever their scope: hidden from every named principal except
+  # LLM_BRAIN_OWNER_PRINCIPAL (when set).
+  if [ -f "$file" ]; then
+    local secret_rc=0
+    secret_scan_file "$file" >/dev/null 2>&1 || secret_rc=$?
+    if [ "$secret_rc" = 2 ]; then
+      [ -n "$principal" ] && [ -n "${LLM_BRAIN_OWNER_PRINCIPAL:-}" ] && [ "$principal" = "$LLM_BRAIN_OWNER_PRINCIPAL" ]
+      return
+    fi
+  fi
   fm_get scope "$file" brain_principal
   fm_get audience "$file" brain_audience
   if [ -z "$scope" ] && [ -z "$audience" ]; then
@@ -7627,6 +7638,8 @@ cmd_export() {
         local rel
         # 0.11 private tier: owner-only records never leave the brain.
         [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || continue
+        # 0.11: secret-bearing records stay in the brain, owner-only.
+        secret_scan_file "$file" >/dev/null 2>&1 || continue
         rel="${file#"$dir"/okf/}"
         mkdir -p "$stage/documents/$(dirname "$rel")"
         cp "$file" "$stage/documents/$rel"
@@ -7655,6 +7668,7 @@ cmd_export() {
       # 0.11 private tier: owner-only records never leave the brain.
       while IFS= read -r file; do
         [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || rm -f "$file"
+        secret_scan_file "$file" >/dev/null 2>&1 || rm -f "$file"
       done < <(find "$bundle_dir/okf" -type f -name '*.md')
       {
         printf 'schema_version\t%s\n' "$SCHEMA_VERSION"
@@ -8585,10 +8599,20 @@ cmd_review_sweep() {
       --confirm) token="${2:-}"; shift 2 ;;
       --undo) mode=undo; undo_run="${2:-}"; shift 2 ;;
       --by-project) by_project=1; shift ;;
+      --scan-sources) mode=scan; shift ;;
       *) die 64 "unknown review sweep option: $1" ;;
     esac
   done
   [ -d "$ROOT/projects" ] || die 66 "missing projects directory under root"
+  if [ "$mode" = scan ]; then
+    # Counts-only, read-only secret census (areas, file kinds, detectors and
+    # the custody behind secret-like review items).  No names, paths or text.
+    local scan_project=""
+    [ "$scope" = "--all" ] || { require_project "$scope" >/dev/null; scan_project="$scope"; }
+    line="$(review_policy scan-sources --root "$ROOT" --project "$scan_project")" || die 70 "review sweep scan failed"
+    printf 'review_sweep=scan-sources %s\n' "$(printf '%s\n' "$line" | cut -f2- | tr '\t' ' ')"
+    return 0
+  fi
   out="$(mktemp "${TMPDIR:-/tmp}/llm-brain-sweep.XXXXXX")"
   case "$mode" in
     dry-run|apply)
@@ -8622,7 +8646,7 @@ cmd_review_sweep() {
       ;;
     undo)
       case "$undo_run" in sweep_*|closeout_*) ;; *) rm -f "$out"; die 64 "review sweep --undo requires RUN_ID" ;; esac
-      local restored=0 retracted=0 labels=0 changed=0 missing=0 touched=0
+      local restored=0 retracted=0 changed=0 missing=0 touched=0
       while IFS= read -r project; do
         require_project "$project" dir
         [ -f "$dir/migrations/review-sweep/$undo_run/manifest.tsv" ] || continue
@@ -8632,12 +8656,11 @@ cmd_review_sweep() {
         touched=$((touched + 1))
         restored=$((restored + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "restored" { print $2 }')))
         retracted=$((retracted + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "retracted" { print $2 }')))
-        labels=$((labels + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "unredacted-labels" { print $2 }')))
         changed=$((changed + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "skipped-changed" { print $2 }')))
         missing=$((missing + $(printf '%s\n' "$line" | tr '\t' '\n' | awk -F= '$1 == "skipped-missing" { print $2 }')))
       done < <(review_sweep_projects "$scope")
       rm -f "$out"
-      printf 'review_sweep=undone run_id=%s projects=%s restored=%s retracted=%s redacted_kept=%s skipped_changed=%s skipped_missing=%s\n' "$undo_run" "$touched" "$restored" "$retracted" "$labels" "$changed" "$missing"
+      printf 'review_sweep=undone run_id=%s projects=%s restored=%s retracted=%s skipped_changed=%s skipped_missing=%s\n' "$undo_run" "$touched" "$restored" "$retracted" "$changed" "$missing"
       ;;
   esac
 }
