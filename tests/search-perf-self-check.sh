@@ -83,6 +83,34 @@ same_results() {
 }
 count() { grep -c "^$1\$" "$fixture/$2.log" || true; }
 
+# Lexical confidence gate: a margin the top lexical score clears skips the
+# embedder and keeps the lexical order; always/an unmet margin fuse as before.
+counted_embedder="$fixture/embedder-counted"
+printf '#!/bin/bash\nprintf x >>"%s"\nexec "%s" "$@"\n' "$fixture/embedder.calls" "$embedder" >"$counted_embedder"
+chmod +x "$counted_embedder"
+gate_search() {
+  local tag="$1"; shift
+  : >"$fixture/embedder.calls"
+  "$cli" --root "$vault" search "$project_id" "ferry timetable tides" --limit 40 --strategy hybrid \
+    --query-embedder "$counted_embedder" --metadata-file "$fixture/$tag.meta" "$@" >"$fixture/$tag.out"
+  wc -c <"$fixture/embedder.calls" | tr -d ' '
+}
+run_search gate-lexical lexical
+[ "$(gate_search gate-always --vector-gate always)" -gt 0 ] || fail "gate always: embedder not run"
+grep -qx 'retrieval_mode=hybrid-rrf' "$fixture/gate-always.meta" || fail "gate always: not fused"
+! grep -q '^vector_gate=' "$fixture/gate-always.meta" || fail "gate always: metadata changed"
+[ "$(gate_search gate-never --vector-gate never)" = 0 ] || fail "gate never: embedder ran"
+grep -qx 'retrieval_mode=hybrid-lexical' "$fixture/gate-never.meta" || fail "gate never: mode not recorded"
+grep -qx 'degraded=false' "$fixture/gate-never.meta" || fail "gate never: reported as degraded"
+cut -f1 "$fixture/gate-never.out" | cmp -s - <(cut -f1 "$fixture/gate-lexical.out") || fail "gate never: order differs from lexical"
+[ "$(LLM_BRAIN_VECTOR_GATE=0 gate_search gate-zero)" = 0 ] || fail "gate 0: embedder ran"
+grep -q '^lexical_margin=0\.' "$fixture/gate-zero.meta" || fail "gate 0: margin not recorded"
+[ "$(gate_search gate-one --vector-gate 1)" -gt 0 ] || fail "gate 1: close lexical scores skipped the vector pass"
+grep -qx 'retrieval_mode=hybrid-rrf' "$fixture/gate-one.meta" || fail "gate 1: not fused"
+if "$cli" --root "$vault" search "$project_id" ferry --strategy hybrid --query-embedder "$embedder" --vector-gate sometimes >/dev/null 2>&1; then fail "an invalid vector gate was accepted"; fi
+LLM_BRAIN_VECTOR_GATE=never run_search lexical-gate lexical
+cmp -s "$fixture/gate-lexical.out" "$fixture/lexical-gate.out" || fail "lexical: vector gate changed lexical results"
+
 for strategy in hybrid lexical; do
   # Index build refuses malformed YAML, so add the invalid record (duplicate
   # key) after the hybrid pass; lexical BM25F reads canonical files directly.
@@ -109,11 +137,13 @@ for strategy in hybrid lexical; do
   done
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
-  # The vector weight only touches hybrid fusion (default 0.5, recorded).
+  # The vector weight only touches hybrid fusion (default 1, recorded), and
+  # the default lexical confidence gate (0.1) is recorded with its margin.
   if [ "$strategy" = hybrid ]; then
-    grep -qx 'vector_weight=0.5' "$fixture/hybrid.meta" || fail "hybrid: default vector weight not recorded"
-    run_search hybrid-w1 hybrid --vector-weight 1
-    grep -qx 'vector_weight=1' "$fixture/hybrid-w1.meta" || fail "hybrid: --vector-weight not applied"
+    grep -qx 'vector_weight=1' "$fixture/hybrid.meta" || fail "hybrid: default vector weight not recorded"
+    grep -qx 'vector_gate=0.1' "$fixture/hybrid.meta" || fail "hybrid: default vector gate not recorded"
+    run_search hybrid-w05 hybrid --vector-weight 0.5
+    grep -qx 'vector_weight=0.5' "$fixture/hybrid-w05.meta" || fail "hybrid: --vector-weight not applied"
   else
     LLM_BRAIN_VECTOR_WEIGHT=0 run_search lexical-w0 lexical
     same_results lexical lexical-w0 "lexical: vector weight changed lexical results"

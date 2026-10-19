@@ -105,10 +105,16 @@ or vault migration is added.
   Scores are recomputed from canonical files on every query, so there is no
   index to drift. `LLM_BRAIN_LEXICAL_SCORER=legacy` restores the previous
   scorer.
-- **Hybrid fusion weight (0.10).** Hybrid search adds `W / (60 + vector rank)`
-  to `1 / (60 + lexical rank)`. `W` defaults to 0.5; set it with
-  `--vector-weight W` or `LLM_BRAIN_VECTOR_WEIGHT` (`1` is the 0.9 equal
-  weight).
+- **Hybrid confidence gate and fusion weight (0.10).** Hybrid search skips
+  the embedder when lexical search is already sure: if the top BM25F score
+  beats the second by a margin `(top - second) / top` of at least 0.1 (a lone
+  match counts as 1), it keeps the lexical order and records
+  `retrieval_mode=hybrid-lexical`. Otherwise it adds `W / (60 + vector rank)`
+  to `1 / (60 + lexical rank)`. Set the gate with
+  `--vector-gate always|never|MARGIN` or `LLM_BRAIN_VECTOR_GATE` (`always` is
+  the 0.9 behaviour, `never` never runs the vector pass), and the weight with
+  `--vector-weight W` or `LLM_BRAIN_VECTOR_WEIGHT` (default 1). Metadata
+  records `vector_gate=`, `lexical_margin=` and, when fused, `vector_weight=`.
 - **File-aware recall.** Concepts may declare `brain_paths` globs (quote them:
   `brain_paths: ["src/api/**"]`). A task that names a matching file, or
   `--path FILE`, boosts those concepts.
