@@ -109,6 +109,17 @@ for strategy in hybrid lexical; do
   done
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
+  # The vector weight only touches hybrid fusion (default 0.5, recorded).
+  if [ "$strategy" = hybrid ]; then
+    grep -qx 'vector_weight=0.5' "$fixture/hybrid.meta" || fail "hybrid: default vector weight not recorded"
+    run_search hybrid-w1 hybrid --vector-weight 1
+    grep -qx 'vector_weight=1' "$fixture/hybrid-w1.meta" || fail "hybrid: --vector-weight not applied"
+  else
+    LLM_BRAIN_VECTOR_WEIGHT=0 run_search lexical-w0 lexical
+    same_results lexical lexical-w0 "lexical: vector weight changed lexical results"
+    ! grep -q '^vector_weight=' "$fixture/lexical.meta" || fail "lexical: metadata names a vector weight"
+    if LLM_BRAIN_VECTOR_WEIGHT=heavy run_search lexical-bad lexical 2>/dev/null; then fail "an invalid vector weight was accepted"; fi
+  fi
 done
 
 # Header parsing split over forked workers (forced on this small vault)
