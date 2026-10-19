@@ -11,6 +11,12 @@ touches a real vault.
 The runner is a trusted local executable invoked as
 ``RUNNER request.json output.json``.  request.json carries ``task``,
 ``workdir``, ``mode`` and ``context_path`` (null when memory is off).
+
+Opt-in control arms (``--controls``) check that a gain comes from the right
+memory, not just from more context: ``shuffled`` gives each task another
+task's memory (or its own words scrambled when there is one task) and
+``unrelated`` gives the same number of off-topic records.  Control arms are
+blind: the runner sees ``mode: on`` for them.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -33,6 +40,15 @@ sys.dont_write_bytecode = True
 FORMAT = "llm-brain.outcome-evaluation"
 VERSION = 1
 MODES = ("off", "on")
+CONTROL_MODES = ("shuffled", "unrelated")
+UNRELATED_FACTS = (
+    ("Office plant watering", "The office plant on the second shelf is watered every Monday morning."),
+    ("Car park allocation", "Visitor car park spaces are allocated from the left side of the lot first."),
+    ("Tea supplies", "Green tea is kept in the top drawer of the kitchen cupboard."),
+    ("Meeting room names", "The meeting rooms are named after rivers and are booked through the front desk."),
+    ("Newsletter timing", "The community newsletter goes out on the first Thursday of each month."),
+    ("Recycling day", "Paper recycling is collected from the loading dock every second Wednesday."),
+)
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 REL_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,127}$")
 ALLOWED_TEST_PROGRAMS = {"python3", "sh", "bash"}
@@ -87,6 +103,25 @@ def validate(cases: dict[str, Any]) -> list[dict[str, Any]]:
     return tasks
 
 
+def control_memory(tasks: list[dict[str, Any]], index: int, mode: str) -> list[dict[str, Any]]:
+    """Deterministic control-arm memory with the same record count as ``on``."""
+    own = tasks[index].get("memory", [])
+    if mode == "unrelated":
+        count = max(1, len(own))
+        return [{"id": f"control_unrelated_{n}", "title": UNRELATED_FACTS[n % len(UNRELATED_FACTS)][0],
+                 "text": UNRELATED_FACTS[n % len(UNRELATED_FACTS)][1]} for n in range(count)]
+    if len(tasks) > 1:
+        other = tasks[(index + 1) % len(tasks)].get("memory", [])
+        return [dict(record, id=f"control_shuffled_{n}", paths=[]) for n, record in enumerate(other)]
+    rng = random.Random(f"shuffle:{tasks[index]['id']}")
+    out = []
+    for n, record in enumerate(own):
+        words = record["text"].split()
+        rng.shuffle(words)
+        out.append({"id": f"control_shuffled_{n}", "title": record["title"], "text": " ".join(words)})
+    return out
+
+
 def run(command: list[str], cwd: Path, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
 
@@ -137,7 +172,9 @@ def main() -> int:
     parser.add_argument("--runner-timeout", type=int, default=600)
     parser.add_argument("--test-timeout", type=int, default=120)
     parser.add_argument("--keep-workspaces", action="store_true")
+    parser.add_argument("--controls", action="store_true", help="also run shuffled and unrelated memory control arms (doubles runner calls)")
     args = parser.parse_args()
+    modes = MODES + (CONTROL_MODES if args.controls else ())
 
     output = Path(args.output)
     if output.exists():
@@ -159,7 +196,7 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     try:
         for index, task in enumerate(tasks):
-            for mode in MODES:
+            for mode in modes:
                 base = scratch / f"{index:03d}-{task['id']}-{mode}"
                 workdir = base / "workspace"
                 workdir.mkdir(parents=True)
@@ -171,9 +208,11 @@ def main() -> int:
                 started = time.monotonic()
                 context_path = None
                 try:
-                    if mode == "on":
+                    if mode != "off":
                         project_id = f"proj_outcome_{index:03d}"
-                        seed_vault(cli, base / "vault", workdir, project_id, task, env)
+                        seeded = task if mode == "on" else dict(task, memory=control_memory(tasks, index, mode))
+                        row["memory_records"] = len(seeded.get("memory", []))
+                        seed_vault(cli, base / "vault", workdir, project_id, seeded, env)
                         pack, size = build_pack(cli, base / "vault", workdir, project_id, task, env, args.budget_tokens)
                         context_path = str(base / "context.md")
                         shutil.copyfile(pack, context_path)
@@ -181,7 +220,7 @@ def main() -> int:
                     else:
                         row["context_bytes"] = 0
                     request = base / "request.json"
-                    request.write_text(json.dumps({"task": task["task"], "workdir": str(workdir), "mode": mode, "context_path": context_path}) + "\n", encoding="utf-8")
+                    request.write_text(json.dumps({"task": task["task"], "workdir": str(workdir), "mode": "off" if mode == "off" else "on", "context_path": context_path}) + "\n", encoding="utf-8")
                     runner_result = run([str(runner), str(request), str(base / "runner-output.json")], workdir, env, args.runner_timeout)
                     row["runner_exit"] = runner_result.returncode
                     test = run(task["test"], workdir, env, args.test_timeout)
@@ -207,7 +246,7 @@ def main() -> int:
         "modes": {},
         "scoring": "executable-tests-only",
     }
-    for mode in MODES:
+    for mode in modes:
         mode_rows = [row for row in rows if row["mode"] == mode]
         passed = sum(1 for row in mode_rows if row["passed"])
         summary["modes"][mode] = {
@@ -223,11 +262,21 @@ def main() -> int:
         if any(r["passed"] for r in rows if r["task_id"] == task["id"] and r["mode"] == "off")
         and not any(r["passed"] for r in rows if r["task_id"] == task["id"] and r["mode"] == "on")
     )
+    controls_line = ""
+    if args.controls:
+        best_control = max(summary["modes"][mode]["pass_rate"] for mode in CONTROL_MODES)
+        summary["controls"] = {
+            "modes": list(CONTROL_MODES),
+            "blind": True,
+            "lift_over_best_control": round(summary["modes"]["on"]["pass_rate"] - best_control, 4),
+            "memory_specific": summary["modes"]["on"]["pass_rate"] > best_control,
+        }
+        controls_line = f" shuffled={summary['modes']['shuffled']['passed']}/{len(tasks)} unrelated={summary['modes']['unrelated']['passed']}/{len(tasks)} lift_over_control={summary['controls']['lift_over_best_control']}"
     with (output / "results.jsonl").open("w", encoding="utf-8") as stream:
         for row in rows:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
     (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"outcome_eval=ok tasks={len(tasks)} off={summary['modes']['off']['passed']}/{len(tasks)} on={summary['modes']['on']['passed']}/{len(tasks)} uplift={summary['uplift']} output={output}")
+    print(f"outcome_eval=ok tasks={len(tasks)} off={summary['modes']['off']['passed']}/{len(tasks)} on={summary['modes']['on']['passed']}/{len(tasks)} uplift={summary['uplift']}{controls_line} output={output}")
     return 0
 
 

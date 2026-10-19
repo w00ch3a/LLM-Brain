@@ -1246,6 +1246,63 @@ def materialise_events(family: Family, horizon: int, seed: int = 0) -> list[dict
     return events
 
 
+
+# Opt-in per-step store checks (--step-checks): after each write event, the
+# okf/ delta is classified as the store operation that actually happened and
+# compared with the operation the event expects.  QA scores alone can hide a
+# store that answers well while writing the wrong thing.
+STEP_OPERATIONS = ("create", "update", "reinforce", "supersede", "retract", "none")
+STEP_DEFAULTS = {"review": "create", "supersession": "supersede", "retraction": "retract"}
+
+
+def observed_store_operation(before: dict[str, tuple[str, int]], after: dict[str, tuple[str, int]], okf_prefix: str, root: Path) -> str:
+    added = [path for path in after if path.startswith(okf_prefix) and path not in before]
+    changed = [path for path in after if path.startswith(okf_prefix) and path in before and before[path] != after[path]]
+    if any("/retractions/" in path for path in added):
+        return "retract"
+    for path in added:
+        fields = frontmatter_fields(root / path)
+        if fields.get("brain_supersedes") or fields.get("brain_version_of"):
+            return "supersede"
+    if added:
+        return "create"
+    if changed:
+        return "update"
+    return "none"
+
+
+def expected_store_operation(event: dict[str, Any]) -> str | None:
+    explicit = event.get("expect_op")
+    if explicit is not None:
+        if explicit not in STEP_OPERATIONS:
+            raise EvaluationError(f"unsupported expect_op: {explicit}")
+        return str(explicit)
+    expected = STEP_DEFAULTS.get(event.get("operation", ""))
+    record = event.get("record") if isinstance(event.get("record"), dict) else {}
+    if expected == "create" and (record.get("supersedes") or record.get("version_of")):
+        expected = "supersede"
+    return expected
+
+
+def step_correct(expected: str, observed: str) -> bool:
+    # Reinforcing a known fact must not create a duplicate record.
+    if expected == "reinforce":
+        return observed in ("none", "update")
+    return expected == observed
+
+
+def step_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_expected: dict[str, dict[str, int]] = {}
+    for row in rows:
+        bucket = by_expected.setdefault(row["expected"], {"checked": 0, "correct": 0})
+        bucket["checked"] += 1
+        bucket["correct"] += int(row["correct"])
+    correct = sum(int(row["correct"]) for row in rows)
+    return {"checked": len(rows), "correct": correct,
+            "correct_operation_rate": round(correct / len(rows), 4) if rows else "unmeasured",
+            "by_expected": by_expected, "metric": "okf-delta-vs-expected-operation"}
+
+
 def run_scenario(
     cli: Path,
     repo_root: Path,
@@ -1257,6 +1314,7 @@ def run_scenario(
     answer_runner: Path | None,
     output_dir: Path,
     seed: int = 0,
+    step_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix=f"llm-brain-lifecycle-{family.family_id}-{horizon}-") as temp:
@@ -1284,11 +1342,27 @@ def run_scenario(
         runtime.seed_write_cost, runtime.seed_write_bytes = snapshot_delta(seed_before, seed_after)
         events = materialise_events(family, horizon, seed)
         query_by_id = {query.query_id: query for query in family.queries}
+        okf_prefix = str((project_dir / "okf").relative_to(temp_root)) + "/"
         for index, event in enumerate(events):
+            expected_op = expected_store_operation(event) if step_rows is not None and event["operation"] != "capture" else None
+            if expected_op is not None and runtime.pending_capture_files:
+                # Isolate this event's own writes; the flush is still costed as capture.
+                pre_flush = file_snapshot(temp_root)
+                flush_captures(cli, vault, repo_root, project_id, runtime)
+                flush_writes, flush_bytes = snapshot_delta(pre_flush, file_snapshot(temp_root))
+                runtime.operation_writes["capture"] += flush_writes
+                runtime.operation_write_bytes["capture"] += flush_bytes
+                runtime.write_cost += flush_writes
+                runtime.write_bytes += flush_bytes
             before = file_snapshot(temp_root)
             started = time.monotonic()
             apply_event(cli, vault, repo_root, project_id, project_dir, family, event, index, capture_dir, runtime, record_ids)
             after = file_snapshot(temp_root)
+            if expected_op is not None and step_rows is not None:
+                observed_op = observed_store_operation(before, after, okf_prefix, temp_root)
+                step_rows.append({"family_id": family.family_id, "horizon": horizon, "event_index": index,
+                                  "operation": event["operation"], "expected": expected_op, "observed": observed_op,
+                                  "correct": step_correct(expected_op, observed_op)})
             writes, write_bytes = snapshot_delta(before, after)
             operation = event["operation"]
             runtime.operation_writes[operation] += writes
@@ -1666,6 +1740,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reader-identity", default="llm-brain-evaluator")
     parser.add_argument("--migration-direction", choices=("none", "forward", "reverse"), default="none")
     parser.add_argument("--portability-matrix", help="optional TSV of local writer/reader CLI pairs")
+    parser.add_argument("--step-checks", action="store_true", help="score each write event's store operation (create/update/reinforce/supersede/retract)")
     args = parser.parse_args(argv)
     if args.seed < 0 or args.repeats < 1 or args.repeats > 50:
         parser.error("--seed must be non-negative and --repeats must be between 1 and 50")
@@ -1753,9 +1828,10 @@ def main(argv: list[str] | None = None) -> int:
         output_dir.mkdir()
         write_json(output_dir / "run.json", identity)
         rows: list[dict[str, Any]] = []
+        step_rows: list[dict[str, Any]] | None = [] if args.step_checks else None
         for family in families:
             for horizon in family.horizons:
-                rows.extend(run_scenario(cli, repo_root, family, horizon, args.repeats, run_id, identity_hash, answer_runner, output_dir, args.seed))
+                rows.extend(run_scenario(cli, repo_root, family, horizon, args.repeats, run_id, identity_hash, answer_runner, output_dir, args.seed, step_rows))
         trace_metadata = {
             "repository_commit": repository_commit,
             "provider": provider,
@@ -1792,6 +1868,11 @@ def main(argv: list[str] | None = None) -> int:
                 "scope": "local_cli_only",
                 "matrix": matrix_results,
             }
+        if step_rows is not None:
+            metrics["step_checks"] = step_summary(step_rows)
+            with (output_dir / "step-checks.jsonl").open("w", encoding="utf-8") as stream:
+                for step in step_rows:
+                    stream.write(json.dumps(step, sort_keys=True) + "\n")
         write_trace(output_dir / "trace.jsonl", rows)
         write_tsv(output_dir / "trace.tsv", rows)
         write_json(output_dir / "summary.json", {"run_id": run_id, "evaluation_metadata": trace_metadata, **metrics})

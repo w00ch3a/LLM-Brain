@@ -426,4 +426,37 @@ printf 'diff --git a/x b/x\n+api_key = "abcdefghijklmnopqrstuvwx"\n' >"$fixture/
 grep -Fq 'attempt-record' "$pdir/audit.v2.tsv" || fail '#14 attempt not audited'
 printf 'idea-14=ok\n'
 
+# ---- #15 eval upgrades: blind shuffled/unrelated control arms and per-step store checks (opt-in).
+"$py" "$repo_root/scripts/eval-outcome.py" --cases "$repo_root/tests/fixtures/outcome/tasks.v1.json" --output "$fixture/eval-controls" --controls >/dev/null
+"$py" - "$fixture/eval-controls/summary.json" "$fixture/eval-controls/results.jsonl" <<'PY' || fail '#15 control arms wrong'
+import json, sys
+s = json.load(open(sys.argv[1]))
+rows = [json.loads(line) for line in open(sys.argv[2])]
+assert set(s["modes"]) == {"off", "on", "shuffled", "unrelated"}, s["modes"]
+assert s["modes"]["on"]["passed"] == 4, s
+assert s["modes"]["shuffled"]["passed"] < 4 and s["modes"]["unrelated"]["passed"] < 4, s
+assert s["controls"]["memory_specific"] is True and s["controls"]["lift_over_best_control"] > 0, s
+assert all(r["memory_records"] >= 1 for r in rows if r["mode"] == "unrelated"), rows
+PY
+"$py" "$repo_root/scripts/eval-outcome.py" --cases "$repo_root/tests/fixtures/outcome/tasks.v1.json" --output "$fixture/eval-plain" >/dev/null
+"$py" -c 'import json,sys; s=json.load(open(sys.argv[1])); assert set(s["modes"])=={"off","on"} and "controls" not in s' "$fixture/eval-plain/summary.json" || fail '#15 control arms are not opt-in'
+"$py" - "$repo_root/tests/fixtures/lifecycle/cases.v1.json" "$fixture/steps.json" "$fixture/steps-wrong.json" <<'PY'
+import json, sys, copy
+source = json.load(open(sys.argv[1]))
+source["horizons"] = [3]
+source["scenario_families"] = [f for f in source["scenario_families"] if f["id"] in ("updates", "retractions", "review-gate")]
+json.dump(source, open(sys.argv[2], "w"))
+wrong = copy.deepcopy(source)
+for family in wrong["scenario_families"]:
+    for event in family["events"]:
+        if event["operation"] == "review":
+            event["expect_op"] = "reinforce"  # a duplicate-creating store would fail this
+json.dump(wrong, open(sys.argv[3], "w"))
+PY
+"$py" "$repo_root/scripts/eval-lifecycle.py" --cases "$fixture/steps.json" --output "$fixture/steps-run" --repeats 1 --step-checks >/dev/null
+"$py" -c 'import json,sys; c=json.load(open(sys.argv[1]))["step_checks"]; assert c["checked"]==3 and c["correct_operation_rate"]==1.0 and set(c["by_expected"])=={"create","supersede","retract"}, c' "$fixture/steps-run/summary.json" || fail "#15 per-step store checks wrong: $(cat "$fixture/steps-run/summary.json" | head -c 400)"
+"$py" "$repo_root/scripts/eval-lifecycle.py" --cases "$fixture/steps-wrong.json" --output "$fixture/steps-wrong-run" --repeats 1 --step-checks >/dev/null
+"$py" -c 'import json,sys; c=json.load(open(sys.argv[1]))["step_checks"]; assert c["correct_operation_rate"] < 1.0, c' "$fixture/steps-wrong-run/summary.json" || fail '#15 a wrong store operation was not caught'
+printf 'idea-15=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'
