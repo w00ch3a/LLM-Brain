@@ -262,6 +262,19 @@ sha256_file() {
   fi
 }
 
+# Hash every path listed in FILE (one per line) with the same tool order as
+# sha256_file; prints "HASH  PATH" lines in input order.
+sha256_files_batch() {
+  local list="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    tr '\n' '\0' <"$list" | xargs -0 shasum -a 256 --
+  elif command -v sha256sum >/dev/null 2>&1; then
+    tr '\n' '\0' <"$list" | xargs -0 sha256sum --
+  else
+    return 69
+  fi
+}
+
 md5_file() {
   if command -v md5 >/dev/null 2>&1; then
     md5 -q "$1"
@@ -1861,7 +1874,8 @@ frontmatter_field() {
   local file="$1" key="$2" aliases="${3:-}"
   local cache cache_tmp wanted field value
   if [ -n "${MAINT_FIELDS_CACHE_DIR:-}" ] && [ -f "$file" ] && [ ! -L "$file" ]; then
-    cache="$MAINT_FIELDS_CACHE_DIR/${file//\//__}"
+    cache="${file#"${MAINT_FIELDS_CACHE_STRIP:-}"}"
+    cache="$MAINT_FIELDS_CACHE_DIR/${cache//\//__}"
     if [ ! -f "$cache" ]; then
       cache_tmp="$cache.tmp.$$.$RANDOM"
       if awk '
@@ -1910,13 +1924,93 @@ frontmatter_field() {
   ' "$file"
 }
 
+# fm_get VAR FILE KEY [ALIASES]: frontmatter_field into VAR without a
+# command-substitution fork when the per-run field cache already holds FILE.
+fm_get() {
+  local __fm_cache __fm_wanted __fm_field __fm_value
+  if [ -n "${MAINT_FIELDS_CACHE_DIR:-}" ] && [ -f "$2" ] && [ ! -L "$2" ]; then
+    __fm_cache="${2#"${MAINT_FIELDS_CACHE_STRIP:-}"}"
+    __fm_cache="$MAINT_FIELDS_CACHE_DIR/${__fm_cache//\//__}"
+    if [ -f "$__fm_cache" ]; then
+      __fm_wanted=",$3,${4:-},"
+      while IFS=$'\t' read -r __fm_field __fm_value; do
+        case "$__fm_wanted" in
+          *,"$__fm_field",*) printf -v "$1" '%s' "$__fm_value"; return 0 ;;
+        esac
+      done <"$__fm_cache"
+      printf -v "$1" '%s' ""
+      return 0
+    fi
+  fi
+  printf -v "$1" '%s' "$(frontmatter_field "$2" "$3" "${4:-}")"
+}
+
+# Fill the field cache for every path in LIST with one awk pass (same parse
+# as frontmatter_field). On any error the pass's output is discarded and
+# frontmatter_field builds entries lazily as before.
+fields_cache_prewarm() {
+  local list="$1"
+  [ -n "${MAINT_FIELDS_CACHE_DIR:-}" ] && [ -d "$MAINT_FIELDS_CACHE_DIR" ] && [ -s "$list" ] || return 0
+  [ -z "$(ls -A "$MAINT_FIELDS_CACHE_DIR" 2>/dev/null)" ] || return 0
+  if ! tr '\n' '\0' <"$list" | xargs -0 awk -v cache_dir="$MAINT_FIELDS_CACHE_DIR" -v strip="${MAINT_FIELDS_CACHE_STRIP:-}" '
+    FNR == 1 {
+      if (out != "") close(out)
+      key = FILENAME
+      if (strip != "" && index(key, strip) == 1) key = substr(key, length(strip) + 1)
+      gsub("/", "__", key)
+      out = cache_dir "/" key
+      printf "" >out
+      in_header = 0; header_done = 0
+    }
+    header_done { next }
+    FNR == 1 && $0 == "---" { in_header = 1; next }
+    in_header && $0 == "---" { header_done = 1; next }
+    in_header {
+      colon = index($0, ":")
+      if (colon > 1) {
+        field = substr($0, 1, colon - 1)
+        value = substr($0, colon + 1)
+        sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value)
+        gsub(/^"|"$/, "", value); gsub(/[\t\r]/, " ", value)
+        print field "\t" value >out
+      }
+    }
+    END { if (out != "") close(out) }
+  ' 2>/dev/null; then
+    rm -rf "$MAINT_FIELDS_CACHE_DIR" && mkdir -p "$MAINT_FIELDS_CACHE_DIR"
+  fi
+  return 0
+}
+
 frontmatter_has() { [ -n "$(frontmatter_field "$1" "$2" "${3:-}")" ]; }
 
 okf_record_valid() {
   # Keep shell policy on the YAML-aware parser; never let the first matching
   # scalar line silently override malformed or duplicate frontmatter.
-  local file="$1"
+  local file="$1" memo
+  # A search pre-validates every canonical file with one `okf valid-batch`
+  # call (same parser, same verdict); fall back to one call when unmemoised.
+  if [ -n "${OKF_VALID_MEMO_DIR:-}" ]; then
+    memo="${file#"${SEARCH_MEMO_PREFIX:-}"}"
+    memo="$OKF_VALID_MEMO_DIR/${memo//\//__}"
+    [ ! -f "$memo.1" ] || return 0
+    [ ! -f "$memo.0" ] || return 1
+  fi
   okf field "$file" type >/dev/null 2>&1
+}
+
+# Fill OKF_VALID_MEMO_DIR from one interpreter start.  Any failure leaves the
+# memo empty, so okf_record_valid falls back to its per-file call.
+okf_valid_memo_fill() {
+  local paths_file="$1" ok path out
+  [ -n "${OKF_VALID_MEMO_DIR:-}" ] && [ -s "$paths_file" ] || return 0
+  out="$OKF_VALID_MEMO_DIR.batch"
+  okf valid-batch "$paths_file" >"$out" 2>/dev/null || { rm -f "$out"; return 0; }
+  while IFS=$'\t' read -r ok path; do
+    path="${path#"${SEARCH_MEMO_PREFIX:-}"}"
+    case "$ok" in 0|1) : >"$OKF_VALID_MEMO_DIR/${path//\//__}.$ok" 2>/dev/null || true ;; esac
+  done <"$out"
+  rm -f "$out"
 }
 
 body_after_frontmatter() {
@@ -4755,17 +4849,17 @@ EOF
 
 canonical_file_effective() {
   local dir="$1" file="$2" state status sensitivity id
-  id="$(basename "$file" .md)"
+  id="${file##*/}"; id="${id%.md}"; [ -n "$id" ] || id=".md"
   [ ! -f "$dir/okf/retractions/$id.md" ] || return 1
-  state="$(frontmatter_field "$file" brain_review_state review_state)"
-  status="$(frontmatter_field "$file" status)"
+  fm_get state "$file" brain_review_state review_state
+  fm_get status "$file" status
   [ "$status" != "deprecated" ] || return 1
   if [ -n "$state" ]; then
     [ "$state" = "approved" ] || return 1
   else
     [ "${status:-stable}" = "stable" ] || return 1
   fi
-  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"; [ -n "$sensitivity" ] || sensitivity="internal"
+  fm_get sensitivity "$file" brain_sensitivity sensitivity; [ -n "$sensitivity" ] || sensitivity="internal"
   [ "$sensitivity" != "restricted" ] || return 1
   return 0
 }
@@ -4802,12 +4896,39 @@ embedding_field() {
 }
 
 canonical_signature() {
-  local dir="$1" file rel
+  local dir="$1" file rel list hashes hash hashed_path ok=1
+  list="$(mktemp "${TMPDIR:-/tmp}/llm-brain-sig.XXXXXX")"
   while IFS= read -r file; do
     canonical_file_effective "$dir" "$file" || continue
-    rel="${file#"$dir"/}"
-    printf '%s\t%s\n' "$rel" "$(sha256_file "$file")"
-  done < <(canonical_files "$dir")
+    printf '%s\n' "$file"
+  done < <(canonical_files "$dir") >"$list"
+  # One hashing process per batch instead of one per file.  The output is
+  # used only when every line names the expected file in order; otherwise
+  # (odd names, missing tool) fall back to the per-file hash.
+  hashes="$list.hashes"
+  if [ -s "$list" ] && sha256_files_batch "$list" >"$hashes" 2>/dev/null && [ "$(wc -l <"$hashes")" = "$(wc -l <"$list")" ]; then
+    exec 4<"$hashes"
+    while IFS= read -r file; do
+      IFS= read -r hash <&4 || { ok=0; break; }
+      hashed_path="${hash#*  }"; hash="${hash%%  *}"
+      [ "$hashed_path" = "$file" ] && [ "${#hash}" = 64 ] || { ok=0; break; }
+    done <"$list"
+    exec 4<&-
+  else
+    ok=0
+  fi
+  if [ "$ok" = 1 ]; then
+    while IFS= read -r hash; do
+      hashed_path="${hash#*  }"
+      printf '%s\t%s\n' "${hashed_path#"$dir"/}" "${hash%%  *}"
+    done <"$hashes"
+  else
+    while IFS= read -r file; do
+      rel="${file#"$dir"/}"
+      printf '%s\t%s\n' "$rel" "$(sha256_file "$file")"
+    done <"$list"
+  fi
+  rm -f "$list" "$hashes"
 }
 
 index_manifest_hash() {
@@ -5141,6 +5262,42 @@ index_vectors_state() {
   fi
   actual_count="$(tail -n +2 "$file" | wc -l | tr -d ' ')"
   [ "$expected_count" = "$actual_count" ] || { printf 'stale\n'; return; }
+  if [ "$INDEX_EXPECTED_SIGNATURE_READY" = "1" ]; then
+    # Fast path for a search that has just hashed every canonical file. The
+    # verdict is only current/stale, so check every row in one awk pass (the
+    # valid_embedding_row rules) and reuse those fresh hashes instead of
+    # hashing each file again. Rows awk cannot judge exactly like the shell
+    # read does (empty or extra fields, backslashes) take the per-row loop.
+    local fast kind
+    fast="$(printf '%s\n' "$INDEX_EXPECTED_SIGNATURE" | awk -F '\t' '
+      FNR == NR { if (NF >= 2) sig[$1] = $2 ""; next }
+      FNR == 1 { next }
+      NF == 0 { next }
+      NF != 5 || $1 == "" || $2 == "" || $3 == "" || $4 == "" || $5 == "" || index($0, "\\") { print "slow"; exit }
+      {
+        if ($4 !~ /^[1-9][0-9]*$/) { print "stale"; exit }
+        count = split($5, values, /[[:space:]]+/)
+        if (count != $4 + 0) { print "stale"; exit }
+        for (i = 1; i <= count; i++) if (values[i] !~ /^-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/) { print "stale"; exit }
+        if (path_count == 0) { first_model = $3 ""; first_dimensions = $4 "" }
+        else if (first_model != ($3 "") || first_dimensions != ($4 "")) { print "stale"; exit }
+        paths[++path_count] = $1
+        if (!($1 in sig) || sig[$1] != ($2 "")) paths[path_count] = $1 "\t" $2
+      }
+      END { for (i = 1; i <= path_count; i++) print paths[i] }
+    ' - "$file")"
+    case "$fast" in
+      stale) printf 'stale\n'; return ;;
+      slow) ;;
+      *)
+        while IFS=$'\t' read -r path hash; do
+          [ -n "$path" ] || continue
+          [ -f "$dir/$path" ] || { printf 'stale\n'; return; }
+          [ -z "$hash" ] || [ "$(sha256_file "$dir/$path")" = "$hash" ] || { printf 'stale\n'; return; }
+        done <<<"$fast"
+        printf 'current\n'; return ;;
+    esac
+  fi
   while IFS=$'\t' read -r path hash model dimensions vector; do
     [ -n "$path" ] || continue
     [ -f "$dir/$path" ] || { printf 'stale\n'; return; }
@@ -5169,7 +5326,8 @@ file_superseded_by_current_memory() {
   local dir="$1" target_file="$2" candidate supersedes
   if [ -n "$SEARCH_SUPERSESSION_MAP" ] && [ -f "$SEARCH_SUPERSESSION_MAP" ]; then
     local target_rel target_base target_title
-    target_rel="${target_file#"$dir"/}"; target_base="$(basename "$target_rel" .md)"; target_title="$(frontmatter_field "$target_file" title)"
+    [ -s "$SEARCH_SUPERSESSION_MAP" ] || return 1
+    target_rel="${target_file#"$dir"/}"; target_base="$(basename "$target_rel" .md)"; fm_get target_title "$target_file" title
     awk -F '\t' -v rel="$target_rel" -v base="$target_base" -v title="$target_title" '$1 == rel || $1 == rel ".md" || $1 == base || $1 == title { found=1 } END { exit !found }' "$SEARCH_SUPERSESSION_MAP"
     return $?
   fi
@@ -5190,7 +5348,7 @@ build_supersession_map() {
   : >"$map"
   while IFS= read -r file; do
     canonical_file_effective "$dir" "$file" || continue
-    supersedes="$(frontmatter_field "$file" brain_supersedes)"
+    fm_get supersedes "$file" brain_supersedes
     [ -n "$supersedes" ] || continue
     rel="${file#"$dir"/}"
     printf '%s\t%s\n' "$supersedes" "$rel" >>"$map"
@@ -5207,9 +5365,10 @@ brain_datetime_valid() {
 brain_temporal_eligible() {
   local file="$1" as_of="$2" historical="$3" valid_from valid_to
   [ "$historical" = "1" ] && [ -z "$as_of" ] && return 0
+  [ -n "$as_of" ] || as_of="${SEARCH_NOW_UTC:-}"
   [ -n "$as_of" ] || as_of="$(now_utc)"
-  valid_from="$(frontmatter_field "$file" brain_valid_from)"
-  valid_to="$(frontmatter_field "$file" brain_valid_to)"
+  fm_get valid_from "$file" brain_valid_from
+  fm_get valid_to "$file" brain_valid_to
   [ -z "$valid_from" ] || brain_datetime_valid "$valid_from" || return 1
   [ -z "$valid_to" ] || brain_datetime_valid "$valid_to" || return 1
   [ -z "$valid_from" ] || [ "$valid_from" \< "$as_of" ] || [ "$valid_from" = "$as_of" ] || return 1
@@ -5267,8 +5426,8 @@ principal_visible() {
   # Without a principal every record is visible unless the operator opts into
   # strict per-person scoping (0.10 #9): then only unscoped records are.
   [ -z "$principal" ] && [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] && return 0
-  scope="$(frontmatter_field "$file" brain_principal)"
-  audience="$(frontmatter_field "$file" brain_audience)"
+  fm_get scope "$file" brain_principal
+  fm_get audience "$file" brain_audience
   [ -z "$scope" ] && [ -z "$audience" ] && return 0
   [ -n "$principal" ] || return 1
   visibility_matches "$scope" "$principal" && return 0
@@ -5834,11 +5993,13 @@ evidence_refs_for_file() {
 
 search_file_eligible() {
   local dir="$1" file="$2" include_proposed="$3" include_cold="$4" topic="$5" historical="$6" as_of="${7:-}" principal="${8:-}" state status sensitivity temperature
+  local id
   okf_record_valid "$file" || return 1
-  [ ! -f "$dir/okf/retractions/$(basename "$file" .md).md" ] || return 1
-  state="$(frontmatter_field "$file" brain_review_state review_state)"
-  status="$(frontmatter_field "$file" status)"; [ -n "$status" ] || status="stable"
-  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  id="${file##*/}"; id="${id%.md}"; [ -n "$id" ] || id=".md"
+  [ ! -f "$dir/okf/retractions/$id.md" ] || return 1
+  fm_get state "$file" brain_review_state review_state
+  fm_get status "$file" status; [ -n "$status" ] || status="stable"
+  fm_get sensitivity "$file" brain_sensitivity sensitivity
   [ "$sensitivity" != "restricted" ] || return 1
   if [ "$state" = "superseded" ] || [ "$status" = "deprecated" ]; then
     [ "$historical" = "1" ] || return 1
@@ -5850,12 +6011,28 @@ search_file_eligible() {
   if [ "$historical" = "0" ]; then
     file_superseded_by_current_memory "$dir" "$file" && return 1
   fi
-  temperature="$(frontmatter_field "$file" brain_loading_temperature)"
+  fm_get temperature "$file" brain_loading_temperature
   [ "$include_cold" = "1" ] || [ "$temperature" != "cold" ] || return 1
-  [ -z "$topic" ] || [ "$(frontmatter_field "$file" brain_topic_id topic_id)" = "$topic" ] || return 1
+  if [ -n "$topic" ]; then fm_get id "$file" brain_topic_id topic_id; [ "$id" = "$topic" ] || return 1; fi
   principal_visible "$file" "$principal" || return 1
   brain_temporal_eligible "$file" "$as_of" "$historical" || return 1
   return 0
+}
+
+# search_file_eligible memoised for one cmd_search call (fixed arguments).
+search_eligible_memo() {
+  local memo
+  if [ -n "${SEARCH_ELIGIBLE_MEMO_DIR:-}" ]; then
+    memo="${2#"${SEARCH_MEMO_PREFIX:-}"}"
+    memo="$SEARCH_ELIGIBLE_MEMO_DIR/${memo//\//__}"
+    [ ! -f "$memo.1" ] || return 0
+    [ ! -f "$memo.0" ] || return 1
+    if search_file_eligible "$@"; then
+      : >"$memo.1" 2>/dev/null || true; return 0
+    fi
+    : >"$memo.0" 2>/dev/null || true; return 1
+  fi
+  search_file_eligible "$@"
 }
 
 file_conflict_state() {
@@ -6224,6 +6401,26 @@ cmd_search() {
     [ -z "$metadata_file" ] || printf 'retrieval_mode=lexical\ndegraded=true\nmanifest_hash=none\nstrategy_requested=%s\nindex_generation=%s\nrebuild_state=%s\n' "$strategy" "${index_generation:-legacy}" "$(sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"].*\)".*/\1/p' "$rebuild_state_file" 2>/dev/null || printf unknown)" >"$metadata_file"
     return 0
   fi
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-search.XXXXXX")"
+  # Per-query memos (removed with tmp_dir). Each one caches a pure function
+  # of a file that this query would otherwise recompute many times:
+  # frontmatter fields (reuses the maintenance field cache), the YAML parser
+  # verdict (one `okf valid-batch` call instead of one Python start per
+  # record), the eligibility verdict (the vector and graph passes re-check
+  # the same files with the same arguments) and the clock used for validity
+  # windows when no --as-of is given.
+  # Memo keys are project-relative so long vault paths stay under NAME_MAX;
+  # the field cache is keyed that way only when this query owns it.
+  local MAINT_FIELDS_CACHE_STRIP="${MAINT_FIELDS_CACHE_STRIP:-}"
+  [ -n "${MAINT_FIELDS_CACHE_DIR:-}" ] || MAINT_FIELDS_CACHE_STRIP="$dir/"
+  local MAINT_FIELDS_CACHE_DIR="${MAINT_FIELDS_CACHE_DIR:-$tmp_dir/fields}"
+  local OKF_VALID_MEMO_DIR="$tmp_dir/valid" SEARCH_ELIGIBLE_MEMO_DIR="$tmp_dir/eligible" SEARCH_MEMO_PREFIX="$dir/"
+  local SEARCH_NOW_UTC=""
+  [ -n "$as_of" ] || SEARCH_NOW_UTC="$(now_utc)"
+  mkdir -p "$MAINT_FIELDS_CACHE_DIR" "$OKF_VALID_MEMO_DIR" "$SEARCH_ELIGIBLE_MEMO_DIR"
+  canonical_files "$dir" >"$tmp_dir/canonical.paths"
+  okf_valid_memo_fill "$tmp_dir/canonical.paths"
+  [ "$MAINT_FIELDS_CACHE_DIR" != "$tmp_dir/fields" ] || fields_cache_prewarm "$tmp_dir/canonical.paths"
   INDEX_EXPECTED_SIGNATURE="$(canonical_signature "$dir")"
   INDEX_EXPECTED_SIGNATURE_READY=1
   docs_state="$(index_documents_state "$dir")"
@@ -6232,7 +6429,6 @@ cmd_search() {
   manifest_hash="$(index_manifest_hash "$dir")"
   [ "$graph_state" = "current" ] && graph_file="$(index_file_path "$dir" graph.tsv)"
   vector_index="$(index_file_path "$dir" vectors.tsv)"
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/llm-brain-search.XXXXXX")"
   [ -n "$metadata_file" ] || [ -z "$receipt_file" ] || metadata_file="$tmp_dir/receipt.metadata"
   lexical_raw="$tmp_dir/lexical.raw.tsv"; lexical_rank="$tmp_dir/lexical.rank.tsv"
   semantic_raw="$tmp_dir/semantic.raw.tsv"; semantic_rank="$tmp_dir/semantic.rank.tsv"; union="$tmp_dir/union.tsv"
@@ -6245,7 +6441,7 @@ cmd_search() {
   : >"$lexical_raw"; : >"$semantic_rank"; : >"$base_records"; : >"$graph_records"; : >"$seen_titles"; : >"$selected_evidence"; : >"$selected_paths"; : >"$independence_map"
   : >"$tmp_dir/eligible.paths"
   while IFS= read -r file; do
-    search_file_eligible "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
+    search_eligible_memo "$dir" "$file" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
     if [ "$lexical_scorer" = bm25f ]; then
       printf '%s\n' "$file" >>"$tmp_dir/eligible.paths"
       continue
@@ -6296,7 +6492,7 @@ cmd_search() {
           ' "$vector_index" >"$semantic_raw"
           while IFS=$'\t' read -r rel score; do
             [ -n "$rel" ] || continue
-            search_file_eligible "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" && printf '%s\t%s\n' "$rel" "$score"
+            search_eligible_memo "$dir" "$dir/$rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" && printf '%s\t%s\n' "$rel" "$score"
           done <"$semantic_raw" >"$semantic_raw.filtered"
           mv "$semantic_raw.filtered" "$semantic_raw"
           sort -t $'\t' -k2,2nr -k1,1 "$semantic_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 }' >"$semantic_rank"
@@ -6316,22 +6512,20 @@ cmd_search() {
     [ "$strategy" = "vector" ] || cut -f1 "$lexical_rank"
     if [ "$semantic_ok" = "1" ]; then cut -f1 "$semantic_rank"; fi
   } | sort -u >"$union"
-  while IFS= read -r rel; do
-    [ -n "$rel" ] || continue
-    local lexical_position lexical_score semantic_position semantic_score final_score
-    lexical_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$lexical_rank")"
-    lexical_score="$(awk -F '\t' -v path="$rel" '$1 == path { print $3; exit }' "$lexical_rank")"
-    semantic_position="$(awk -F '\t' -v path="$rel" '$1 == path { print $2; exit }' "$semantic_rank")"
-    semantic_score="$(awk -F '\t' -v path="$rel" '$1 == path { print $3; exit }' "$semantic_rank")"
-    if [ "$strategy" = "vector" ]; then
-      final_score="${semantic_score:-0}"
-    elif [ "$semantic_ok" = "1" ]; then
-      final_score="$(awk -v lexical="$lexical_position" -v semantic="$semantic_position" 'BEGIN { value=0; if (lexical != "") value += 1 / (60 + lexical); if (semantic != "") value += 1 / (60 + semantic); printf "%.12f", value }')"
-    else
-      final_score="${lexical_score:-0}"
-    fi
-    printf 'B\t%s\t%s\t%s\t%s\n' "$rel" "$final_score" "${lexical_position:-}" "${semantic_position:-}" >>"$base_records"
-  done <"$union"
+  # One join for the whole union (was five awk starts per candidate): first
+  # row per path wins, RRF k=60 for hybrid, raw scores otherwise.
+  awk -F '\t' -v lexical_file="$lexical_rank" -v semantic_file="$semantic_rank" -v strategy="$strategy" -v semantic_ok="$semantic_ok" '
+    FILENAME == lexical_file { if (!($1 in lexical_position)) { lexical_position[$1] = $2; lexical_score[$1] = $3 } next }
+    FILENAME == semantic_file { if (!($1 in semantic_position)) { semantic_position[$1] = $2; semantic_score[$1] = $3 } next }
+    $0 == "" { next }
+    {
+      rel = $0; lp = (rel in lexical_position) ? lexical_position[rel] : ""; sp = (rel in semantic_position) ? semantic_position[rel] : ""
+      if (strategy == "vector") final = (rel in semantic_score && semantic_score[rel] != "") ? semantic_score[rel] : "0"
+      else if (semantic_ok == "1") { value = 0; if (lp != "") value += 1 / (60 + lp); if (sp != "") value += 1 / (60 + sp); final = sprintf("%.12f", value) }
+      else final = (rel in lexical_score && lexical_score[rel] != "") ? lexical_score[rel] : "0"
+      printf "B\t%s\t%s\t%s\t%s\n", rel, final, lp, sp
+    }
+  ' "$lexical_rank" "$semantic_rank" "$union" >>"$base_records"
   sort -t $'\t' -k3,3nr -k2,2 "$base_records" -o "$base_records"
 
   if [ "$expand_graph" = "1" ]; then
@@ -6345,7 +6539,7 @@ cmd_search() {
           target_rel="$(resolve_graph_target "$dir" "$target" 2>/dev/null || true)"
           [ -n "$target_rel" ] || continue
           [ "$target_rel" != "$rel" ] || continue
-          search_file_eligible "$dir" "$dir/$target_rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
+          search_eligible_memo "$dir" "$dir/$target_rel" "$include_proposed" "$include_cold" "$topic" "$historical" "$as_of" "$principal" || continue
           graph_score="$(awk -v value="$score" 'BEGIN { printf "%.12f", value * 0.5 }')"
           printf 'G\t%s\t%s\t%s\t%s\n' "$target_rel" "$graph_score" "$rel" "$relation" >>"$graph_records"
           graph_candidate_count=$((graph_candidate_count + 1))
@@ -6437,10 +6631,20 @@ cmd_search() {
   else
     printf 'path\tscore\ttype\tstate\tstatus\ttrust\tfreshness\tsensitivity\ttitle\n'
   fi
+  # Facts for every row to render come from one `okf facts-list` call; a row
+  # whose batched line does not name it falls back to a per-file call.
+  local facts_batch="$tmp_dir/facts.list" facts_path=""
+  head -n "$limit" "$final_ranked" | while IFS=$'\t' read -r rel _; do [ -z "$rel" ] || printf '%s/%s\n' "$dir" "$rel"; done >"$tmp_dir/facts.paths"
+  okf facts-list "$tmp_dir/facts.paths" >"$facts_batch" 2>/dev/null || : >"$facts_batch"
+  exec 5<"$facts_batch"
   while IFS=$'\t' read -r rel score lexical_position semantic_position graph_source graph_relation; do
     [ -n "$rel" ] || continue
     local facts type status trust freshness generated_at stale_after source_count runtime
-    file="$dir/$rel"; facts="$(okf facts "$file")"; IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
+    file="$dir/$rel"
+    IFS= read -r facts <&5 || facts=""
+    facts_path="${facts%%$'\t'*}"
+    if [ -n "$facts" ] && [ "$facts_path" = "$file" ]; then facts="${facts#*$'\t'}"; else facts="$(okf facts "$file")"; fi
+    IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
     if [ "$exploratory" = "1" ] && grep -Fqx -- "$title" "$seen_titles"; then continue; fi
     [ "$exploratory" = "0" ] || printf '%s\n' "$title" >>"$seen_titles"
     if [ "$require_evidence" = "1" ]; then
@@ -6473,6 +6677,7 @@ cmd_search() {
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title"
     fi
   done < <(head -n "$limit" "$final_ranked")
+  exec 5<&-
   if [ -s "$selected_evidence" ]; then
     evidence_refs="$(sort -u "$selected_evidence" | paste -sd, -)"
   else

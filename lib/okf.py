@@ -805,6 +805,50 @@ def command_field(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_facts_list(args: argparse.Namespace) -> int:
+    """`facts` for every listed path, one "PATH<TAB>FACTS" line each, so a
+    search renders its result rows with one interpreter start.  Any failure
+    or multi-line value fails the whole call; callers then fall back to
+    per-file `facts`."""
+    try:
+        paths = Path(args.paths_file).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise OkfError(f"invalid paths file: {exc}") from exc
+    rows = []
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        text = facts_text(Path(raw_path))
+        if "\n" in text or "\n" in raw_path or "\t" in raw_path:
+            raise OkfError("facts value is not a single line")
+        rows.append(raw_path + "\t" + text)
+    for row in rows:
+        print(row)
+    return 0
+
+
+def command_valid_batch(args: argparse.Namespace) -> int:
+    """One line per input path: "1<TAB>path" when `field PATH type` would
+    succeed, "0<TAB>path" when it would fail.  Lets a search validate every
+    candidate with one interpreter start instead of one per record."""
+    try:
+        paths = Path(args.paths_file).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise OkfError(f"invalid paths file: {exc}") from exc
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        ok = "1"
+        try:
+            metadata, _ = split_frontmatter(Path(raw_path))
+            if isinstance(metadata, dict) and "type" in metadata:
+                scalar_text(metadata["type"])
+        except Exception:  # noqa: BLE001 - any failure means "not valid", as with `field`
+            ok = "0"
+        print(ok + "\t" + raw_path)
+    return 0
+
+
 class LifecycleResolver:
     """Small, read-only resolver shared by capsule and retrieval metadata.
 
@@ -1861,6 +1905,14 @@ def parser() -> argparse.ArgumentParser:
     field.add_argument("file")
     field.add_argument("key")
     field.set_defaults(func=command_field)
+
+    valid_batch = commands.add_parser("valid-batch")
+    valid_batch.add_argument("paths_file")
+    valid_batch.set_defaults(func=command_valid_batch)
+
+    facts_list = commands.add_parser("facts-list")
+    facts_list.add_argument("paths_file")
+    facts_list.set_defaults(func=command_facts_list)
 
     dependency_snapshot = commands.add_parser("dependency-snapshot")
     dependency_snapshot.add_argument("root")

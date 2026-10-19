@@ -74,6 +74,7 @@ core_checks() {
     bash "$repo_root/tests/okf-self-check.sh" -- \
     bash "$repo_root/tests/index-facts-batch-self-check.sh" -- \
     bash "$repo_root/tests/search-help-self-check.sh" -- \
+    bash "$repo_root/tests/search-perf-self-check.sh" -- \
     bash "$repo_root/tests/v3-self-check.sh" -- \
     bash "$repo_root/tests/reflection-scheduler-self-check.sh" -- \
     bash "$repo_root/tests/work-self-check.sh" -- \
