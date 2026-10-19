@@ -166,6 +166,11 @@ printf '%s\n' "$applied" | grep -Fq "$secret_value" && fail 'secret printed'
 "$cli" --root "$vault" lint >"$fixture/lint.out" 2>&1 || true
 grep -Ei "lint:error.*(audit|frontmatter|malformed)" "$fixture/lint.out" && fail "audit chain or frontmatter invalid after apply"
 grep -c "lint:error" "$fixture/lint.out" | grep -qx 1 || { cat "$fixture/lint.out" >&2; fail "unexpected lint errors (only the tampered fixture may fail)"; }
+"$cli" --root "$vault" export knowledge-catalog "$project_id" >/dev/null
+[ -f "$project_dir/exports/knowledge-catalog/documents/claims/cool_ok.md" ] || fail 'catalog export missing a normal record'
+[ ! -e "$project_dir/exports/knowledge-catalog/documents/claims/personal.md" ] || fail 'private record exported to the catalog'
+"$cli" --root "$vault" export bundle "$project_id" >/dev/null
+tar -tzf "$project_dir/exports/${project_id}-okf.tar.gz" | grep -Fq 'okf/claims/personal.md' && fail 'private record exported in the bundle'
 private_hits="$("$cli" --root "$vault" search "$project_id" "medication breakfast" --principal someone-else 2>/dev/null || true)"
 printf '%s\n' "$private_hits" | grep -Fq 'okf/claims/personal.md' && fail 'private record visible to another principal'
 

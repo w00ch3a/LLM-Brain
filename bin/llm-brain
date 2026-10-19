@@ -7625,6 +7625,8 @@ cmd_export() {
       out="$dir/exports/knowledge-catalog"; stage="$(mktemp -d "$dir/exports/.knowledge-catalog.XXXXXX")"; mkdir -p "$stage/documents"
       while IFS= read -r file; do
         local rel
+        # 0.11 private tier: owner-only records never leave the brain.
+        [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || continue
         rel="${file#"$dir"/okf/}"
         mkdir -p "$stage/documents/$(dirname "$rel")"
         cp "$file" "$stage/documents/$rel"
@@ -7650,6 +7652,10 @@ cmd_export() {
       local bundle_dir rel file
       out="$dir/exports/${project_id}-okf.tar.gz"; stage="${out}.tmp.$$"; bundle_dir="$(mktemp -d "$dir/exports/.bundle.XXXXXX")"
       cp -R "$dir/okf" "$bundle_dir/okf"
+      # 0.11 private tier: owner-only records never leave the brain.
+      while IFS= read -r file; do
+        [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || rm -f "$file"
+      done < <(find "$bundle_dir/okf" -type f -name '*.md')
       {
         printf 'schema_version\t%s\n' "$SCHEMA_VERSION"
         printf 'project_id\t%s\n' "$project_id"
