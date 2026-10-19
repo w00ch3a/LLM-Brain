@@ -107,7 +107,7 @@ or vault migration is added.
   scorer.
 - **Hybrid confidence gate and fusion weight (0.10).** Hybrid search skips
   the embedder when lexical search is already sure: if the top BM25F score
-  beats the second by a margin `(top - second) / top` of at least 0.1 (a lone
+  beats the second by a margin `(top - second) / top` of at least 0.2 (a lone
   match counts as 1), it keeps the lexical order and records
   `retrieval_mode=hybrid-lexical`. Otherwise it adds `W / (60 + vector rank)`
   to `1 / (60 + lexical rank)`. Set the gate with

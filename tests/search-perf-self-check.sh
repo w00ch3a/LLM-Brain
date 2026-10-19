@@ -138,10 +138,10 @@ for strategy in hybrid lexical; do
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
   # The vector weight only touches hybrid fusion (default 1, recorded), and
-  # the default lexical confidence gate (0.1) is recorded with its margin.
+  # the default lexical confidence gate (0.2) is recorded with its margin.
   if [ "$strategy" = hybrid ]; then
     grep -qx 'vector_weight=1' "$fixture/hybrid.meta" || fail "hybrid: default vector weight not recorded"
-    grep -qx 'vector_gate=0.1' "$fixture/hybrid.meta" || fail "hybrid: default vector gate not recorded"
+    grep -qx 'vector_gate=0.2' "$fixture/hybrid.meta" || fail "hybrid: default vector gate not recorded"
     run_search hybrid-w05 hybrid --vector-weight 0.5
     grep -qx 'vector_weight=0.5' "$fixture/hybrid-w05.meta" || fail "hybrid: --vector-weight not applied"
   else

@@ -6518,7 +6518,7 @@ cmd_search() {
   local topic="" limit=20 include_proposed=0 include_cold=0 strategy="lexical" query_embedder="$QUERY_EMBEDDER" expand_graph=0 historical=0 explain=0 metadata_file="" receipt_file="" as_of="" intent="legacy" principal="" require_evidence=0 exploratory=0 evidence_refs=""
   local usage_boost="${LLM_BRAIN_USAGE_BOOST:-0}" diversity_reserve="${LLM_BRAIN_DIVERSITY_RESERVE:-2}" diversity_reserved=0 path_matched=0 lexical_scorer="${LLM_BRAIN_LEXICAL_SCORER:-bm25f}"
   local -a path_hints=() with_labels=() without_labels=()
-  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.1}" vector_gate_skip=0 lexical_margin=""
+  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.2}" vector_gate_skip=0 lexical_margin=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
