@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -385,6 +386,8 @@ def bm25_rows(
     optionally maps a path to its already parsed (metadata, body); it must
     come from the same bytes bm25_fields would read."""
     project = Path(project_dir).resolve()
+    if lexical_profile() != "legacy":
+        return bm25_rows_v2(project, paths, query, hint_paths, parsed)
     terms = query_terms(query)
     phrase = query.strip().lower()
     hints = hints_from(query, hint_paths)
@@ -438,6 +441,316 @@ def bm25_rows(
             idf = math.log(1.0 + (total - df + 0.5) / (df + 0.5))
             score += idf * combined / (BM25_K1 + combined)
         if score > 0 and len(terms) > 1 and phrase and any(phrase in lowered[name] for name in lowered):
+            score += PHRASE_BONUS
+        matched = path_matches(globs, hints) if globs and hints else ""
+        if matched:
+            score += PATH_BOOST
+        if score > 0:
+            rows.append((rel, round(score, 6), matched))
+    rows.sort(key=lambda row: (-row[1], row[0]))
+    return rows
+
+
+# ------------------------------------------------- lexical profile "v2"
+#
+# LLM_BRAIN_LEXICAL_PROFILE selects the BM25F variant.  "legacy" is the
+# 0.8-0.10 scorer above, byte for byte.  "v2" (the default) keeps the same
+# fields, weights and boosts and changes only what was measured to help on
+# held-out dev sets (see docs/guide.md): a small English suffix stemmer in
+# place of prefix matching, two-character and numeric tokens, accent
+# folding, camelCase parts of identifiers, a lower k1, and a bonus for identifier-like query spans (versions, hosts, error codes,
+# file names, kebab/snake identifiers) found intact in a record.  Pure
+# stdlib, no model, no index; the per-query cost stays linear in the vault.
+
+LEXICAL_PROFILES = ("legacy", "v2")
+DEFAULT_LEXICAL_PROFILE = "v2"
+V2_RAW_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+V2_CAMEL_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+V2_IDENT_RE = re.compile(
+    r"[A-Za-z0-9]+(?:[._:/@#-][A-Za-z0-9]+)+|[A-Za-z]+[0-9][A-Za-z0-9]*|[0-9]+[A-Za-z][A-Za-z0-9]*"
+)
+V2_PARAMS: dict[str, Any] = {
+    "k1": 0.9,
+    "min_len": 2,
+    "substring": 0.5,
+    "ident": 0.5,
+}
+_V2_STEMS: dict[str, str] = {}
+# Structural extensions of v2 (on by default; set the variable to 0 to turn
+# one off; ignored by the legacy profile).
+V2_ANCHOR_WEIGHT = 1.0
+V2_ANCHOR_B = 0.5
+V2_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\s]+)\)|\[\[([^\]\n]+)\]\]")
+
+
+def v2_flag(name: str) -> bool:
+    """v2 structural extension switch: on unless set to 0."""
+    value = os.environ.get(name, "") or "1"
+    if value not in ("0", "1"):
+        raise SystemExit(f"memory-signals: {name} must be 0 or 1")
+    return value == "1"
+
+
+def v2_anchor_texts(items: list[tuple[str, dict[str, str], dict[str, Any]]]) -> dict[str, str]:
+    """Link anchors per target: the link text plus the linking record's title
+    for every markdown or [[wiki]] link that resolves to another record of
+    this pass (exact project-relative path, path suffix or unique basename)."""
+    by_rel = {rel: rel for rel, _, _ in items}
+    by_base: dict[str, list[str]] = defaultdict(list)
+    for rel, _, _ in items:
+        base = rel.rsplit("/", 1)[-1]
+        by_base[base[:-3] if base.endswith(".md") else base].append(rel)
+    anchors: dict[str, list[str]] = defaultdict(list)
+    for rel, fields, _ in items:
+        for match in V2_LINK_RE.finditer(fields["body"]):
+            text = match.group(1) or ""
+            target = (match.group(2) or match.group(3) or "").split("#", 1)[0].split("|", 1)[0].strip()
+            while target.startswith("./"):
+                target = target[2:]
+            if not target or "://" in target:
+                continue
+            found = by_rel.get(target)
+            if found is None:
+                suffix = [item for item in by_rel if item.endswith("/" + target)]
+                if len(suffix) == 1:
+                    found = suffix[0]
+            if found is None:
+                base = target.rsplit("/", 1)[-1]
+                base = base[:-3] if base.endswith(".md") else base
+                if len(by_base.get(base, ())) == 1:
+                    found = by_base[base][0]
+            if found is None or found == rel:
+                continue
+            anchors[found].append(" ".join(part for part in (text, fields["title"]) if part))
+    return {rel: " ".join(values) for rel, values in anchors.items()}
+
+
+def v2_state_order(documents: list[Any], metas: list[dict[str, Any]], scores: list[float]) -> None:
+    """Within a brain_state_key group whose members all carry an explicit
+    brain_valid_from or brain_observed_at, hand the group's scores to its
+    members newest first.  Other records keep their scores; a group with any
+    undated member is left alone (missing validity is not a date)."""
+    groups: dict[str, list[int]] = defaultdict(list)
+    for index, metadata in enumerate(metas):
+        key = clean(metadata.get("brain_state_key"))
+        if key and scores[index] > 0:
+            groups[key].append(index)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        dated = []
+        for index in members:
+            moment = parse_time(metas[index].get("brain_valid_from")) or parse_time(metas[index].get("brain_observed_at"))
+            if moment is None:
+                break
+            dated.append((moment, index))
+        else:
+            ordered = [index for _, index in sorted(dated, key=lambda item: (-item[0].timestamp(), documents[item[1]][0]))]
+            values = sorted((scores[index] for index in members), reverse=True)
+            previous = None
+            for index, value in zip(ordered, values):
+                # Strictly below the newer sibling, so equal scores cannot
+                # fall back to path order (rows are rounded to 6 places).
+                if previous is not None and value > previous - 1e-5:
+                    value = max(previous - 1e-5, 1e-6)
+                scores[index] = previous = value
+
+
+def lexical_profile() -> str:
+    value = os.environ.get("LLM_BRAIN_LEXICAL_PROFILE", "") or DEFAULT_LEXICAL_PROFILE
+    if value not in LEXICAL_PROFILES:
+        raise SystemExit("memory-signals: LLM_BRAIN_LEXICAL_PROFILE must be legacy or v2")
+    return value
+
+
+def v2_stem(word: str) -> str:
+    """Deterministic light English suffix stripper (plural, -ing, -ed, -ly,
+    final -e, -y -> -i).  Conservative on purpose: short words and numbers
+    are left alone, and both records and queries go through the same rules,
+    so a crude stem is harmless as long as it is consistent."""
+    hit = _V2_STEMS.get(word)
+    if hit is not None:
+        return hit
+    stem = word
+    if len(stem) > 3 and not stem.isdigit():
+        if stem.endswith("ies") and len(stem) > 4:
+            stem = stem[:-3] + "y"
+        elif stem.endswith("sses"):
+            stem = stem[:-2]
+        elif stem.endswith("es") and len(stem) > 4 and (stem[-3] in "sxz" or stem[-4:-2] in ("ch", "sh")):
+            stem = stem[:-2]
+        elif stem.endswith("s") and not stem.endswith(("ss", "us", "is")):
+            stem = stem[:-1]
+        if len(stem) > 5 and stem.endswith("ing"):
+            stem = stem[:-3]
+            if len(stem) > 2 and stem[-1] == stem[-2] and stem[-1] not in "lsz":
+                stem = stem[:-1]
+        elif len(stem) > 4 and stem.endswith("ed") and not stem.endswith("eed"):
+            stem = stem[:-2]
+            if len(stem) > 2 and stem[-1] == stem[-2] and stem[-1] not in "lsz":
+                stem = stem[:-1]
+        if len(stem) > 5 and stem.endswith("ly"):
+            stem = stem[:-2]
+        if len(stem) > 4 and stem.endswith("e"):
+            stem = stem[:-1]
+        if len(stem) > 3 and stem.endswith("y"):
+            stem = stem[:-1] + "i"
+    _V2_STEMS[word] = stem
+    return stem
+
+
+def v2_fold(text: str) -> str:
+    """Accents folded to ASCII (café -> cafe); ASCII text is returned as is."""
+    if text.isascii():
+        return text
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def v2_tokens(text: str) -> list[str]:
+    """Stemmed tokens of an already folded text.  Mixed-case identifiers
+    also contribute their camelCase parts (getUserName -> getusername, get,
+    user, name); snake_case and kebab-case already split on punctuation."""
+    minimum = V2_PARAMS["min_len"]
+    out: list[str] = []
+    for raw in V2_RAW_TOKEN_RE.findall(text):
+        token = raw.lower()
+        if len(token) >= minimum or token.isdigit():
+            out.append(v2_stem(token))
+        if not raw.islower() and not raw.isupper() and not raw.isdigit():
+            parts = V2_CAMEL_RE.findall(raw)
+            if len(parts) > 1:
+                for part in parts:
+                    part = part.lower()
+                    if len(part) >= minimum or part.isdigit():
+                        out.append(v2_stem(part))
+    return out
+
+
+def v2_query_terms(query: str) -> list[str]:
+    seen: list[str] = []
+    for token in v2_tokens(v2_fold(query)):
+        if token not in seen:
+            seen.append(token)
+    return seen
+
+
+def v2_ident_spans(query: str) -> list[str]:
+    seen: list[str] = []
+    for match in V2_IDENT_RE.finditer(v2_fold(query)):
+        span = match.group(0).lower()
+        if span not in seen:
+            seen.append(span)
+    return seen
+
+
+def bm25_rows_v2(
+    project: Path,
+    paths: list[str],
+    query: str,
+    hint_paths: list[str],
+    parsed: dict[str, tuple[dict[str, Any], str]] | None,
+) -> list[tuple[str, float, str]]:
+    terms = v2_query_terms(query)
+    phrase = v2_fold(query.strip().lower())
+    phrase_terms = len(query_terms(query))
+    hints = hints_from(query, hint_paths)
+    names = tuple(BM25_FIELD_WEIGHTS)
+    anchors_on = v2_flag("LLM_BRAIN_LEXICAL_ANCHORS")
+    state_order_on = v2_flag("LLM_BRAIN_LEXICAL_STATE_ORDER")
+    weights = dict(BM25_FIELD_WEIGHTS)
+    b_values = dict(BM25_B)
+    score_names = names
+    if anchors_on:
+        weights["anchor"] = V2_ANCHOR_WEIGHT
+        b_values["anchor"] = V2_ANCHOR_B
+        score_names = names + ("anchor",)
+    items: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    for item in paths:
+        path = Path(item)
+        try:
+            if parsed is not None and item in parsed:
+                fields, metadata = bm25_fields_from(*parsed[item])
+            else:
+                fields, metadata = bm25_fields(path)
+        except (OSError, okf.OkfError):
+            continue
+        try:
+            rel = path.resolve().relative_to(project).as_posix()
+        except ValueError:
+            continue
+        items.append((rel, fields, metadata))
+    anchor_texts = v2_anchor_texts(items) if anchors_on else {}
+    documents: list[tuple[str, dict[str, Any], dict[str, str], dict[str, str], dict[str, int], list[str]]] = []
+    metas: list[dict[str, Any]] = []
+    for rel, fields, metadata in items:
+        if anchors_on:
+            fields = dict(fields, anchor=anchor_texts.get(rel, ""))
+        folded = {name: v2_fold(fields[name]) for name in score_names}
+        lowered = {name: folded[name].lower() for name in score_names}
+        counts: dict[str, dict[str, int]] = {}
+        joined: dict[str, str] = {}
+        lengths: dict[str, int] = {}
+        for name in score_names:
+            field_tokens = v2_tokens(folded[name])
+            lengths[name] = len(field_tokens)
+            table: dict[str, int] = {}
+            for token in field_tokens:
+                table[token] = table.get(token, 0) + 1
+            counts[name] = table
+            joined[name] = " ".join(table)
+        documents.append((rel, counts, joined, lowered, lengths, ref_list(metadata.get("brain_paths"))))
+        metas.append(metadata)
+    total = len(documents)
+    if total == 0:
+        return []
+    k1 = V2_PARAMS["k1"]
+    substring = V2_PARAMS["substring"]
+    average = {name: max(sum(doc[4][name] for doc in documents) / total, 1.0) for name in score_names}
+    scores = [0.0] * total
+    for term in terms:
+        per_doc: list[tuple[int, dict[str, float]]] = []
+        for index, (_, counts, joined, _, _, _) in enumerate(documents):
+            values: dict[str, float] = {}
+            for name in score_names:
+                count = counts[name].get(term, 0)
+                if count:
+                    values[name] = float(count)
+                elif substring > 0 and term in joined[name]:
+                    # Kept from the legacy scorer at a discount: a term
+                    # glued inside a longer token still counts a little.
+                    values[name] = substring
+            if values:
+                per_doc.append((index, values))
+        if not per_doc:
+            continue
+        df = len(per_doc)
+        idf = math.log(1.0 + (total - df + 0.5) / (df + 0.5))
+        for index, values in per_doc:
+            lengths = documents[index][4]
+            combined = 0.0
+            for name, value in values.items():
+                b = b_values[name]
+                normaliser = 1.0 - b + b * (lengths[name] / average[name])
+                combined += weights[name] * value / max(normaliser, 1e-9)
+            if combined > 0:
+                scores[index] += idf * combined / (k1 + combined)
+    ident = V2_PARAMS["ident"]
+    if ident > 0:
+        for span in v2_ident_spans(query):
+            pattern = re.compile(r"(?<![a-z0-9])" + re.escape(span) + r"(?![a-z0-9])")
+            hits = [index for index, doc in enumerate(documents) if any(pattern.search(doc[3][name]) for name in names)]
+            if not hits:
+                continue
+            df = len(hits)
+            idf = math.log(1.0 + (total - df + 0.5) / (df + 0.5))
+            for index in hits:
+                scores[index] += ident * idf
+    if state_order_on:
+        v2_state_order(documents, metas, scores)
+    rows: list[tuple[str, float, str]] = []
+    for index, (rel, _, _, lowered, _, globs) in enumerate(documents):
+        score = scores[index]
+        if score > 0 and phrase_terms > 1 and phrase and any(phrase in lowered[name] for name in names):
             score += PHRASE_BONUS
         matched = path_matches(globs, hints) if globs and hints else ""
         if matched:
