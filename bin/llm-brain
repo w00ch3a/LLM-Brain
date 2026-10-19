@@ -256,7 +256,9 @@ sha256_file() {
   # sha256sum (C) first: same digest and output format as shasum (Perl),
   # which costs about 10 ms more to start on every call.
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    local sha256_line
+    sha256_line="$(sha256sum "$1")" || return
+    printf '%s\n' "${sha256_line%% *}"
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
   else
@@ -359,6 +361,19 @@ replication_helper() {
 
 bridge_utf8_prefix() {
   local limit="$1" py
+  # With a private scratch file (bridge rendering sets one), an all-ASCII
+  # prefix is already what the decode below returns: skip the Python start.
+  if [ -n "${BRIDGE_UTF8_SCRATCH:-}" ]; then
+    cat >"$BRIDGE_UTF8_SCRATCH"
+    case "$(head -c "$limit" "$BRIDGE_UTF8_SCRATCH" | LC_ALL=C tr -d '\000-\177' | wc -c)" in
+      *[1-9]*) ;;
+      *) head -c "$limit" "$BRIDGE_UTF8_SCRATCH"; return ;;
+    esac
+    py="$(bridge_python)"
+    [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for bridge context rendering"
+    "$py" -c 'import sys; limit=int(sys.argv[1]); sys.stdout.write(sys.stdin.buffer.read()[:limit].decode("utf-8", "ignore"))' "$limit" <"$BRIDGE_UTF8_SCRATCH"
+    return
+  fi
   py="$(bridge_python)"
   [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for bridge context rendering"
   "$py" -c 'import sys; limit=int(sys.argv[1]); sys.stdout.write(sys.stdin.buffer.read()[:limit].decode("utf-8", "ignore"))' "$limit"
@@ -1345,7 +1360,7 @@ bridge_search_evidence() {
   if [ "$strategy" = hybrid ] || [ "$strategy" = vector ]; then
     if [ "$index_current" = 1 ] && [ -n "$QUERY_EMBEDDER" ] && [ -x "$QUERY_EMBEDDER" ]; then
       query_input="$tmp/query.txt"; query_vector="$tmp/query.vector"; printf '%s\n' "$query" >"$query_input"
-      if "$QUERY_EMBEDDER" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
+      if query_embed "$QUERY_EMBEDDER" "$query_input" "$query_vector" "$query" && valid_embedding_file "$query_vector"; then
         query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
         bridge_vector_scores "$index" "$query_vector" "$query_model" "$query_dimensions" "$principal" "$semantic_raw"
         sort -t $'\t' -k2,2nr -k3,3r -k1,1 "$semantic_raw" | awk -F '\t' '{ print $1 "\t" NR "\t" $2 "\t" $3 "\t" $4 }' >"$semantic_rank"
@@ -1380,10 +1395,27 @@ bridge_search_evidence() {
   rm -rf "$tmp"
 }
 
+# Run EMBEDDER on INPUT (the QUERY line) into OUTPUT. Within one bridge recall
+# (QUERY_VECTOR_MEMO set) the evidence pass reuses the canonical pass's
+# successful answer for the same embedder and query instead of starting it
+# again.
+query_embed() {
+  local embedder="$1" input="$2" output="$3" query="$4"
+  if [ -n "${QUERY_VECTOR_MEMO:-}" ] && [ "${QUERY_VECTOR_MEMO_KEY:-}" = "$embedder"$'\n'"$query" ] && [ -f "$QUERY_VECTOR_MEMO" ]; then
+    cp "$QUERY_VECTOR_MEMO" "$output"
+    return
+  fi
+  "$embedder" "$input" >"$output" 2>/dev/null || return
+  if [ -n "${QUERY_VECTOR_MEMO:-}" ] && cp "$output" "$QUERY_VECTOR_MEMO" 2>/dev/null; then
+    QUERY_VECTOR_MEMO_KEY="$embedder"$'\n'"$query"
+  fi
+  return 0
+}
+
 bridge_render_context() {
   local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title lexical_rank semantic_rank graph_source graph_relation authority index_status excerpt claims claims_file evidence_refs evidence_file excerpt_bytes next_payload warning_bytes evidence_started=0 observed observed_line resolution_mode view_tmp final_resolution_note="" intent principal state_reason effective_ref evidence_group independent_count correlated_count provenance_state lifecycle_bundle lifecycle_warnings state_warnings raw_line visible_results visible_evidence_refs visible_evidence_ref first_visible
-  local header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$"
-  local context_bytes context_selected_count=0 context_rendered_count=0 context_truncated=false bounded_context render_results rendered_refs="" evidence_opened=false evidence_incomplete=false verified_hash evidence_rendered_count=0 evidence_visible_count=0 warning_line
+  local header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$" BRIDGE_UTF8_SCRATCH="${output}.utf8.$$"
+  local block_bytes=0 context_bytes context_selected_count=0 context_rendered_count=0 context_truncated=false bounded_context render_results rendered_refs="" evidence_opened=false evidence_incomplete=false verified_hash evidence_rendered_count=0 evidence_visible_count=0 warning_line
   require_project "$project_id" dir
   max_bytes=$((budget * 4))
   resolution_mode="$(awk -F= '$1 == "resolution_mode" { print $2; exit }' "$metadata" 2>/dev/null || printf static)"
@@ -1506,8 +1538,8 @@ bridge_render_context() {
         claims="$(sed '1{/^derived=/d;}' "$claims_file" | sed '/^[[:space:]]*$/d; s/^/- /')"
       fi
     fi
-    observed="$(frontmatter_field "$dir/$path" brain_observed_at)"; observed_line=""; [ -z "$observed" ] || observed_line="Observed: \`$observed\`\n"
-    excerpt_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
+    fm_get observed "$dir/$path" brain_observed_at; observed_line=""; [ -z "$observed" ] || observed_line="Observed: \`$observed\`\n"
+    excerpt_bytes=$(( $(printf '%s' "$excerpt" | wc -c) ))
     lifecycle_warnings="$(lifecycle_bundle_warning_text "$lifecycle_bundle" 2>/dev/null || true)"
     {
       [ -z "$lifecycle_warnings" ] || printf '%s\n\n' "$lifecycle_warnings"
@@ -1519,7 +1551,8 @@ bridge_render_context() {
     next_payload=$((evidence_payload_bytes + excerpt_bytes))
     printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
     [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
-    if [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -gt "$max_bytes" ]; then
+    block_bytes=$(( $(wc -c <"$block") ))
+    if [ $((used_bytes + block_bytes + $(wc -c <"$footer"))) -gt "$max_bytes" ]; then
       context_truncated=true
       if [ -n "$lifecycle_warnings" ]; then
         warning_bytes="$(printf '%s\n\n' "$lifecycle_warnings" | wc -c | tr -d ' ')"
@@ -1531,7 +1564,7 @@ bridge_render_context() {
       break
     fi
     cat "$block" >>"$output"
-    used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
+    used_bytes=$((used_bytes + block_bytes))
     context_rendered_count=$((context_rendered_count + 1))
     rendered_refs="${rendered_refs}${rendered_refs:+,}${path}"
     evidence_payload_bytes="$next_payload"
@@ -1548,7 +1581,7 @@ bridge_render_context() {
       verified_hash="$(bridge_verified_source_hash "$dir" "$evidence_file" "$principal" 2>/dev/null || true)"
       if [ -z "$verified_hash" ]; then evidence_incomplete=true; continue; fi
       excerpt="$(body_after_frontmatter "$dir/$evidence_file" 2>/dev/null | bridge_utf8_prefix 800)"
-      excerpt_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
+      excerpt_bytes=$(( $(printf '%s' "$excerpt" | wc -c) ))
       {
         [ "$evidence_started" = 1 ] || printf '%s\n\n' '### Supporting evidence'
         printf 'Evidence: `%s`\n\n%s\n\nHash: `%s`\n\n' "$evidence_file" "$excerpt" "$(sha256_file "$dir/$evidence_file")"
@@ -1556,12 +1589,13 @@ bridge_render_context() {
       next_payload=$((evidence_payload_bytes + excerpt_bytes))
       printf 'Planner evidence bytes: %s; conservative token estimate: %s.\n' "$next_payload" "$(( (next_payload + 3) / 4 ))" >"$footer"
       [ -z "$final_resolution_note" ] || printf '%s\n' "$final_resolution_note" >>"$footer"
-      if [ $((used_bytes + $(wc -c <"$block" | tr -d ' ') + $(wc -c <"$footer" | tr -d ' '))) -gt "$max_bytes" ]; then
+      block_bytes=$(( $(wc -c <"$block") ))
+      if [ $((used_bytes + block_bytes + $(wc -c <"$footer"))) -gt "$max_bytes" ]; then
         context_truncated=true
         break
       fi
       cat "$block" >>"$output"
-      used_bytes=$((used_bytes + $(wc -c <"$block" | tr -d ' ')))
+      used_bytes=$((used_bytes + block_bytes))
       evidence_payload_bytes="$next_payload"
       evidence_started=1
       evidence_opened=true
@@ -3497,7 +3531,8 @@ cmd_bridge() {
       # (removed with $tmp) between search, evidence and context rendering.
       local MAINT_FIELDS_CACHE_STRIP="${MAINT_FIELDS_CACHE_STRIP:-}"
       if [ -z "${MAINT_FIELDS_CACHE_DIR:-}" ] && mkdir "$tmp/fields"; then MAINT_FIELDS_CACHE_STRIP="$dir/"; fi
-      local MAINT_FIELDS_CACHE_DIR="${MAINT_FIELDS_CACHE_DIR:-$tmp/fields}"
+      local MAINT_FIELDS_CACHE_DIR="${MAINT_FIELDS_CACHE_DIR:-$tmp/fields}" SEARCH_FIELDS_PREWARM_DIR="$tmp/fields"
+      local QUERY_VECTOR_MEMO="$tmp/query.vector.memo" QUERY_VECTOR_MEMO_KEY=""
       local -a search_args
       search_args=("$id" "$query" "--limit" "20" "--strategy" "$requested_strategy" "--metadata-file" "$metadata" "--intent" "$intent" "--explain")
       [ -z "$principal" ] || search_args+=("--principal" "$principal")
@@ -3554,7 +3589,10 @@ cmd_bridge() {
       fi
       bridge_render_context "$id" "$results" "$metadata" "$budget" "$context"
       # 0.10: matching "already ruled out" approaches (empty for most vaults).
-      memory_lineage recall-extras --project-dir "$dir" --principal "$principal" --task "$query" >>"$context" 2>/dev/null || true
+      # Both ledgers are optional; without either, recall-extras prints nothing.
+      if [ -f "$dir/ruled-out/items.tsv" ] || [ -f "$dir/lineage/labels.tsv" ]; then
+        memory_lineage recall-extras --project-dir "$dir" --principal "$principal" --task "$query" >>"$context" 2>/dev/null || true
+      fi
       retrieval_receipt "$receipt_file" bridge-recall "$id" "$query" "$metadata" "$(tail -n +2 "$results" | cut -f1)" || say_error "retrieval receipt unavailable"
       actual_strategy="$(awk -F= '$1 == "retrieval_mode" { print $2; exit }' "$metadata")"; [ -n "$actual_strategy" ] || actual_strategy=lexical
       degraded="$(awk -F= '$1 == "degraded" { print $2; exit }' "$metadata")"; [ -n "$degraded" ] || degraded=true
@@ -5455,7 +5493,7 @@ bridge_render_record_visible() {
   esac
   file="$dir/$path"
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  sensitivity="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+  fm_get sensitivity "$file" brain_sensitivity sensitivity
   [ "$sensitivity" != restricted ] || return 1
   principal_visible "$file" "$principal"
 }
@@ -5528,7 +5566,10 @@ state_resolution_for_file() {
   [ "$(file_conflict_state "$file" "${SEARCH_GRAPH_FILE:-}")" = "conflicted" ] && { STATE_RESOLUTION="unresolved-conflict"; STATE_REASON="explicit-conflict"; return 0; }
   brain_temporal_eligible "$file" "$as_of" 0 || { STATE_RESOLUTION="historical"; STATE_REASON="outside-validity"; return 0; }
 
-  for chain_ref in "$(frontmatter_field "$file" brain_supersedes)" "$(frontmatter_field "$file" brain_version_of)"; do
+  local chain_supersedes chain_version_of depends_on
+  fm_get chain_supersedes "$file" brain_supersedes
+  fm_get chain_version_of "$file" brain_version_of
+  for chain_ref in "$chain_supersedes" "$chain_version_of"; do
     [ -n "$chain_ref" ] || continue
     chain_file="$(canonical_ref_file "$dir" "$chain_ref" 2>/dev/null || true)"
     [ -n "$chain_file" ] || { STATE_RESOLUTION="unresolved-dependency"; STATE_REASON="missing-lineage"; return 0; }
@@ -5542,14 +5583,15 @@ state_resolution_for_file() {
 
   file_superseded_by_current_memory "$dir" "$file" && { STATE_RESOLUTION="historical"; STATE_REASON="superseded"; return 0; }
 
-  state_key="$(frontmatter_field "$file" brain_state_key)"
+  fm_get state_key "$file" brain_state_key
   if [ -n "$state_key" ]; then
     while IFS= read -r other; do
       [ "$other" = "$file" ] && continue
-      [ "$(frontmatter_field "$other" brain_state_key)" = "$state_key" ] || continue
+      fm_get other_key "$other" brain_state_key
+      [ "$other_key" = "$state_key" ] || continue
       canonical_file_effective "$dir" "$other" || continue
       state_visible_eligible "$dir" "$other" "$as_of" "$principal" || continue
-      other_key="$(frontmatter_field "$other" brain_state_key)"
+      fm_get other_key "$other" brain_state_key
       [ "$other_key" = "$state_key" ] || continue
       STATE_RESOLUTION="unresolved-conflict"
       STATE_REASON="multiple-active-state-records"
@@ -5557,11 +5599,12 @@ state_resolution_for_file() {
     done < <(canonical_files "$dir")
   fi
 
-  version_ref="$(frontmatter_field "$file" brain_version_of)"
+  fm_get version_ref "$file" brain_version_of
   if [ -n "$version_ref" ]; then
     version_file="$(canonical_ref_file "$dir" "$version_ref" 2>/dev/null || true)"
     [ -n "$version_file" ] || { STATE_REASON="missing-version-lineage"; return 0; }
   fi
+  fm_get depends_on "$file" brain_depends_on
   while IFS= read -r dep; do
     [ -n "$dep" ] || continue
     dep_file="$(canonical_ref_file "$dir" "$dep" 2>/dev/null || true)"
@@ -5574,9 +5617,9 @@ state_resolution_for_file() {
       invalid-cycle) STATE_RESOLUTION="invalid-cycle"; STATE_REASON="dependency-cycle"; return 0 ;;
       *) STATE_RESOLUTION="unresolved-dependency"; STATE_REASON="dependency-$dep_state"; return 0 ;;
     esac
-  done < <(reference_lines "$(frontmatter_field "$file" brain_depends_on)")
+  done < <(reference_lines "$depends_on")
 
-  valid_from="$(frontmatter_field "$file" brain_valid_from)"; valid_to="$(frontmatter_field "$file" brain_valid_to)"
+  fm_get valid_from "$file" brain_valid_from; fm_get valid_to "$file" brain_valid_to
   STATE_EFFECTIVE_REF="$rel"
   if [ -z "$valid_from" ] && [ -z "$valid_to" ]; then
     STATE_RESOLUTION="unknown-validity"
@@ -5865,6 +5908,76 @@ print(json.dumps(bundle, ensure_ascii=False, separators=(",", ":"), sort_keys=Tr
 PY
 }
 
+# One Python start for every rendered row: line 1 is the record total
+# (as lifecycle_bundle_total_records), then one "REL<TAB>BUNDLE" line per path
+# in ROWS (as lifecycle_bundle_for_root for that REL). Rows whose path the
+# shell could not pass through unchanged get an empty REL so the caller falls
+# back to the per-row helper. Any doubt about the total exits non-zero.
+lifecycle_bundle_batch() {
+  local json_file="$1" roots_file="$2" rows_file="$3" prefix="$4"
+  resolve_okf_runtime
+  "$OKF_PYTHON" - "$json_file" "$roots_file" "$rows_file" "$prefix" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+payload_path, roots_path, rows_path, prefix = sys.argv[1:]
+encoding = sys.stdout.encoding or "utf-8"
+try:
+    value = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+    total = "0"
+except (OSError, json.JSONDecodeError):
+    value, total = None, "0"
+except Exception:
+    raise SystemExit(3)
+if value is not None:
+    if not isinstance(value, dict):
+        raise SystemExit(3)
+    records = value.get("records", [])
+    total = str(len(records) if isinstance(records, list) else 0)
+
+
+def bundle_for(root):
+    try:
+        payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+        roots = [line.strip() for line in Path(roots_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if root not in roots:
+        return ""
+    bundles = payload.get("evidence_bundles")
+    if isinstance(bundles, list):
+        index = roots.index(root)
+        if index >= len(bundles) or not isinstance(bundles[index], dict):
+            return ""
+        bundle = dict(bundles[index])
+    else:
+        if roots.index(root) != 0:
+            return ""
+        bundle = dict(payload)
+    bundle["root"] = root
+    text = json.dumps(bundle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    text.encode(encoding)
+    return text
+
+
+out = [total]
+rows = Path(rows_path).read_text(encoding="utf-8", errors="surrogateescape").split("\n")
+for line in rows[:-1] if rows and rows[-1] == "" else rows:
+    rel = line[len(prefix):] if line.startswith(prefix) else ""
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", rel):
+        out.append("\t")
+        continue
+    try:
+        text = bundle_for(rel)
+    except Exception:
+        text = ""
+    out.append(rel + "\t" + text)
+sys.stdout.write("\n".join(out) + "\n")
+PY
+}
+
 lifecycle_bundle_total_records() {
   local json_file="$1"
   resolve_okf_runtime
@@ -5884,6 +5997,30 @@ PY
 
 lifecycle_bundle_warning_text() {
   local raw="$1"
+  # The helper prints nothing when (with no JSON escapes) "warnings" and
+  # "incomplete" each appear at most once, only as "warnings":[] and
+  # "incomplete":false: the top-level values are then empty or absent.
+  case "$raw" in
+    *\\*) ;;
+    *)
+      local lifecycle_rest lifecycle_quiet=1
+      case "$raw" in
+        *warnings*)
+          lifecycle_rest="${raw#*warnings}"
+          case "$raw" in *'"warnings":[]'*) ;; *) lifecycle_quiet=0 ;; esac
+          case "$lifecycle_rest" in *warnings*) lifecycle_quiet=0 ;; esac
+          ;;
+      esac
+      case "$raw" in
+        *incomplete*)
+          lifecycle_rest="${raw#*incomplete}"
+          case "$raw" in *'"incomplete":false'*) ;; *) lifecycle_quiet=0 ;; esac
+          case "$lifecycle_rest" in *incomplete*) lifecycle_quiet=0 ;; esac
+          ;;
+      esac
+      [ "$lifecycle_quiet" = 0 ] || return 0
+      ;;
+  esac
   resolve_okf_runtime
   "$OKF_PYTHON" - "$raw" <<'PY'
 import json
@@ -5944,8 +6081,8 @@ evidence_root_hashes() {
     if [ -n "$nested" ]; then evidence_root_hashes "$dir" "$nested" $((depth + 1)) "$seen" "$principal"; followed=1; fi
   done < <(reference_lines "$derived_from")
   if [ "$followed" = 0 ]; then
-    hash="$(frontmatter_field "$file" brain_source_hash_sha256)"
-    [ -n "$hash" ] || hash="$(frontmatter_field "$file" brain_content_hash_sha256)"
+    fm_get hash "$file" brain_source_hash_sha256
+    [ -n "$hash" ] || fm_get hash "$file" brain_content_hash_sha256
     [ -n "$hash" ] && printf '%s\n' "$hash"
   fi
   return 0
@@ -6482,7 +6619,9 @@ cmd_search() {
     fi
   fi
   [ -n "$prep" ] || okf_valid_memo_fill "$tmp_dir/canonical.paths"
-  [ "$MAINT_FIELDS_CACHE_DIR" != "$tmp_dir/fields" ] || fields_cache_prewarm "$tmp_dir/canonical.paths"
+  if [ "$MAINT_FIELDS_CACHE_DIR" = "$tmp_dir/fields" ] || [ "$MAINT_FIELDS_CACHE_DIR" = "${SEARCH_FIELDS_PREWARM_DIR:-}" ]; then
+    fields_cache_prewarm "$tmp_dir/canonical.paths"
+  fi
   if [ -n "$prep" ]; then
     INDEX_EXPECTED_SIGNATURE="$(cat "$prep/signature.tsv")"
   else
@@ -6568,7 +6707,7 @@ cmd_search() {
     else
       query_input="$tmp_dir/query.txt"; query_vector="$tmp_dir/query.vector"
       printf '%s\n' "$query" >"$query_input"
-      if "$query_embedder" "$query_input" >"$query_vector" 2>/dev/null && valid_embedding_file "$query_vector"; then
+      if query_embed "$query_embedder" "$query_input" "$query_vector" "$query" && valid_embedding_file "$query_vector"; then
         query_model="$(embedding_field "$query_vector" model)"; query_dimensions="$(embedding_field "$query_vector" dimensions)"
         vector_model="$(awk -F '\t' 'NR == 2 { print $3; exit }' "$vector_index")"; vector_dimensions="$(awk -F '\t' 'NR == 2 { print $4; exit }' "$vector_index")"
         if [ "$query_model" = "$vector_model" ] && [ "$query_dimensions" = "$vector_dimensions" ]; then
@@ -6695,7 +6834,6 @@ cmd_search() {
     lifecycle_bundle_json_file="$tmp_dir/lifecycle.json"
     head -n 20 "$final_ranked" | cut -f1 >"$lifecycle_bundle_roots_file"
     lifecycle_bundle_for_roots "$dir" "$lifecycle_bundle_roots_file" "$principal" "$as_of" "$lifecycle_bundle_json_file"
-    lifecycle_bundle_record_count="$(lifecycle_bundle_total_records "$lifecycle_bundle_json_file")"
   fi
   local roots_more
   while IFS= read -r rel; do
@@ -6733,6 +6871,21 @@ cmd_search() {
   head -n "$limit" "$final_ranked" | while IFS=$'\t' read -r rel _; do [ -z "$rel" ] || printf '%s/%s\n' "$dir" "$rel"; done >"$tmp_dir/facts.paths"
   okf facts-list "$tmp_dir/facts.paths" >"$facts_batch" 2>/dev/null || : >"$facts_batch"
   exec 5<"$facts_batch"
+  # Lifecycle bundles for every row (and the record total) in one call; a row
+  # whose batched line does not name it uses the per-row helper.
+  local lifecycle_batch="$tmp_dir/lifecycle.rows" lifecycle_line=""
+  : >"$lifecycle_batch"
+  if [ "$intent" = current_state ] || [ "$intent" = evidence ]; then
+    if lifecycle_bundle_batch "$lifecycle_bundle_json_file" "$lifecycle_bundle_roots_file" "$tmp_dir/facts.paths" "$dir/" >"$lifecycle_batch" 2>/dev/null &&
+      IFS= read -r lifecycle_bundle_record_count <"$lifecycle_batch"; then
+      :
+    else
+      : >"$lifecycle_batch"
+      lifecycle_bundle_record_count="$(lifecycle_bundle_total_records "$lifecycle_bundle_json_file")"
+    fi
+  fi
+  exec 6<"$lifecycle_batch"
+  [ ! -s "$lifecycle_batch" ] || IFS= read -r lifecycle_line <&6 || true
   while IFS=$'\t' read -r rel score lexical_position semantic_position graph_source graph_relation; do
     [ -n "$rel" ] || continue
     local facts type status trust freshness generated_at stale_after source_count runtime
@@ -6740,6 +6893,7 @@ cmd_search() {
     IFS= read -r facts <&5 || facts=""
     facts_path="${facts%%$'\t'*}"
     if [ -n "$facts" ] && [ "$facts_path" = "$file" ]; then facts="${facts#*$'\t'}"; else facts="$(okf facts "$file")"; fi
+    IFS= read -r lifecycle_line <&6 || lifecycle_line=""
     IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
     if [ "$exploratory" = "1" ] && grep -Fqx -- "$title" "$seen_titles"; then continue; fi
     [ "$exploratory" = "0" ] || printf '%s\n' "$title" >>"$seen_titles"
@@ -6776,7 +6930,13 @@ cmd_search() {
     esac
     lifecycle_bundle=""
     case "$intent" in
-      current_state|evidence) lifecycle_bundle="$(lifecycle_bundle_for_root "$lifecycle_bundle_json_file" "$lifecycle_bundle_roots_file" "$rel" || true)" ;;
+      current_state|evidence)
+        if [ -n "$lifecycle_line" ] && [ "${lifecycle_line%%$'\t'*}" = "$rel" ]; then
+          lifecycle_bundle="${lifecycle_line#*$'\t'}"
+        else
+          lifecycle_bundle="$(lifecycle_bundle_for_root "$lifecycle_bundle_json_file" "$lifecycle_bundle_roots_file" "$rel" || true)"
+        fi
+        ;;
     esac
     if [ "$explain" = "1" ]; then
       fm_get authority "$file" brain_source_authority source_authority; [ -n "$authority" ] || authority="unknown"
@@ -6787,7 +6947,7 @@ cmd_search() {
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$score" "$type" "$state" "$status" "$trust" "$freshness" "$sensitivity" "$title"
     fi
   done < <(head -n "$limit" "$final_ranked")
-  exec 5<&-
+  exec 5<&- 6<&-
   if [ -s "$selected_evidence" ]; then
     evidence_refs="$(sort -u "$selected_evidence" | paste -sd, -)"
   else

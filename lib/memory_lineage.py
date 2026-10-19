@@ -1404,6 +1404,14 @@ def command_ruled_out(args: argparse.Namespace) -> int:
 
 def command_recall_extras(args: argparse.Namespace) -> int:
     """Small add-on for bridge recall (Hermes/MCP): ruled-out approaches only."""
+    # Nothing can match without task terms, an added ruled-out item or a
+    # ruled-out label: answer before parsing every record into a Vault.
+    root = Path(args.project_dir).expanduser().resolve()
+    if not _terms(args.task) or (
+        not any(row["action"] == "add" for row in read_ruled(root))
+        and not any(row["label"] == "ruled-out" or row["label"].startswith("ruled-out:") for row in read_ledger(root))
+    ):
+        return 0
     vault = Vault(args.project_dir, args.principal)
     lines = ruled_out_matches(vault, args.task, 4)
     if lines:

@@ -647,6 +647,70 @@ def _yaml_valid(raw: bytes) -> tuple[bool, tuple[dict[str, Any], str] | None]:
     return True, (metadata, body)
 
 
+def _yaml_valid_all(raws: list[bytes]) -> list[tuple[bool, tuple[dict[str, Any], str] | None]]:
+    """`_yaml_valid` for every header, split over up to 4 forked workers.
+
+    The pure-Python YAML parse is most of a search on a large vault; the same
+    work spread over a few cores ends sooner.  Results come back in order
+    (pickled from our own children) and any worker problem means the whole
+    list is parsed serially, so the answer never depends on the split.
+    """
+    setting = os.environ.get("LLM_BRAIN_SEARCH_WORKERS", "")
+    if setting.isdigit():  # explicit count (1 = serial), any vault size
+        workers, smallest = min(int(setting), 16), 2
+    else:
+        workers, smallest = min(4, os.cpu_count() or 1), 200
+    workers = min(workers, len(raws))
+    if workers < 2 or len(raws) < smallest or not hasattr(os, "fork"):
+        return [_yaml_valid(raw) for raw in raws]
+    import pickle
+
+    size = len(raws)
+    bounds = [(index * size // workers, (index + 1) * size // workers) for index in range(workers)]
+    children: list[tuple[int, int]] = []
+    try:
+        for start, end in bounds[1:]:
+            read_fd, write_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:  # child: parse one slice, send it back, never return
+                code = 1
+                try:
+                    os.close(read_fd)
+                    data = pickle.dumps([_yaml_valid(raw) for raw in raws[start:end]], protocol=pickle.HIGHEST_PROTOCOL)
+                    with os.fdopen(write_fd, "wb") as stream:
+                        stream.write(data)
+                    code = 0
+                finally:
+                    os._exit(code)
+            os.close(write_fd)
+            children.append((pid, read_fd))
+        start, end = bounds[0]
+        results = [_yaml_valid(raw) for raw in raws[start:end]]
+        failed = False
+        for pid, read_fd in children:
+            with os.fdopen(read_fd, "rb") as stream:
+                data = stream.read()
+            _, status = os.waitpid(pid, 0)
+            if failed or status != 0:
+                failed = True
+                continue
+            results.extend(pickle.loads(data))
+        children = []
+        if not failed and len(results) == size:
+            return results
+    except Exception:  # noqa: BLE001 - fall back to the serial parse below
+        for pid, read_fd in children:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+    return [_yaml_valid(raw) for raw in raws]
+
+
 def command_search_prepare(args: argparse.Namespace) -> int:
     project = os.fsencode(args.project_dir)
     out = Path(args.out_dir)
@@ -685,8 +749,7 @@ def command_search_prepare(args: argparse.Namespace) -> int:
     eligible: list[str] = []
     parsed: dict[str, tuple[dict[str, Any], str]] = {}
     unsure = False
-    for record in records:
-        valid, document = _yaml_valid(record.raw)
+    for record, (valid, document) in zip(records, _yaml_valid_all([record.raw for record in records])):
         try:
             verdict = b"1" if _eligible(project, record, valid, options, supersession) else b"0"
         except _Unsure:

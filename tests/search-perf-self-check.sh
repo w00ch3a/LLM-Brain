@@ -58,9 +58,11 @@ real_python="$(command -v python3)"
 wrapper="$fixture/python-counter"
 cat >"$wrapper" <<'WRAPPER'
 #!/bin/bash
-printf '%s\n' "${2:-}" >>"$SEARCH_PERF_LOG"
-case "${SEARCH_PERF_BREAK:-}:${2:-}" in
-  prepare:search-prepare|all:search-prepare|all:valid-batch|all:facts-list) exit 1 ;;
+# Inline helpers (`python3 - ARGS`) are logged as inline-<argument count>.
+if [ "${1:-}" = - ]; then name="inline-$#"; else name="${2:-}"; fi
+printf '%s\n' "$name" >>"$SEARCH_PERF_LOG"
+case "${SEARCH_PERF_BREAK:-}:$name" in
+  prepare:search-prepare|all:search-prepare|all:valid-batch|all:facts-list|all:inline-5|lifecycle:inline-5) exit 1 ;;
 esac
 exec "$SEARCH_PERF_REAL_PYTHON" "$@"
 WRAPPER
@@ -108,6 +110,47 @@ for strategy in hybrid lexical; do
   grep -q 'okf/claims/ferry-new.md' "$fixture/$strategy.out" || fail "$strategy: ferry-new missing"
   for n in $(seq -w 1 24); do grep -q "okf/claims/ferry-$n.md" "$fixture/$strategy.out" || fail "$strategy: ferry-$n missing"; done
 done
+
+# Header parsing split over forked workers (forced on this small vault)
+# returns the same answer as the serial parse.
+run_search workers-base lexical
+LLM_BRAIN_SEARCH_WORKERS=3 run_search workers lexical
+same_results workers-base workers "lexical: serial and parallel header parsing"
+
+# Lifecycle intents batch every row's bundle into one helper start; the
+# per-row helper (batch unavailable) returns the same rows and metadata.
+for intent in current_state evidence; do
+  run_search "$intent" lexical --intent "$intent"
+  SEARCH_PERF_BREAK=lifecycle run_search "$intent-per-row" lexical --intent "$intent"
+  same_results "$intent" "$intent-per-row" "$intent: batched and per-row lifecycle bundles"
+  [ "$(count inline-5 "$intent")" = 1 ] || fail "$intent: lifecycle bundles were not batched"
+  [ "$(count inline-4 "$intent")" = 0 ] || fail "$intent: per-row lifecycle helper started"
+  [ "$(count inline-4 "$intent-per-row")" -gt 0 ] || fail "$intent: fallback did not resolve per row"
+  starts="$(wc -l <"$fixture/$intent.log" | tr -d ' ')"
+  # search-prepare + facts-list + lifecycle-bundle + the row batch
+  [ "$starts" -le 4 ] || fail "$intent: $starts Python starts"
+done
+
+# A whole bridge recall (the Hermes path) starts a fixed number of helpers,
+# and matches the output built with every batch helper unavailable.
+printf 'ferry timetable tides\n' >"$fixture/recall-query.txt"
+run_recall() {
+  local tag="$1"; shift
+  : >"$fixture/$tag.log"
+  SEARCH_PERF_LOG="$fixture/$tag.log" SEARCH_PERF_REAL_PYTHON="$real_python" LLM_BRAIN_OKF_PYTHON="$wrapper" \
+    "$cli" --root "$vault" bridge recall --source-root "$workspace" --project-id "$project_id" \
+    --query-file "$fixture/recall-query.txt" --strategy lexical --require-evidence --budget-tokens 600 "$@" >"$fixture/$tag.out"
+}
+run_recall recall
+SEARCH_PERF_BREAK=all run_recall recall-fallback
+cmp -s "$fixture/recall.out" "$fixture/recall-fallback.out" || fail "bridge recall: fast and per-file paths differ"
+starts="$(wc -l <"$fixture/recall.log" | tr -d ' ')"
+[ "$starts" -le 6 ] || fail "bridge recall: $starts Python starts"
+run_recall recall-state --intent current_state
+SEARCH_PERF_BREAK=all run_recall recall-state-fallback --intent current_state
+cmp -s "$fixture/recall-state.out" "$fixture/recall-state-fallback.out" || fail "bridge recall (current_state): fast and per-file paths differ"
+starts="$(wc -l <"$fixture/recall-state.log" | tr -d ' ')"
+[ "$starts" -le 7 ] || fail "bridge recall (current_state): $starts Python starts"
 
 # A value search-prepare cannot judge byte-for-byte (non-ASCII edge) must be
 # handed back to the shell check for that record, with identical results.
