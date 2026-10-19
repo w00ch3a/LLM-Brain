@@ -71,6 +71,22 @@ the [v0.10.0 notes](releases/v0.10.0.md) for details and defaults.
   `procedures PROJECT` (trial, active, stable or retired from recent runs).
 - **Historical packs** label superseded records; `--controls` and
   `--step-checks` strengthen the evaluation harnesses.
+- **Sharper lexical search, no model needed (candidate).** The default
+  lexical profile `v2` keeps BM25F's fields and weights and adds a light
+  English stemmer (retry finds retries), two-letter and numeric tokens (Pi,
+  DB, CX-5), whole identifier matches (versions such as 1.4.2, hosts, error
+  codes, `config.py`, `PAGE_SIZE`), camelCase parts (`getUserName` finds
+  "user name") and accent folding (cafe finds café). Pure stdlib, no extra
+  process, same speed. `LLM_BRAIN_LEXICAL_PROFILE=legacy` restores the
+  previous scores byte for byte; metadata records `lexical_profile=v2` when
+  the new profile ran. Two structural extensions are on by default under
+  `v2` (`legacy` ignores them): link anchors also score a record by the link
+  text and titles of the records that link to it, and state order ranks the
+  newest member of a `brain_state_key` group first when every member has an
+  explicit `brain_valid_from` or `observed_at`. Set
+  `LLM_BRAIN_LEXICAL_ANCHORS=0` or `LLM_BRAIN_LEXICAL_STATE_ORDER=0` to turn
+  one off; each accepts `0` or `1` (anything else exits 64). See the
+  [candidate note](releases/v0.10.0-lexical-candidate.md) for the evaluation.
 
 ## What's new in 0.9
 
