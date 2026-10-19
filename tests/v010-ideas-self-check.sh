@@ -400,4 +400,30 @@ printf 'v2\n' >"$repo13/deploy.sh" && git -C "$repo13" -c user.email=t@example.i
 [ "$(pstate deploy-run)" = active ] || fail '#13 git was consulted without --source-root'
 printf 'idea-13=ok\n'
 
+# ---- #14 tried-and-reverted attempts keep their real diff in sources/, linked from the decision.
+repo14="$fixture/repo14"; mkdir -p "$repo14"
+g14() { git -C "$repo14" -c user.email=t@example.invalid -c user.name=t "$@"; }
+git -C "$repo14" init -q && printf 'def fetch(url):\n    return get(url)\n' >"$repo14/fetch.py" && g14 add fetch.py && g14 commit -qm base
+printf 'CACHE = {}\ndef fetch(url):\n    if url in CACHE:\n        return CACHE[url]\n    CACHE[url] = get(url)\n    return CACHE[url]\n' >"$repo14/fetch.py" && g14 commit -qam 'try response cache'
+tried="$(git -C "$repo14" rev-parse HEAD)"
+g14 revert --no-edit HEAD >/dev/null
+out="$(b attempt record "$pid" --commit "$tried" --source-root "$repo14" --title 'Response cache in fetch layer' --reason 'stale reads broke the upload tests' --decision deploy-new)"
+ref="$(sed -n 's/.* ref=\([^ ]*\).*/\1/p' <<<"$out")"
+grep -Fq 'outcome=reverted added=5 removed=1' <<<"$out" || fail "#14 diff stats wrong: $out"
+[ -f "$pdir/$ref" ] && [ "$(awk '{print $1}' "$pdir/$ref.sha256")" = "$(shasum -a 256 "$pdir/$ref" | awk '{print $1}')" ] || fail '#14 custody file or checksum missing'
+grep -Fq '+    if url in CACHE:' "$pdir/$ref" || fail '#14 the real diff was not kept'
+grep -Fq "$ref" <<<"$(b attempt list "$pid" --decision okf/claims/deploy-new.md)" || fail '#14 attempt not linked from the decision'
+pack="$(b pack build "$pid" --task 'response cache in the fetch layer' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq 'REVERTED: Response cache in fetch layer — stale reads broke the upload tests (+5/-1 in fetch.py' "$pack" || fail "#14 pack does not mention the reverted attempt: $(cat "$pack")"
+! grep -Fq '```diff' "$pack" || fail '#14 diff attached without an evidence request (token cost)'
+pack="$(b pack build "$pid" --task 'response cache in the fetch layer' --require-evidence | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq '+    if url in CACHE:' "$pack" || fail '#14 diff not attached when evidence was requested'
+grep -Fq '+    if url in CACHE:' <<<"$(b attempt show "$pid" "$ref")" || fail '#14 attempt show lacks the diff'
+printf 'diff --git a/x b/x\n+api_key = "abcdefghijklmnopqrstuvwx"\n' >"$fixture/secret.diff"
+! b attempt record "$pid" --diff "$fixture/secret.diff" --title 'Leaky attempt' >/dev/null 2>&1 || fail '#14 secret-bearing diff stored'
+! ls "$pdir"/sources/*-attempt-leaky* >/dev/null 2>&1 || fail '#14 secret-bearing diff left a file'
+! LLM_BRAIN_ATTEMPT_MAX_BYTES=10 b attempt record "$pid" --commit "$tried" --source-root "$repo14" --title 'Too big' >/dev/null 2>&1 || fail '#14 size cap ignored'
+grep -Fq 'attempt-record' "$pdir/audit.v2.tsv" || fail '#14 attempt not audited'
+printf 'idea-14=ok\n'
+
 printf 'v010-ideas-self-check=ok\n'

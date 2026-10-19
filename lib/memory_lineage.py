@@ -1102,6 +1102,11 @@ def command_pack_extras(args: argparse.Namespace) -> int:
             out.append("## Lineage Labels — see `llm-brain lineage show` for where the decision changed\n")
             out += lines
             out.append("")
+    attempts = attempt_lines(vault, args.task, selected, args.evidence)
+    if attempts:
+        out.append("## Tried and Reverted — real diffs kept as evidence\n")
+        out += attempts
+        out.append("")
     procedures = procedure_pack_lines(vault, now, selected)
     if procedures:
         out.append("## Procedure Status — derived from runs since the last change\n")
@@ -1968,6 +1973,111 @@ def command_procedures(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- #14 tried-and-reverted diffs
+
+ATTEMPT_EXCERPT_BYTES = 1200
+
+
+def read_attempts(vault: Vault) -> list[dict[str, Any]]:
+    """Attempt diffs kept in sources/ (custody files with a .sha256 sidecar)."""
+    rows = []
+    folder = vault.root / "sources"
+    if not folder.is_dir():
+        return rows
+    for path in sorted(folder.glob("*-attempt-*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            meta, body = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        if meta.get("type") != "Attempt":
+            continue
+        owner = clean(meta.get("brain_principal"))
+        if owner and owner != vault.principal:
+            continue
+        diff = body.split("```diff\n", 1)[1].rsplit("\n```", 1)[0] if "```diff\n" in body else ""
+        rows.append({"ref": f"sources/{path.name}", "title": clean(meta.get("title")) or path.stem,
+                     "outcome": clean(meta.get("brain_attempt_outcome")) or "reverted",
+                     "decision": clean(meta.get("brain_attempt_decision")),
+                     "reason": clean(meta.get("brain_attempt_reason")),
+                     "files": ref_list(meta.get("brain_attempt_files")),
+                     "added": int(meta.get("brain_attempt_added") or 0), "removed": int(meta.get("brain_attempt_removed") or 0),
+                     "recorded_at": clean(meta.get("brain_observed_at")), "diff": diff})
+    return rows
+
+
+def attempt_lines(vault: Vault, task: str, selected: list[str], evidence: bool, limit: int = 4) -> list[str]:
+    wanted = set(_terms(task))
+    chosen = set(selected)
+    scored = []
+    for row in read_attempts(vault):
+        linked = row["decision"] and (row["decision"] in chosen or (vault.resolver.canonical_ref(row["decision"]) is not None and vault.rel(vault.resolver.canonical_ref(row["decision"])) in chosen))
+        terms = set(_terms(row["title"] + " " + " ".join(row["files"]) + " " + row["reason"]))
+        overlap = len(wanted & terms)
+        if linked or (terms and overlap >= min(2, len(terms))):
+            scored.append((0 if linked else 1, -overlap, row))
+    scored.sort(key=lambda item: (item[0], item[1], item[2]["recorded_at"]))
+    lines, budget = [], ATTEMPT_EXCERPT_BYTES * 2
+    for _, _, row in scored[:limit]:
+        why = f" — {row['reason']}" if row["reason"] else ""
+        link = f"; decision `{row['decision']}`" if row["decision"] else ""
+        lines.append(f"- {row['outcome'].upper()}: {_one(row['title'], 100)}{why} (+{row['added']}/-{row['removed']} in {', '.join(row['files'][:3]) or 'unknown files'}; diff `{row['ref']}`{link})")
+        if evidence and row["diff"] and budget > 0:
+            excerpt = row["diff"].encode()[:min(ATTEMPT_EXCERPT_BYTES, budget)].decode(errors="ignore")
+            budget -= len(excerpt.encode())
+            cut = "" if len(excerpt) >= len(row["diff"]) else "\n… (truncated; llm-brain attempt show for the full diff)"
+            lines.append("```diff\n" + excerpt.rstrip("\n") + cut + "\n```")
+    return lines
+
+
+def command_attempts(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    rows = read_attempts(vault)
+    if args.action == "show":
+        for row in rows:
+            if row["ref"] == args.ref or row["ref"].removeprefix("sources/") == args.ref:
+                print(f"# {row['title']}\n\noutcome: {row['outcome']}\ndecision: {row['decision'] or '-'}\nreason: {row['reason'] or '-'}\n\n```diff\n{row['diff']}\n```")
+                return 0
+        print(f"attempt not found: {args.ref}", file=sys.stderr)
+        return 66
+    if args.task:
+        print("\n".join(attempt_lines(vault, args.task, [], False, args.limit)))
+        return 0
+    if args.decision:
+        target = vault.resolver.canonical_ref(args.decision)
+        wanted = vault.rel(target) if target is not None else args.decision
+        rows = [row for row in rows if row["decision"] in (args.decision, wanted)
+                or (vault.resolver.canonical_ref(row["decision"]) is not None and vault.resolver.canonical_ref(row["decision"]) == target)]
+    if args.json:
+        print(json.dumps([{k: v for k, v in row.items() if k != "diff"} for row in rows], sort_keys=True))
+        return 0
+    print("ref\toutcome\trecorded_at\ttitle\tdecision\tfiles")
+    for row in rows:
+        print(f"{row['ref']}\t{row['outcome']}\t{row['recorded_at']}\t{row['title']}\t{row['decision'] or '-'}\t{','.join(row['files']) or '-'}")
+    return 0
+
+
+def command_attempt_meta(args: argparse.Namespace) -> int:
+    """Files touched and +/- line counts of a unified diff (for the record)."""
+    files, added, removed = [], 0, 0
+    for line in Path(args.diff).read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("+++ "):
+            name = line[4:].strip()
+            if name != "/dev/null":
+                name = name[2:] if name.startswith("b/") else name
+                if name not in files:
+                    files.append(name)
+        elif line.startswith("--- "):
+            continue
+        elif line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    print(f"{added}\t{removed}\t{json.dumps(files[:20])}")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -2061,6 +2171,7 @@ def parser() -> argparse.ArgumentParser:
     pe.add_argument("--every", type=int, default=8)
     pe.add_argument("--session", default="")
     pe.add_argument("--state-index", action="store_true")
+    pe.add_argument("--evidence", action="store_true")
     base("brief-extras", command_brief_extras)
     ro = base("ruled-out", command_ruled_out)
     ro.add_argument("--action", choices=("add", "reopen", "list"), required=True)
@@ -2086,6 +2197,16 @@ def parser() -> argparse.ArgumentParser:
     ct = commands.add_parser("capture-tag")
     ct.add_argument("--file", required=True)
     ct.set_defaults(func=command_capture_tag)
+    at = base("attempts", command_attempts)
+    at.add_argument("--action", choices=("list", "show"), default="list")
+    at.add_argument("--ref", default="")
+    at.add_argument("--task", default="")
+    at.add_argument("--decision", default="")
+    at.add_argument("--limit", type=int, default=4)
+    at.add_argument("--json", action="store_true")
+    am = commands.add_parser("attempt-meta")
+    am.add_argument("--diff", required=True)
+    am.set_defaults(func=command_attempt_meta)
     pl = base("procedures", command_procedures)
     pl.add_argument("--source-root", default="")
     pl.add_argument("--json", action="store_true")
