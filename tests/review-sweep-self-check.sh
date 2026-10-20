@@ -238,7 +238,7 @@ if git -C "$repo_root" cat-file -e "$base_ref^{commit}" 2>/dev/null; then
     "$c" --root "$r" work run-once "$p" >/dev/null
     "$c" --root "$r" review list "$p"
   }
-  normalise() { (cd "$1" && find . -type f ! -path './.locks/*' | LC_ALL=C sort | while IFS= read -r f; do printf '== %s\n' "$f"; case "$f" in */audit.v2.tsv) hx='s/[0-9a-f]{64}/HASH/g' ;; *) hx='s/^$//' ;; esac; sed -E -e "$hx" -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z/TS/g; s/[0-9]{8}T[0-9]{6}Z/TS/g; s/^(format_level|writer_version|recorded_at)=.*/\1=X/' "$f"; done); }
+  normalise() { (cd "$1" && find . -type f ! -path './.locks/*' | LC_ALL=C sort | while IFS= read -r f; do printf '== %s\n' "$f"; case "$f" in */audit.v2.tsv) hx='s/[0-9a-f]{64}/HASH/g' ;; *) hx='s/^$//' ;; esac; sed -E -e "$hx" -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z/TS/g; s/[0-9]{8}T[0-9]{6}Z/TS/g; s/^(format_level|writer_version|recorded_at)=.*/\1=X/; s#llm-brain/[0-9]+\.[0-9]+\.[0-9]+#llm-brain/VERSION#g' "$f"; done); }
   # Same root path for both runs so path-derived ids match.
   (cd "$fixture" && LLM_BRAIN_REVIEW_POLICY=strict scenario "$fixture/base/bin/llm-brain" "$fixture/strict") >"$fixture/old.out"
   mv "$fixture/strict" "$fixture/strict-old"
