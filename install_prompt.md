@@ -47,6 +47,7 @@ Apply this setup without making the user choose each item:
 - Use an existing local vector provider when available; otherwise use built-in lexical search. Include evidence and use the standard 4,000-token budget.
 - Enable privacy protections. Keep experiments and migrations off. For Hermes, enable the MemoryProvider and retain the built-in context compressor.
 - Keep `LLM_BRAIN_COMMITMENT_POLICY=shadow`: record derived transition decisions without changing existing promotion behaviour. Current-state resolution and procedure capsules remain explicit opt-in workflows.
+- Keep the default tiered review policy and lexical profile `v2`. If an existing vault has a review backlog, show `review sweep --all --dry-run` counts to the user; never run `--apply` without their explicit confirmation.
 - Keep governed maintenance user-invocable: status is a bounded read-only check, reports are derived review candidates, and any schedule is host-native and separately verified.
 
 Configure only the agent host receiving this prompt. Mention other detected hosts after installation as optional additions; do not modify them automatically.

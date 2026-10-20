@@ -43,11 +43,13 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
-## What's new in 0.11 (draft)
+## What's new in 0.11
 
 **The review queue only holds real exceptions.** The default tiered review
 policy stops captures from creating queue work and clears what can be cleared
-safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the 0.10 behaviour exactly.
+safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the pre-0.11 review behaviour
+exactly. 0.11.0 also ships every 0.10 change below. No vault migration. See
+the [v0.11.0 notes](releases/v0.11.0.md).
 
 - **Custody markers are not queue items.** `ingest` and `ingest-source` record
   the source marker as `captured` rather than `proposed`.
@@ -92,7 +94,8 @@ safely. `LLM_BRAIN_REVIEW_POLICY=strict` keeps the 0.10 behaviour exactly.
 ## What's new in 0.10
 
 Version 0.10 closes silent failure modes and makes belief updates and
-handovers safer. Schema 3 and OKF v0.2 are unchanged; no vault migration. See
+handovers safer. These changes shipped in 0.11.0 (0.10.0 was not published on
+its own). Schema 3 and OKF v0.2 are unchanged; no vault migration. See
 the [v0.10.0 notes](releases/v0.10.0.md) for details and defaults.
 
 - **Upgrade machines that share a vault together.** 0.10 writes
@@ -117,7 +120,7 @@ the [v0.10.0 notes](releases/v0.10.0.md) for details and defaults.
   `procedures PROJECT` (trial, active, stable or retired from recent runs).
 - **Historical packs** label superseded records; `--controls` and
   `--step-checks` strengthen the evaluation harnesses.
-- **Sharper lexical search, no model needed (candidate).** The default
+- **Sharper lexical search, no model needed (default).** The default
   lexical profile `v2` keeps BM25F's fields and weights and adds a light
   English stemmer (retry finds retries), two-letter and numeric tokens (Pi,
   DB, CX-5), whole identifier matches (versions such as 1.4.2, hosts, error
@@ -132,7 +135,7 @@ the [v0.10.0 notes](releases/v0.10.0.md) for details and defaults.
   explicit `brain_valid_from` or `observed_at`. Set
   `LLM_BRAIN_LEXICAL_ANCHORS=0` or `LLM_BRAIN_LEXICAL_STATE_ORDER=0` to turn
   one off; each accepts `0` or `1` (anything else exits 64). See the
-  [candidate note](releases/v0.10.0-lexical-candidate.md) for the evaluation.
+  [lexical profile note](releases/v0.10.0-lexical-candidate.md) for the evaluation.
 
 ## What's new in 0.9
 

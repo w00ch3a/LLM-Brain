@@ -173,8 +173,11 @@ The review queue only holds real exceptions now. A tiered review policy
 (default) stores routine captures without a human step, and
 `review sweep --dry-run|--apply|--undo` clears an existing backlog with a
 token-confirmed apply and a byte-for-byte undo. Nothing is deleted. Secret-like
-records stay as written, owner-only and out of exports. Lexical profile v2 is
-the default search scorer. 0.11 also ships everything prepared for 0.10 below.
+records stay as written, owner-only and out of exports, and health, privacy,
+legal and finance facts are stored owner-only. `LLM_BRAIN_REVIEW_POLICY=strict`
+keeps the old review behaviour. Lexical profile v2 is the default search
+scorer, with link anchors and state order on (`LLM_BRAIN_LEXICAL_ANCHORS=0`,
+`LLM_BRAIN_LEXICAL_STATE_ORDER=0` to opt out). 0.11 also ships everything prepared for 0.10 below.
 No vault migration. Details: [v0.11.0 notes](docs/releases/v0.11.0.md).
 
 ## What's new in 0.10
