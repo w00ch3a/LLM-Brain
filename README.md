@@ -167,6 +167,16 @@ Labels also show in Neural Expansion's detail panel:
 UNKNOWN, and search and packs accept `--label` / `--without-label`. See the
 [v0.9.0 notes](docs/releases/v0.9.0.md).
 
+## What's new in 0.11
+
+The review queue only holds real exceptions now. A tiered review policy
+(default) stores routine captures without a human step, and
+`review sweep --dry-run|--apply|--undo` clears an existing backlog with a
+token-confirmed apply and a byte-for-byte undo. Nothing is deleted. Secret-like
+records stay as written, owner-only and out of exports. Lexical profile v2 is
+the default search scorer. 0.11 also ships everything prepared for 0.10 below.
+No vault migration. Details: [v0.11.0 notes](docs/releases/v0.11.0.md).
+
 ## What's new in 0.10
 
 Safer belief updates (one outlier cannot overwrite a well-supported fact),

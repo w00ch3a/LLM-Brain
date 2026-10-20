@@ -9,7 +9,21 @@
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
 
-## 0.10.0 - unreleased (prepared 2026-10-19)
+## 0.11.0 - 2026-10-20
+
+- Includes all 0.10.0 changes below (0.10.0 was not published on its own).
+- Lexical profile v2 is the default; link anchors and state order are on by
+  default (`LLM_BRAIN_LEXICAL_ANCHORS=0`, `LLM_BRAIN_LEXICAL_STATE_ORDER=0`).
+- Tiered review policy by default (`LLM_BRAIN_REVIEW_POLICY=strict` keeps the
+  old behaviour); captured custody markers; `brain_received_at` cool-off.
+- `review sweep` with counts-only dry run, token-confirmed apply and
+  byte-for-byte undo; `--scan-sources` secret census (counts only).
+- Secret-bearing records stay as written, owner-only and out of exports;
+  owner-only `private` tier for health, privacy, legal and finance facts.
+- Secret-scan key-prefix detectors match only at a word start.
+- No vault migration; schema 3 and OKF v0.2 unchanged. No model bundled.
+
+## 0.10.0 - not published separately (shipped in 0.11.0)
 
 - Fixed evidence views splitting on `---` inside values or bodies (run
   `index build` once to refresh cached views).
