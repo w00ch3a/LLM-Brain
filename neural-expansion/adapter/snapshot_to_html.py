@@ -418,7 +418,7 @@ def merge_project_payloads(results: list) -> dict:
     totals["cap"] = "per project"
     meta = {
         "project": f"All projects ({len(per_project)} of {len(results)})",
-        "version": "0.12.0", "privacy": "Principal-filtered snapshot",
+        "version": "0.12.1", "privacy": "Principal-filtered snapshot",
         "pending": totals, "projects": per_project, "skipped": skipped,
         "reviewed_total": sum(row["reviewed"] for row in per_project),
     }

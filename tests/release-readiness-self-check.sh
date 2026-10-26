@@ -109,6 +109,7 @@ core_checks() {
     bash "$repo_root/tests/evidence-meta-self-check.sh" -- \
     bash "$repo_root/tests/real-eval-self-check.sh" -- \
     bash "$repo_root/tests/research-recall-self-check.sh" -- \
+    bash "$repo_root/tests/doctor-okf-index-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

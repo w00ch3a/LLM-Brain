@@ -3,7 +3,7 @@
   "label": "Neural Expansion",
   "description": "Memthena memory viewer: synthetic demo, or this profile's principal-filtered brain with label lineage (opt-in)",
   "icon": "Brain",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "tab": {
     "path": "/neural-expansion",
     "position": "end"

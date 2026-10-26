@@ -8,6 +8,13 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.12.1 - 2026-10-26
+
+- `doctor` no longer reports the per-folder OKF `index.md` pages written by
+  `migrate okf-backfill --apply` (or a plain `log.md`) as records missing a
+  validation timestamp in pre-schema-3 projects. Files with those reserved
+  names are still checked when they carry record frontmatter.
+
 ## 0.12.0 - 2026-10-26
 
 - LLM-Brain is now Memthena. `memthena` and `MEMTHENA_*` are aliases for

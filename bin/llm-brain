@@ -8493,6 +8493,10 @@ cmd_doctor() {
       continue
     fi
     while IFS= read -r file; do
+      # OKF v0.2 reserves index.md and log.md for navigation (okf-backfill's
+      # generated pages start with its marker line, not frontmatter).  They
+      # are not records: skip them unless they carry record frontmatter.
+      case "${file##*/}" in index.md|log.md) [ "$(head -c 3 "$file" 2>/dev/null)" = "---" ] || continue ;; esac
       validated="$(frontmatter_field "$file" last_validated_at)"
       if [ -z "$validated" ]; then
         say_error "doctor: missing validation timestamp: ${file#"$ROOT"/}"
