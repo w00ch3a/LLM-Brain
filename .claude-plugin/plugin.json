@@ -1,9 +1,9 @@
 {
   "name": "llm-brain",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Automatic filesystem-first project memory using Google Open Knowledge Format v0.2.",
   "author": {
-    "name": "LLM-Brain Maintainers",
+    "name": "Memthena Maintainers",
     "url": "https://github.com/w00ch3a"
   }
 }

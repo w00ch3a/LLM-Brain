@@ -1,6 +1,6 @@
-# LLM-Brain automatic context
+# Memthena automatic context
 
-Unless `LLM_BRAIN_PASSIVE=0`, apply the LLM-Brain automatic-use contract to every non-trivial project task without waiting for the user to name it. LLM-Brain is active infrastructure; only the user experience is passive. Current source, governing instructions, explicit user direction and live proof outrank memory.
+Unless `LLM_BRAIN_PASSIVE=0`, apply the Memthena automatic-use contract to every non-trivial project task without waiting for the user to name it. Memthena is active infrastructure; only the user experience is passive. Current source, governing instructions, explicit user direction and live proof outrank memory.
 
 @./skills/llm-brain/SKILL.md
 
@@ -15,6 +15,6 @@ use:
 
 @./skills/llm-brain-maintenance/SKILL.md
 
-When the user asks to upgrade or update LLM-Brain, use:
+When the user asks to upgrade or update Memthena (formerly LLM-Brain), use:
 
 @./skills/llm-brain-upgrade/SKILL.md

@@ -1,9 +1,9 @@
 {
   "name": "llm-brain",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Automatic filesystem-first durable memory using Google Open Knowledge Format v0.2.",
   "author": {
-    "name": "LLM-Brain Maintainers",
+    "name": "Memthena Maintainers",
     "url": "https://github.com/w00ch3a"
   },
   "homepage": "https://github.com/w00ch3a/LLM-Brain",
@@ -18,10 +18,10 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "LLM-Brain",
+    "displayName": "Memthena",
     "shortDescription": "Automatic durable memory for project agents",
     "longDescription": "Retrieve and maintain inspectable project memory automatically, with Google OKF v0.2, governed review, source custody, verified migration and receipt-based rollback.",
-    "developerName": "LLM-Brain Maintainers",
+    "developerName": "Memthena Maintainers",
     "category": "Productivity",
     "capabilities": [
       "Instructions",
@@ -30,7 +30,7 @@
     "websiteURL": "https://github.com/w00ch3a/LLM-Brain",
     "defaultPrompt": [
       "Use project memory naturally for this task.",
-      "Upgrade LLM-Brain safely.",
+      "Upgrade Memthena safely.",
       "Inspect the current project brain."
     ],
     "brandColor": "#5B4BDB"

@@ -67,7 +67,9 @@ cat >"$wrapper" <<'WRAPPER'
 #!/bin/bash
 facts_helper="$1"
 shift
-if [ "${1:-}" != facts-batch ]; then
+# Inject around the read pass of both build paths: the per-record
+# facts-batch and the one-pass vault-scan (--mode index).
+if [ "${1:-}" != facts-batch ] && ! { [ "${1:-}" = vault-scan ] && [ "${5:-}" = index ]; }; then
   exec "$FACTS_REAL_PYTHON" "$facts_helper" "$@"
 fi
 case "$FACTS_TEST_ACTION" in
@@ -104,11 +106,28 @@ expect_rejected_without_publish() {
   grep -Eq 'source-admission-changed|source-changed-during-index|generation-validation-failed' "$project/indexes/rebuild-state.json" || fail "$action did not record source change failure"
 }
 
-expect_rejected_without_publish before-restricted
-cp "$fixture/claim-original.md" "$claim"
-expect_rejected_without_publish after-mutation
-cp "$fixture/claim-original.md" "$claim"
-expect_rejected_without_publish after-delete
+for one_pass in 1 0; do
+  export LLM_BRAIN_INDEX_ONE_PASS="$one_pass"
+  if [ "$one_pass" = 0 ]; then
+    # Only the two-step path has a window between admission and read.
+    expect_rejected_without_publish before-restricted
+    cp "$fixture/claim-original.md" "$claim"
+  fi
+  expect_rejected_without_publish after-mutation
+  cp "$fixture/claim-original.md" "$claim"
+  expect_rejected_without_publish after-delete
+  cp "$fixture/claim-original.md" "$claim"
+done
+unset LLM_BRAIN_INDEX_ONE_PASS
+
+# One pass reads admission and content together: a record that turns
+# restricted before the read is simply not indexed, and nothing else changes.
+cp "$fixture/claim-restricted.md" "$claim"
+scratch_root="$fixture/one-pass-scratch"
+rm -rf "$scratch_root"; cp -R "$vault" "$scratch_root"
+"$cli" --root "$scratch_root" index build "$project_id" >/dev/null || fail "one-pass build of a restricted record failed"
+! grep -q "$(basename "$claim")" "$scratch_root/projects/$project_id/indexes/documents.tsv" || fail "one-pass build indexed a restricted record"
+rm -rf "$scratch_root"
 cp "$fixture/claim-original.md" "$claim"
 
 mkdir -p "$fixture/mkdir-wrapper"
@@ -157,11 +176,15 @@ expect_rejected_under_lock() {
   grep -Eq 'source-admission-changed|source-changed-during-index|generation-validation-failed' "$project/indexes/rebuild-state.json" || fail "$action under lock did not record validation failure"
 }
 
-expect_rejected_under_lock restricted "$fixture/claim-restricted.md"
-expect_rejected_under_lock deprecated "$fixture/claim-deprecated.md"
-expect_rejected_under_lock retracted
-expect_rejected_under_lock delete
-expect_rejected_under_lock malformed "$fixture/claim-malformed.md"
-expect_rejected_under_lock mutate
+for one_pass in 1 0; do
+  export LLM_BRAIN_INDEX_ONE_PASS="$one_pass"
+  expect_rejected_under_lock restricted "$fixture/claim-restricted.md"
+  expect_rejected_under_lock deprecated "$fixture/claim-deprecated.md"
+  expect_rejected_under_lock retracted
+  expect_rejected_under_lock delete
+  expect_rejected_under_lock malformed "$fixture/claim-malformed.md"
+  expect_rejected_under_lock mutate
+done
+unset LLM_BRAIN_INDEX_ONE_PASS
 
 printf 'llm-brain index facts batch self-check passed\n'

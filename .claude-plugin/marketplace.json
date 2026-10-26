@@ -3,7 +3,7 @@
   "name": "llm-brain",
   "description": "Automatic, inspectable and governed durable memory for coding agents.",
   "owner": {
-    "name": "LLM-Brain Maintainers"
+    "name": "Memthena Maintainers"
   },
   "plugins": [
     {

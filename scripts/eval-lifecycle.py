@@ -28,6 +28,9 @@ from typing import Any, Iterable
 
 
 FORMAT = "llm-brain.lifecycle-evaluation"
+# Per-call ceiling for CLI steps.  Calls normally finish in under 3 s; the
+# headroom absorbs host-wide I/O stalls on busy shared machines.
+CLI_TIMEOUT = int(os.environ.get("LLM_BRAIN_EVAL_CLI_TIMEOUT", "180") or "180")
 VERSION = 1
 MODES = ("none", "raw-source", "factual", "explicit", "evidence", "historical")
 MODE_INTENTS = {
@@ -525,8 +528,8 @@ def cli_base(cli: Path, vault: Path) -> list[str]:
     return [str(cli), "--root", str(vault)]
 
 
-def run_cli(cli: Path, vault: Path, args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    result = command(cli_base(cli, vault) + args, timeout=timeout)
+def run_cli(cli: Path, vault: Path, args: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    result = command(cli_base(cli, vault) + args, timeout=timeout or CLI_TIMEOUT)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise EvaluationError(f"llm-brain {' '.join(args[:3])} failed ({result.returncode}): {detail[:500]}")
@@ -602,7 +605,7 @@ def flush_captures(cli: Path, vault: Path, repo_root: Path, project_id: str, run
 
 
 def build_index(cli: Path, vault: Path, project_id: str) -> None:
-    run_cli(cli, vault, ["index", "build", project_id], timeout=120)
+    run_cli(cli, vault, ["index", "build", project_id], timeout=max(120, CLI_TIMEOUT))
 
 
 def parse_capsule_path(output: str, project_dir: Path) -> str:

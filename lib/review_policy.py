@@ -350,7 +350,73 @@ def plan(project: Project, settings: Settings, since: Optional[str] = None) -> L
     for item in sorted(items, key=lambda value: value.id):
         if item.kind in ("claim", "procedure", "reference") and not SCAFFOLD.search(item.body) and item.body.strip():
             first_body.setdefault(item.body_hash, item.id)
-    return [(item, *classify(item, project, settings, now, first_body)) for item in items]
+    planned = [(item, *classify(item, project, settings, now, first_body)) for item in items]
+    return [(item, *_s1_cautious(item, tier, reason, project)) for item, tier, reason in planned]
+
+
+_S1: Dict[str, object] = {}
+
+
+def _s1_spec() -> str:
+    spec = os.environ.get("MEMTHENA_S1_MODEL", "")
+    if not spec and os.environ.get("MEMTHENA_S1", "0") == "1":
+        spec = "bundled"
+    return spec
+
+
+def _s1_neighbours(project: Project, s1: object) -> List[Tuple[str, str, str]]:
+    """Canonical claims/procedures/references (id, title, body); protected records are never sent to a model."""
+    cached = _S1.get("records:" + str(project.dir))
+    if cached is None:
+        cached = []
+        for sub in ("claims", "procedures", "references"):
+            base = project.dir / "okf" / sub
+            if not base.is_dir():
+                continue
+            for path in sorted(base.glob("*.md")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if s1.protected(text):  # type: ignore[attr-defined]
+                    continue
+                header, body = split_frontmatter(text)
+                meta, _ = parse_header(header or [])
+                cached.append((path.stem, meta.get("title", ""), re.sub(r"^#.*$", "", body, count=1, flags=re.M).strip()))
+        _S1["records:" + str(project.dir)] = cached
+    return cached  # type: ignore[return-value]
+
+
+def _s1_cautious(item: Item, tier: str, reason: str, project: Optional[Project] = None) -> Tuple[str, str]:
+    """Opt-in Memthena System One (MEMTHENA_S1=1 for the bundled model, or MEMTHENA_S1_MODEL=SPEC).
+    It runs after every rule above and can only make an outcome MORE cautious (AUTO -> WAIT); it never
+    promotes. Acting heads: keep and duplicate (32m int8), duplicate only (linear fallback); kind and
+    triage are advisory and never consulted here. No model, a protected item, or any error leaves the
+    rule result exactly as it was (fail-open)."""
+    spec = _s1_spec()
+    if not spec or not tier.startswith("AUTO"):
+        return tier, reason
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import memthena_s1
+        if "pred" not in _S1:
+            _S1["pred"] = memthena_s1.load_predictor(spec)
+        threshold = float(os.environ.get("MEMTHENA_S1_THRESHOLD", "0.95"))
+        neighbours = []
+        if project is not None and "dup" in memthena_s1.acting(_S1["pred"]):
+            neighbours = memthena_s1.nearest(item.body, _s1_neighbours(project, memthena_s1))
+        verdict = memthena_s1.review_hook_decision(item.text, _S1["pred"], threshold, neighbours)
+    except Exception:
+        return tier, reason
+    if not verdict:
+        return tier, reason
+    if verdict.get("acts") and verdict.get("keep") is not None and verdict["keep"] < 0.5:
+        return "WAIT", "s1-not-durable"
+    if verdict.get("dup_acts"):
+        return "WAIT", "s1-possible-duplicate"
+    return tier, reason
 
 
 def audit_row(project_dir: Path, actor: str, action: str, object_id: str, old: str, new: str, content_hash: str, details: str) -> None:

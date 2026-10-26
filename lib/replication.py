@@ -1293,10 +1293,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             result = do_openclaw(args)
     except LaneError as exc:
-        print("llm-brain: %s" % exc, file=sys.stderr)
+        print("memthena: %s" % exc, file=sys.stderr)
         return exc.code
     except (OSError, tarfile.TarError) as exc:
-        print("llm-brain: replication I/O failure: %s" % exc, file=sys.stderr)
+        print("memthena: replication I/O failure: %s" % exc, file=sys.stderr)
         return 73
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0

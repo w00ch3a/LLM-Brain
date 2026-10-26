@@ -1,9 +1,11 @@
-# LLM-Brain full guide
+# Memthena full guide
+
+**One intelligence. Infinite possibilities.** Memthena was formerly called LLM-Brain; the `llm-brain` command, `LLM_BRAIN_*` settings and vault layout are unchanged, and `memthena` / `MEMTHENA_*` are aliases.
 
 This is the complete reference that used to be the README. The [README](../README.md) is the short introduction.
 
 <p align="center">
-  <img src="assets/llm-brain-logo.png" alt="LLM-Brain" width="640">
+  <img src="assets/llm-brain-logo.png" alt="Memthena" width="640">
 </p>
 
 [![Release](https://img.shields.io/github/v/release/w00ch3a/LLM-Brain)](https://github.com/w00ch3a/LLM-Brain/releases)
@@ -12,7 +14,7 @@ This is the complete reference that used to be the README. The [README](../READM
 
 **Durable, inspectable, filesystem-first memory for AI agents.**
 
-LLM-Brain gives Codex, Claude Code, Gemini CLI, Hermes Agent and custom agents a shared project memory. It stores knowledge as Markdown, tracks the evidence behind each claim, and retrieves the right context before an agent starts work.
+Memthena gives Codex, Claude Code, Gemini CLI, Hermes Agent and custom agents a shared project memory. It stores knowledge as Markdown, tracks the evidence behind each claim, and retrieves the right context before an agent starts work.
 
 The infrastructure stays active. You do not have to invoke it, clear lock files or manage a memory queue during normal work.
 
@@ -42,6 +44,31 @@ workflows, so installation and release behaviour stay reviewable with the
 code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
+
+## What's new in 0.12 (Memthena)
+
+LLM-Brain is now Memthena. No vault migration. See the
+[v0.12.0 notes](releases/v0.12.0.md).
+
+
+- **New name, same brain.** `memthena` runs the same CLI as `llm-brain`, and every `LLM_BRAIN_*` setting can also be written as `MEMTHENA_*` (when both are set, `MEMTHENA_*` wins). Vault layout, plugin ids, the Hermes provider id and release file names are unchanged, so nothing needs migrating.
+- **Messages say Memthena.** Error and warning lines now start with `memthena:` instead of `llm-brain:`, and a few messages name Memthena; exit codes are unchanged.
+- **Faster on a shared network drive.** Each machine keeps a local, stat-checked cache of record bytes outside the vault (`MEMTHENA_CACHE=0` turns it off), and it survives upgrades.
+- **Bulk folder check on macOS.** Search checks every record against the local cache with one folder listing (macOS `getattrlistbulk`), not one network round trip per file. Each record is still judged by its own size and timestamps, so hand edits are seen by the next search. It falls back to per-file checks whenever the listing is unavailable. Turn it off with `MEMTHENA_BULK_STAT=0`.
+- **Optional NAS trust window (`MEMTHENA_NAS_TRUST_SECONDS`, default `0` = off).** With bulk folder checks it is rarely needed. If you set it to a number of seconds, read-only search skips re-checking record files for that long after a full check, as long as nothing has been written. Any write made through Memthena (CLI, Hermes plugin or MCP server) ends the window at once. Only a file edited in place by another tool can go unseen, and only until the window ends.
+- **OKF backfill (`migrate okf-backfill`).** `--check` (the default) is read-only and prints counts; `--apply` adds OKF `description:` lines and generated folder `index.md` files, with an audit row and a manifest; `--undo ID` restores the files byte for byte. Restricted, secret and owner-only records are skipped. Upgrade every machine that shares the vault before applying, because older builds rank the new field.
+- **OKF descriptions.** After a backfill, newly promoted records get a one-line `description:` from their first sentence. Restricted, secret and owner-only records never get one, and search ranking ignores it.
+- **Models, all optional and fail-open.**
+  - `MEMTHENA_EMBED=1` uses the bundled 4 MB `lbembed-v2-int4` embedder (pure Python) for hybrid search.
+  - `MEMTHENA_S1=1` turns on System One, which can only make a review outcome more cautious (AUTO to WAIT). It never promotes, and protected items never reach it.
+  - The base package includes the small linear model (duplicate check only).
+  - The 32m model is a separate per-machine download: `memthena models install system-one-32m`. It needs `onnxruntime` and `tokenizers`, and adds keep and relevance decisions. Kind and triage answers stay advisory.
+  - Check what's installed with `memthena models status`. Remove the 32m model with `memthena models remove system-one-32m`, and System One goes back to the linear model.
+  - Hermes can use System One for recall through `memthena decide-serve` on localhost.
+- **Raw-history baseline in `eval run`.** Add `raw-bm25` and/or `raw-embed` to `--strategies` to rank the raw episodes and source files with no memory pipeline. `raw-bm25` is plain BM25. `raw-embed` uses `--query-embedder` or the bundled `lbembed` model. The report gains a "Raw-history baseline" table showing whether each memory arm beats, ties or loses to the best raw arm. Without a raw arm the report is unchanged.
+- **Doctor replays the audit log.** `memthena doctor` replays `audit.v2.tsv` against canonical frontmatter and the current index, without changing anything. It reports records whose lifecycle state, retraction, index row or `stale_after` disagrees with the audit as `memthena: doctor: audit replay mismatch (...)`. It uses the record cache and bulk folder checks, and skips logs with more than `MEMTHENA_DOCTOR_AUDIT_MAX_EVENTS` events (default 2,000,000). Turn it off with `--no-audit-replay` or `MEMTHENA_DOCTOR_AUDIT_REPLAY=0`.
+- **`pack build --action-risk low|medium|high`** (or `MEMTHENA_PACK_ACTION_RISK`). At `high`, each premise that is stale or rests on a single source is marked "re-verify before acting", and the pack gets an optional `brain_action_risk: high` field. `low`, `medium` and unset packs are byte-for-byte the same as before. The MCP `brain_pack_build` tool takes the same optional `action_risk` (`low`, `medium` or `high`).
+- **Personal eval kit (`scripts/personal-eval.py`).** Scores a brain on the corrections and decisions it actually holds. It copies the brain, writes follow-up queries and checks whether packs surface the right record among filler. It writes hashes and scores only, and never writes to the source. See [evaluation](evaluation.md#personal-eval-kit).
 
 ## What's new in 0.11
 
@@ -281,7 +308,7 @@ capture → custody + episode → policy/review → canonical OKF
 
 ## Why agents use it
 
-| Need | LLM-Brain behaviour |
+| Need | Memthena behaviour |
 |---|---|
 | Context survives sessions | Project memory lives on disk instead of inside one chat window. |
 | Humans stay out of the plumbing | Agents retrieve context and capture authorised closeouts through host integrations. |
@@ -296,11 +323,11 @@ An explicit `--intent evidence` or `--intent current_state` pack puts unresolved
 
 Retrieval receipts remain opt-in (`search --receipt`, `pack build --receipt`, or `bridge recall --receipt`). New receipts retain the existing JSONL fields and include identity version 2, with principal, intent, as-of and rendered selection in the idempotency key. Old receipts remain untouched. OKF v0.2 Markdown in storage schema 3 is still authoritative; bridge JSON and receipts are transport and derived audit data.
 
-Hermes' normal capture stays non-blocking. Its optional checkpoint-required compression setting asks LLM-Brain for a durable bridge completion receipt before compression can discard direct messages; a queued outbox record alone is not that receipt. See the [Hermes guide](../integrations/hermes/llm-brain/README.md) before enabling it, because the setting changes other Hermes compaction paths. OpenClaw remains an explicit staged observation, and Pi, Oh My Pi and Claude Code keep their own session mechanisms without becoming canonical memory writers.
+Hermes' normal capture stays non-blocking. Its optional checkpoint-required compression setting asks Memthena for a durable bridge completion receipt before compression can discard direct messages; a queued outbox record alone is not that receipt. See the [Hermes guide](../integrations/hermes/llm-brain/README.md) before enabling it, because the setting changes other Hermes compaction paths. OpenClaw remains an explicit staged observation, and Pi, Oh My Pi and Claude Code keep their own session mechanisms without becoming canonical memory writers.
 
 ## Install
 
-LLM-Brain uses Bash, Python and pinned PyYAML. It does not require a database or daemon.
+Memthena uses Bash, Python and pinned PyYAML. It does not require a database or daemon.
 
 ```bash
 git clone https://github.com/w00ch3a/LLM-Brain.git
@@ -360,7 +387,7 @@ $brain pack build PROJECT_ID --task "current task" --budget-tokens 4000
 
 The final command is only an example: use the exact token and target returned by the preview. Retraction records a tombstone and audit event; it does not pretend that historical custody never existed.
 
-The project layout stays readable without LLM-Brain:
+The project layout stays readable without Memthena:
 
 ```text
 projects/PROJECT_ID/
@@ -378,7 +405,7 @@ projects/PROJECT_ID/
 
 ## Hermes Agent memory plugin
 
-The standalone plugin in [`integrations/hermes/llm-brain/`](../integrations/hermes/llm-brain/) makes LLM-Brain a native Hermes memory provider. Hermes can retrieve project context before a request and capture each completed turn without a model-specific adapter.
+The standalone plugin in [`integrations/hermes/llm-brain/`](../integrations/hermes/llm-brain/) makes Memthena a native Hermes memory provider. Hermes can retrieve project context before a request and capture each completed turn without a model-specific adapter.
 
 ### MemoryProvider
 
@@ -440,7 +467,7 @@ An empty `project_id` lets the plugin resolve the registered Hermes workspace or
 
 `LLMBrainContextEngine` subclasses Hermes' native `ContextCompressor`. It preserves Hermes compression, token accounting and model-switch behaviour, then inserts one request-scoped provenance block. Selection does not modify stored conversation history.
 
-MemoryProvider recall is the safe setup default. Enable the context engine when LLM-Brain should own request context selection:
+MemoryProvider recall is the safe setup default. Enable the context engine when Memthena should own request context selection:
 
 ```bash
 hermes plugins enable llm-brain --no-allow-tool-override
@@ -476,7 +503,7 @@ Each bridge command writes one JSON object to stdout. JSON carries transport dat
 
 ## Retrieval and memory control
 
-LLM-Brain supports:
+Memthena supports:
 
 - lexical, configured vector, hybrid and graph-expanded retrieval;
 - conflict-aware Hermes evidence retrieval that ranks user content separately from assistant suggestions, preserves competing dates, and exposes resolution mode and provenance in bridge JSON;
@@ -629,12 +656,61 @@ are `usage PROJECT_ID`, `stability show PROJECT_ID`, `review triage PROJECT_ID`
 and `association propose PROJECT_ID`.
 
 The repository-only outcome harness runs small coding tasks with and without
-LLM-Brain and scores them only with executable tests:
+Memthena and scores them only with executable tests:
 `scripts/eval-outcome.py --cases tests/fixtures/outcome/tasks.v1.json --output NEW_DIR [--runner EXECUTABLE]`.
 The bundled reference runner is deterministic and only proves that the harness
 measures memory-dependent outcomes; plug in a real agent with `--runner`.
 
 The repository-only lifecycle evaluator runs thirteen ground-truth scenario families (including a rapid-update interference stress family) at short (20-event) and long (200-event) checkpoints. It seeds facts, validity intervals, trust channels, visibility and as-of dates before applying updates, retractions, conflicts, poisoning, repair and procedure-capsule events. Each checkpoint compares six bounded modes: `none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`. It scores stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance alongside candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. Run it with `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; an answer runner is optional, and model-answer accuracy remains unmeasured when it is absent. See [the development evaluation guide](evaluation.md). Evaluation reports are disposable derived artefacts and never become memory.
+
+### Capture, packs and retraction hygiene (26 Oct)
+
+All fields below are optional, additive OKF v0.2 frontmatter; nothing needs a
+migration and records without them behave as before.
+
+- **Speaker roles at capture.** Hermes, Codex and Claude Code captures keep
+  structured speaker roles. A `[User]:`-style label that appears inside message
+  content or tool output is escaped and is never treated as user-authored.
+  Episodes record `brain_speaker_roles: structured`, `brain_speaker_turns` and,
+  when something was escaped, `brain_role_labels_escaped`.
+- **Hermes post-compaction re-inject.** On Hermes's `post_compaction` hook the
+  plugin re-injects a size-capped pack. Config: `post_compaction_reinject`
+  (default on) and `post_compaction_budget_tokens` (default 625). Older Hermes
+  builds without the hook are unaffected.
+- **Pack freshness.** Every pack says `Index freshness: index as of audit seq N;
+  M captures not yet indexed` (frontmatter `brain_index_audit_seq`,
+  `brain_unindexed_captures`). The count resets on `index build`.
+  `LLM_BRAIN_PACK_FRESHNESS=0` turns the line off.
+- **"Applies when" scope.** A preference or constraint can carry
+  `brain_applies_when: "project=ID; host=hermes,codex; task=review"`. Scope fails
+  open: every tool and agent can read all memory at the same time, and a clause
+  hides a record only when the caller's value for that key is known and
+  different. An unknown, `generic` or `mcp` host (the MCP server with no
+  `LLM_BRAIN_HOST`), no task type or no project never hides anything; the host comes
+  from `--host`, `LLM_BRAIN_HOST` (the Hermes plugin sets `hermes`) or a
+  non-generic `--agent`, and the task type from `--task-type` or
+  `LLM_BRAIN_TASK_TYPE`. Unknown keys or malformed clauses never hide the record; it is
+  shown with a one-line `memthena:` warning. The
+  pack counts hidden records in `brain_applies_when_hidden`. The brief obeys the
+  same scope (`brief --host NAME --task-type TYPE`, or the same env vars) and
+  notes how many records it left out (`scope_hidden` in `--json`); the
+  session-start hook passes its agent (`LLM_BRAIN_AGENT`, default `claude-code`)
+  as the host unless `LLM_BRAIN_HOST` is set. Plain `search` is an explicit
+  lookup, so it still lists scoped records but adds `[out of scope: ...]` to the
+  title only when the caller is known and differs.
+- **Retraction finishes properly.** `retract PID ID --source REF --reason R
+  --preview|--confirm TOKEN` retracts one source behind a claim. If another
+  independent source still backs it, only a receipt tombstone is written
+  (`okf/retractions/receipts/`, `brain_retracts_source`, `brain_source_of`) and
+  the claim stays active, with its folder summaries rebuilt. When the last source
+  goes, it falls through to a full retraction. A full retraction now also purges
+  retracted content from retrieval receipts (query logs and pack receipts) and
+  feedback text (ids, lineage and the tombstone stay), deletes the record's
+  embeddings, refreshes folder summaries and generated `index.md`, and checks
+  every derived store, including registered Neural Expansion export pages. If a
+  store did not update, it exits 75 with `retraction_apply=incomplete` and names
+  the store. The tombstone stays in force. After fixing the store, run
+  `retract PID ID --finish` to re-check.
 
 ## Neural Expansion
 
@@ -686,7 +762,7 @@ Public archives exclude vault records, task captures, local usernames, home-dire
 
 ## Licence and responsibility
 
-LLM-Brain is provided under the Apache License 2.0. The licence governs the grant of rights and its disclaimers and limitations; applicable law may limit how those terms operate. Use, configuration, validation, migration and deployment remain the user's responsibility. No documentation, test or evaluation result is a guarantee of correctness, availability, security, regulatory compliance or fitness for a particular purpose.
+Memthena is provided under the Apache License 2.0. The licence governs the grant of rights and its disclaimers and limitations; applicable law may limit how those terms operate. Use, configuration, validation, migration and deployment remain the user's responsibility. No documentation, test or evaluation result is a guarantee of correctness, availability, security, regulatory compliance or fitness for a particular purpose.
 
 ## Upgrade
 

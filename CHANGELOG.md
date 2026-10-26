@@ -8,6 +8,37 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.12.0 - 2026-10-26
+
+- LLM-Brain is now Memthena. `memthena` and `MEMTHENA_*` are aliases for
+  `llm-brain` and `LLM_BRAIN_*` (`MEMTHENA_*` wins); nothing is renamed on disk.
+  Message prefixes are now `memthena:`; exit codes unchanged.
+- Much faster on large and network-shared vaults: batched index builds, a
+  per-machine stat-checked record cache (`MEMTHENA_CACHE=0`), macOS bulk folder
+  checks (`MEMTHENA_BULK_STAT=0`), host-aware locks, a cached brief in the
+  session hook, and an optional trust window (`MEMTHENA_NAS_TRUST_SECONDS`,
+  default off). Search output unchanged.
+- Bundled 4 MB `lbembed-v2-int4` embedder for hybrid search (`MEMTHENA_EMBED=1`).
+- Opt-in System One review model (`MEMTHENA_S1=1`): can only make an outcome
+  more cautious, never promotes; fails open. Optional 32m model as a separate
+  release asset (`memthena models install|status|remove system-one-32m`).
+- `migrate okf-backfill [--check|--apply|--undo ID]`: adds OKF `description:`
+  lines and generated folder `index.md` files; check is read-only, apply is
+  audited and byte-for-byte undoable; restricted, secret and owner-only records
+  are skipped.
+- `eval run` raw-history baseline arms (`raw-bm25`, `raw-embed`) and a "Raw-history baseline" report table; default reports unchanged.
+- `doctor` replays `audit.v2.tsv` against canonical frontmatter and the current index (read-only; `--no-audit-replay`, `MEMTHENA_DOCTOR_AUDIT_REPLAY=0`, `MEMTHENA_DOCTOR_AUDIT_MAX_EVENTS`).
+- `pack build --action-risk low|medium|high` (`MEMTHENA_PACK_ACTION_RISK`): at high, stale or single-source premises are marked "re-verify before acting"; other levels are byte-identical to the default.
+- `scripts/personal-eval.py`: copy-only personal eval kit that outputs hashes and scores only.
+- Packs escape role-label lines in recalled text (`brain_role_labels_escaped`); the Hermes plugin re-injects a size-capped pack after compaction (`post_compaction_reinject`).
+- Packs show index freshness (`Index freshness: ...`, `brain_index_audit_seq`, `brain_unindexed_captures`; `LLM_BRAIN_PACK_FRESHNESS=0` turns it off).
+- Optional `brain_applies_when` scope on preferences and constraints: packs, standing constraints, Hermes bridge recall, `brief` (`--host`, `--task-type`) and the session-start hook honour it; plain `search` lists scoped records with an `[out of scope: ...]` note. Scope fails open: it hides a record only when the caller's host, task or project is known and different, so an unidentified caller (including MCP with no `LLM_BRAIN_HOST`) sees all memory; malformed scopes are shown with a `memthena:` warning.
+- `retract --source` writes a receipt tombstone while another independent source still backs the claim; full retraction purges derived stores and `retract --finish` re-checks an incomplete one.
+- MCP `brain_pack_build` takes an optional `action_risk` (`low`, `medium`, `high`); omitted gives the default pack.
+- The lifecycle evaluation allows each CLI step up to 180 seconds
+  (`LLM_BRAIN_EVAL_CLI_TIMEOUT`), up from 60, so a busy machine no longer
+  fails release checks on a stalled call.
+- No vault migration; schema 3, OKF v0.2 and writer format level 1 unchanged.
 
 ## 0.11.0 - 2026-10-20
 

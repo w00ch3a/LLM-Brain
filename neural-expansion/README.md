@@ -1,6 +1,6 @@
 # Neural Expansion
 
-Neural Expansion is LLM-Brain's read-only, offline memory-graph viewer. It
+Neural Expansion is Memthena's read-only, offline memory-graph viewer. It
 renders records and their typed relations as an interactive graph, with a
 detail panel, search, status filters and a keyboard-accessible list view.
 
@@ -80,7 +80,7 @@ synced or static-server directory. Read [PRIVACY.md](PRIVACY.md) first.
 | `tests/` | Synthetic adapter, demo and viewer-logic tests |
 
 The adapters use the Python standard library plus the PyYAML version that
-LLM-Brain already pins (`requirements-okf.lock`).
+Memthena already pins (`requirements-okf.lock`).
 
 ## Checks
 

@@ -22,7 +22,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -748,6 +748,9 @@ def summary_text(vault: Vault, folder: Path) -> str:
         state = ""
         if resolved in vault.resolver.file_set:
             state = " (superseded)" if resolved in vault.superseded() else ("" if vault.resolver.effective(resolved) else " (not effective)")
+        dropped = len(retracted_sources(vault.root, vault.rel(path)))
+        if dropped:
+            state += f" ({dropped} source{'s' if dropped != 1 else ''} retracted)"
         groups.setdefault(key, []).append(f"- [{title}]({path.name}){state}: {summary}" if summary else f"- [{title}]({path.name}){state}")
     for key in sorted(groups, reverse=True):
         lines.append(f"## {key}")
@@ -916,13 +919,336 @@ def command_working(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- 26 Oct: retraction completion
+#
+# `retract --source REF` retracts one source (receipt) behind a claim.  When
+# another independent source still backs the claim, only a receipt tombstone
+# is written (okf/retractions/receipts/<id>--src-<sha12>.md; type Retraction,
+# brain_retracts_source, brain_source_of, no brain_retracts) and the claim
+# stays active.  A full retraction then finishes with `retract-finish`: purge
+# retracted content from query logs / pack receipts / feedback text (ids and
+# the tombstone stay), drop derived embeddings, and verify every derived store,
+# failing closed with the stores that did not update.
+
+RECEIPT_TOMBSTONES = Path("okf") / "retractions" / "receipts"
+
+
+def retracted_sources(root: Path, rel: str) -> set[str]:
+    """Source keys already retracted (receipt tombstones) for record REL."""
+    folder = Path(root) / RECEIPT_TOMBSTONES
+    out: set[str] = set()
+    if not folder.is_dir():
+        return out
+    for path in sorted(folder.glob("*.md")):
+        try:
+            meta, _ = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        if clean(meta.get("brain_source_of")) == rel and clean(meta.get("brain_retracts_source")):
+            out.add(clean(meta.get("brain_retracts_source")))
+    return out
+
+
+def source_carriers(vault: Vault, target: Path) -> dict[str, list[str]]:
+    """Source key -> records carrying it (the target itself or supporters)."""
+    trel = vault.rel(target)
+    tmeta = vault.meta(target)
+    out: dict[str, list[str]] = {_source_key(tmeta, trel): [trel]}
+    verified = tmeta.get("verified")
+    if isinstance(verified, dict) and str(verified.get("by", "")).startswith("human:"):
+        out.setdefault("human-verification", []).append(trel)
+    superseded = vault.superseded()
+    for path in vault.semantic_files():
+        if path == target or path in superseded or not vault.resolver.effective(path):
+            continue
+        meta = vault.meta(path)
+        if any(vault.resolver.canonical_ref(item) == target for item in ref_list(meta.get("brain_supports"))):
+            out.setdefault(_source_key(meta, vault.rel(path)), []).append(vault.rel(path))
+    return out
+
+
+def command_retract_source_plan(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    target = vault.root / args.ref
+    if not target.is_file():
+        print(f"memthena: canonical item missing: {args.ref}", file=sys.stderr)
+        return 66
+    carriers = source_carriers(vault, target)
+    done = retracted_sources(vault.root, args.ref)
+    live = {key: refs for key, refs in carriers.items() if key not in done}
+    wanted = clean(args.source)
+    key = ""
+    if wanted in live:
+        key = wanted
+    else:  # a supporting record path also names its source
+        for candidate, refs in live.items():
+            if wanted in refs and wanted != args.ref:
+                key = candidate
+                break
+    if not key:
+        print(f"backing=0 key= remaining={len(live)} sources={','.join(sorted(live)) or 'none'}")
+        return 0
+    remaining = sorted(k for k in live if k != key)
+    print(f"backing=1 key={key} remaining={len(remaining)} sources={','.join(remaining) or 'none'} carriers={','.join(live[key])}")
+    return 0
+
+
+def _purge_refs(value: Any, rel: str, tomb: str) -> Any:
+    if isinstance(value, list):
+        return [tomb if item == rel else _purge_refs(item, rel, tomb) for item in value]
+    if isinstance(value, str):
+        return value.replace(rel, tomb)
+    return value
+
+
+def _mentions(text: str, needles: list[str]) -> bool:
+    return any(needle and needle in text for needle in needles)
+
+
+def purge_receipts(root: Path, rel: str, cid: str, chash: str) -> int:
+    path = root / "audit" / "retrieval-receipts.jsonl"
+    if not path.is_file():
+        return 0
+    tomb = f"okf/retractions/{cid}.md"
+    needles = [rel, chash]
+    changed = 0
+    import fcntl
+    with open(path, "r+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        rows = stream.read().splitlines()
+        out = []
+        for line in rows:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                out.append(line)
+                continue
+            if not isinstance(row, dict) or not _mentions(line, needles):
+                out.append(line)
+                continue
+            keep = {"schema", "receipt_identity_version", "receipt_id", "recorded_at", "surface", "project_id",
+                    "selected", "rendered_selection", "evidence_refs", "retrieval_mode", "degraded", "intent",
+                    "principal", "context_truncated", "context_rendered_count", "evidence_opened", "evidence_incomplete"}
+            row = {k: _purge_refs(v, rel, tomb) for k, v in row.items() if k in keep}
+            row["query_sha256"] = "purged"
+            row["purged_for"] = cid
+            out.append(json.dumps(row, sort_keys=True))
+            changed += 1
+        if changed:
+            tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+            tmp.write_text("".join(item + "\n" for item in out), encoding="utf-8")
+            os.replace(tmp, path)
+    return changed
+
+
+def purge_feedback(root: Path, rel: str, cid: str, chash: str, packs: set[str]) -> int:
+    folder = root / "feedback"
+    if not folder.is_dir():
+        return 0
+    marker = f"purged: retracted {cid}"
+    changed = 0
+    for path in sorted(folder.glob("*.md")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            meta, _ = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        if clean(meta.get("brain_purged_for")) == cid:
+            continue
+        if clean(meta.get("brain_pack_ref")) not in packs and not _mentions(text, [rel, chash, f"{cid}.md"]):
+            continue
+        lines = text.split("\n")
+        head, body, fences = [], [], 0
+        for line in lines:
+            if fences < 2:
+                if line == "---":
+                    fences += 1
+                    if fences == 2:
+                        head.append(f"brain_purged_for: {cid}")
+                    head.append(line)
+                    continue
+                if line.startswith("brain_notes:"):
+                    line = f'brain_notes: "{marker}"'
+                head.append(line)
+            else:
+                body.append(line)
+        kept = []
+        for line in body:  # keep the ids block (Pack/hash/usefulness/principal)
+            kept.append(line)
+            if line.startswith("Principal:"):
+                break
+        new = "\n".join(head + kept + ["", marker, ""])
+        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+        tmp.write_text(new, encoding="utf-8")
+        os.replace(tmp, path)
+        changed += 1
+    return changed
+
+
+def command_retract_finish(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    root = vault.root
+    rel, cid, chash = args.ref, args.id, args.hash
+    record = root / rel
+    title = ""
+    if record.is_file():
+        try:
+            title = clean(okf.split_frontmatter(record)[0].get("title"))
+        except okf.OkfError:
+            title = ""
+    packs = {item for item in (args.affected or "").split(",") if item.startswith("context-packs/")}
+    stores: list[tuple[str, str, str]] = []
+    failed: list[str] = []
+
+    def report(name: str, state: str, detail: str) -> None:
+        stores.append((name, state, detail))
+        if state == "failed":
+            failed.append(name)
+
+    try:
+        report("receipts", "ok", f"purged={purge_receipts(root, rel, cid, chash)}")
+    except OSError as error:
+        report("receipts", "failed", f"error={type(error).__name__}")
+    try:
+        report("feedback", "ok", f"purged={purge_feedback(root, rel, cid, chash, packs)}")
+    except OSError as error:
+        report("feedback", "failed", f"error={type(error).__name__}")
+
+    # Embeddings: vectors are keyed by the canonical file hash.
+    embeddings = root / "indexes" / "embeddings"
+    removed = 0
+    for path in sorted(embeddings.glob(f"{chash}-*")) if chash and embeddings.is_dir() else []:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    left = sorted(p.name for p in embeddings.glob(f"{chash}-*")) if chash and embeddings.is_dir() else []
+    report("embeddings", "failed" if left else "ok", f"removed={removed}" + (f" residual={','.join(left)}" if left else ""))
+
+    # Search index: no index file may still name the record or its hash.
+    residual = []
+    indexes = root / "indexes"
+    if indexes.is_dir():
+        for path in sorted(indexes.rglob("*")):
+            if not path.is_file() or embeddings in path.parents or (indexes / "summaries") in path.parents:
+                continue
+            if path.suffix not in {".tsv", ".txt", ".json", ".md", ".jsonl"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _mentions(text, [rel, chash]):
+                residual.append(path.relative_to(root).as_posix())
+    report("search-index", "failed" if residual else "ok", f"residual={','.join(residual) or 'none'}")
+
+    # Folder summaries: indexes/summaries and the generated okf index.md.
+    summary_residual = []
+    summaries = root / "indexes" / "summaries"
+    if summaries.is_dir():
+        for folder in summary_folders(vault):
+            name = folder.relative_to(root).as_posix().replace("/", "__") + ".md"
+            text = summary_text(vault, folder)
+            target = summaries / name
+            if not target.exists() or target.read_text(encoding="utf-8") != text:
+                tmp = target.with_suffix(".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(target)
+        for path in sorted(summaries.glob("*.md")):
+            if f"]({record.name})" in path.read_text(encoding="utf-8", errors="replace"):
+                summary_residual.append(path.relative_to(root).as_posix())
+    folder_index = record.parent / "index.md"
+    if folder_index.is_file() and okf._bf_is_ours(folder_index):
+        for line in folder_index.read_text(encoding="utf-8", errors="replace").splitlines():
+            if f"]({record.name})" in line and ((title and title in line) or " - " in line):
+                summary_residual.append(folder_index.relative_to(root).as_posix())
+                break
+    report("folder-summary", "failed" if summary_residual else "ok", f"residual={','.join(summary_residual) or 'none'}")
+
+    # Neural Expansion exports live outside the vault; we cannot rewrite them,
+    # so any registered page that still carries the record fails closed.
+    registry = root / "audit" / "neural-expansion-exports.tsv"
+    stale = []
+    if registry.is_file():
+        outputs = []
+        for line in registry.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[2] not in outputs:
+                outputs.append(parts[2])
+        for output in outputs:
+            page = Path(output)
+            try:
+                text = page.read_text(encoding="utf-8", errors="replace") if page.is_file() else ""
+            except OSError:
+                text = ""
+            if _mentions(text, [rel, chash, title if len(title) >= 8 else ""]):
+                stale.append(output)
+    report("neural-expansion-export", "failed" if stale else "ok", f"stale={','.join(stale) or 'none'}")
+
+    for name, state, detail in stores:
+        print(f"derived_store={name} state={state} {detail}")
+    print(f"failed_stores={','.join(failed) or 'none'}")
+    return 0
+
 # ------------------------------------------- #4 standing constraints
 
-def constraint_rows(vault: Vault, now: dt.datetime) -> list[dict[str, str]]:
+APPLIES_WHEN_KEYS = {"project": "project", "host": "host", "task": "task", "task_type": "task"}
+
+
+def parse_applies_context(value: str) -> dict[str, str]:
+    """'project=a;host=b;task=c' -> {key: value}; empty values are dropped."""
+    out: dict[str, str] = {}
+    for clause in (value or "").split(";"):
+        key, sep, val = clause.partition("=")
+        key = APPLIES_WHEN_KEYS.get(key.strip().lower(), "")
+        if sep and key and val.strip():
+            out[key] = val.strip()
+    return out
+
+
+def applies_when_ok(value: Any, context: Optional[dict[str, str]]) -> bool:
+    """26 Oct: brain_applies_when scope check (mirrors applies_when_filter in
+    bin/llm-brain).  Fails open: a clause hides only when the caller's value
+    for that key is known and different.  Unknown/generic/mcp host, missing
+    task or project never hide; a malformed clause or unknown key shows the
+    record with a one-line memthena: warning on stderr."""
+    if context is None:
+        return True
+    text = clean(value).strip().strip("\"'").strip()
+    if text in ("", "null", "~"):
+        return True
+    bad = False
+    for clause in text.split(";"):
+        clause = clause.strip()
+        if not clause:
+            continue
+        key, sep, want = clause.partition("=")
+        key = APPLIES_WHEN_KEYS.get(key.strip().lower(), "")
+        if not sep or not key or not want.strip():
+            bad = True
+            continue
+        have = (context.get(key, "") or "").strip()
+        if key == "host" and have.lower() in ("generic", "mcp", "unknown"):
+            have = ""
+        if not have:
+            continue
+        wanted = [item.strip() for item in want.split(",")]
+        if "*" not in wanted and have.lower() not in {item.lower() for item in wanted}:
+            return False
+    if bad:
+        import sys as _sys
+        print(f"memthena: warning: malformed brain_applies_when {text!r} (shown anyway)", file=_sys.stderr)
+    return True
+
+
+def constraint_rows(vault: Vault, now: dt.datetime, applies: Optional[dict[str, str]] = None) -> list[dict[str, str]]:
     stored = active_labels(vault)
     rows = []
     for path in vault.semantic_files():
         if not vault.eligible(path, now):
+            continue
+        if not applies_when_ok(vault.meta(path).get("brain_applies_when"), applies):
             continue
         rel = vault.rel(path)
         kind = clean(vault.meta(path).get("brain_constraint"))
@@ -1069,7 +1395,8 @@ def command_pack_extras(args: argparse.Namespace) -> int:
     now = now_from(args.now)
     out: list[str] = []
     if args.turn:
-        rows = constraint_rows(vault, now) if constraints_due(args.turn, args.every) else []
+        applies = parse_applies_context(args.applies_context) if args.applies_context else None
+        rows = constraint_rows(vault, now, applies) if constraints_due(args.turn, args.every) else []
         if rows:
             out.append(f"## Standing Constraints — still in force at turn {args.turn}\n")
             out += [f"- {row['kind'].upper()}: {row['title']}: {row['text']} [{row['ref']}]" for row in rows]
@@ -1662,6 +1989,119 @@ def command_capture_tag(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------- 26 Oct: structured speaker roles at capture
+
+# Labels typed inside content or tool output ("[User]: ...", "Assistant:",
+# "<|im_start|>user") are quoted text.  The speaker of a turn comes only from
+# the transcript's structured role field; the same pattern is mirrored in the
+# Hermes plugin, which is packaged separately.
+ROLE_LABEL_RE = re.compile(
+    r"(?im)^([ \t>]*)("
+    r"\[(?:user|human|assistant|ai|system|developer|tool)\](?:[ \t]*:)?"
+    r"|(?:user|human|assistant|ai|system|developer)[ \t]*:"
+    r"|<\|(?:user|assistant|system|im_start|im_end|endoftext)\|>"
+    r")"
+)
+ROLE_LABEL_ESCAPE = "(quoted) "
+SPEAKER_TURNS_BYTES = 24000
+
+
+def escape_role_labels(text: str) -> tuple[str, int]:
+    count = 0
+
+    def quote(match: "re.Match[str]") -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group(1)}{ROLE_LABEL_ESCAPE}{match.group(2)}"
+
+    return ROLE_LABEL_RE.sub(quote, text or ""), count
+
+
+def _content_parts(role: str, content: Any) -> list[tuple[str, str]]:
+    """(speaker, text) pairs from one structured message.  Tool results that
+    hosts deliver inside a user-role message (Claude Code) stay tool output."""
+    if isinstance(content, str):
+        return [(role, content)]
+    out: list[tuple[str, str]] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                out.append((role, item))
+            elif isinstance(item, dict):
+                kind = str(item.get("type") or "")
+                if kind in {"text", "input_text", "output_text"}:
+                    out.append((role, str(item.get("text") or "")))
+                elif kind == "tool_result":
+                    out.extend(("tool", text) for _, text in _content_parts("tool", item.get("content")))
+                elif kind == "tool_use":
+                    out.append(("tool-call", f"tool call {item.get('name') or 'unknown'}"))
+    return out
+
+
+def speaker_turns(path: Path) -> list[tuple[str, str]] | None:
+    """Speaker turns from a Codex, Claude Code or role/content JSONL
+    transcript, or None when the file is not one."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    turns: list[tuple[str, str]] = []
+    parsed = bad = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(obj, dict):
+            bad += 1
+            continue
+        parsed += 1
+        if obj.get("type") == "response_item" and isinstance(obj.get("payload"), dict):
+            obj = obj["payload"]
+        message = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+        kind = str(obj.get("type") or "")
+        if kind in {"function_call_output", "custom_tool_call_output"}:
+            output = obj.get("output")
+            turns.extend(_content_parts("tool", output if isinstance(output, (str, list)) else json.dumps(output)))
+            continue
+        if kind in {"function_call", "custom_tool_call"}:
+            turns.append(("tool-call", f"tool call {obj.get('name') or 'unknown'}"))
+            continue
+        role = str(message.get("role") or "").lower()
+        if role not in {"user", "assistant", "system", "developer", "tool"}:
+            continue
+        turns.extend(_content_parts(role, message.get("content")))
+    if not parsed or bad > parsed or not turns:
+        return None
+    return [(role, text) for role, text in turns if text.strip()]
+
+
+def command_speaker_turns(args: argparse.Namespace) -> int:
+    turns = speaker_turns(Path(args.file))
+    if not turns:
+        return 0
+    out, escaped, used, shown = [], 0, 0, 0
+    for index, (role, text) in enumerate(turns, 1):
+        quoted, count = escape_role_labels(text.strip())
+        escaped += count
+        block = f"### {index}. speaker: {role}\n\n{quoted}\n"
+        size = len(block.encode("utf-8"))
+        if used + size > args.max_bytes:
+            out.append(f"[speaker turns truncated after {shown} of {len(turns)}]\n")
+            # Count escapes in the rest so the field reflects the whole source.
+            escaped += sum(escape_role_labels(rest)[1] for _, rest in turns[index:])
+            break
+        out.append(block)
+        used += size
+        shown += 1
+    print(f"turns={len(turns)} escaped={escaped}")
+    sys.stdout.write("\n".join(out))
+    return 0
+
+
 # ------------------------------------------- 0.10: sticky forgetting (#10)
 
 def forget_neighbours(vault: Vault, ref: str, threshold: float = 0.5) -> list[tuple[str, str]]:
@@ -1743,7 +2183,7 @@ def belief_support(vault: Vault, target: Path) -> list[str]:
         meta = vault.meta(path)
         if any(vault.resolver.canonical_ref(item) == target for item in ref_list(meta.get("brain_supports"))):
             keys.add(_source_key(meta, vault.rel(path)))
-    return sorted(keys)
+    return sorted(keys - retracted_sources(vault.root, trel))
 
 
 def belief_check(vault: Vault, review: Path) -> dict[str, Any]:
@@ -2172,6 +2612,14 @@ def parser() -> argparse.ArgumentParser:
     bd.add_argument("--task", default="")
     ob = base("observe", command_observe)
     ob.add_argument("--within-days", type=float, default=7.0)
+    rsp = base("retract-source-plan", command_retract_source_plan)
+    rsp.add_argument("--ref", required=True)
+    rsp.add_argument("--source", required=True)
+    rf = base("retract-finish", command_retract_finish)
+    rf.add_argument("--ref", required=True)
+    rf.add_argument("--id", required=True)
+    rf.add_argument("--hash", default="")
+    rf.add_argument("--affected", default="")
     pe = base("pack-extras", command_pack_extras)
     pe.add_argument("--task", default="")
     pe.add_argument("--selected", default="")
@@ -2180,6 +2628,7 @@ def parser() -> argparse.ArgumentParser:
     pe.add_argument("--session", default="")
     pe.add_argument("--state-index", action="store_true")
     pe.add_argument("--evidence", action="store_true")
+    pe.add_argument("--applies-context", default="")
     base("brief-extras", command_brief_extras)
     ro = base("ruled-out", command_ruled_out)
     ro.add_argument("--action", choices=("add", "reopen", "list"), required=True)
@@ -2230,6 +2679,10 @@ def parser() -> argparse.ArgumentParser:
     ho.add_argument("--since", default="")
     ho.add_argument("--session", default="")
     ho.add_argument("--json", action="store_true")
+    st = commands.add_parser("speaker-turns")
+    st.add_argument("--file", required=True)
+    st.add_argument("--max-bytes", type=int, default=SPEAKER_TURNS_BYTES)
+    st.set_defaults(func=command_speaker_turns)
     hs = base("history-states", command_history_states)
     hs.add_argument("--selected", required=True)
     return result

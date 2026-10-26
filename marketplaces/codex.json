@@ -1,7 +1,7 @@
 {
   "name": "llm-brain",
   "interface": {
-    "displayName": "LLM-Brain"
+    "displayName": "Memthena"
   },
   "plugins": [
     {
@@ -9,7 +9,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/w00ch3a/LLM-Brain.git",
-        "ref": "v0.4.0"
+        "ref": "v0.12.0"
       },
       "policy": {
         "installation": "AVAILABLE",

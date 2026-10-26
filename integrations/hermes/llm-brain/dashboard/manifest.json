@@ -1,9 +1,9 @@
 {
   "name": "llm-brain",
   "label": "Neural Expansion",
-  "description": "LLM-Brain memory viewer: synthetic demo, or this profile's principal-filtered brain with label lineage (opt-in)",
+  "description": "Memthena memory viewer: synthetic demo, or this profile's principal-filtered brain with label lineage (opt-in)",
   "icon": "Brain",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "tab": {
     "path": "/neural-expansion",
     "position": "end"

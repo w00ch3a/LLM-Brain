@@ -1,7 +1,11 @@
-# LLM-Brain
+# Memthena
+
+**One intelligence. Infinite possibilities.**
+
+Memthena (formerly LLM-Brain) is the same project under a new name. Nothing on disk changes: the `llm-brain` command, `LLM_BRAIN_*` settings, plugin ids and your vault keep working exactly as before. `memthena` and `MEMTHENA_*` are new aliases for the same things (when both are set, `MEMTHENA_*` wins).
 
 <p align="center">
-  <img src="docs/assets/llm-brain-logo.png" alt="LLM-Brain" width="480">
+  <img src="docs/assets/llm-brain-logo.png" alt="Memthena" width="480">
 </p>
 
 [![Release](https://img.shields.io/github/v/release/w00ch3a/LLM-Brain)](https://github.com/w00ch3a/LLM-Brain/releases)
@@ -10,7 +14,7 @@
 
 **Plain-Markdown project memory for AI agents, with the evidence behind every claim.**
 
-LLM-Brain gives Codex, Claude Code, Gemini CLI, Hermes Agent and other agents a
+Memthena gives Codex, Claude Code, Gemini CLI, Hermes Agent and other agents a
 shared memory that lives in ordinary files. No database, no daemon, no hosted
 service.
 
@@ -166,6 +170,19 @@ Labels also show in Neural Expansion's detail panel:
 `invalidate preview|apply` marks related records KEEP, STALE, REPLACE or
 UNKNOWN, and search and packs accept `--label` / `--without-label`. See the
 [v0.9.0 notes](docs/releases/v0.9.0.md).
+
+## What's new in 0.12
+
+LLM-Brain is now Memthena: same project, same brain, nothing renamed on disk
+(`memthena` and `MEMTHENA_*` are aliases). Large and network-shared vaults are
+much faster: on a 5,000-record vault `doctor` went from 306 s to 0.6 s and
+`index build` from 208 s to 1.5 s, with search output unchanged. A 4 MB
+embedder is bundled (`MEMTHENA_EMBED=1`), the System One review model is opt-in
+(`MEMTHENA_S1=1`) and can only make a review more cautious, and a larger 32m
+model is an optional per-machine download. `migrate okf-backfill` adds OKF
+`description:` lines with a read-only `--check` and a byte-for-byte `--undo`.
+Nine smaller memory features are listed in the notes. No vault migration.
+Details: [v0.12.0 notes](docs/releases/v0.12.0.md).
 
 ## What's new in 0.11
 

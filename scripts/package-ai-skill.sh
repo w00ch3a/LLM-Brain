@@ -43,9 +43,11 @@ python3 -m py_compile "$repo_root/lib/memory_signals.py"
 python3 -m py_compile "$repo_root/lib/memory_lineage.py"
 python3 -m py_compile "$repo_root/lib/review_policy.py"
 python3 -m py_compile "$repo_root/lib/mcp_server.py"
+python3 -m py_compile "$repo_root/lib/memthena_s1.py"
 python3 -m py_compile "$repo_root/scripts/eval-lifecycle.py"
 python3 -m py_compile "$repo_root/scripts/eval-outcome.py"
 python3 -m py_compile "$repo_root/scripts/outcome-reference-runner.py"
+python3 -m py_compile "$repo_root/scripts/personal-eval.py"
 
 python3 - "$repo_root" "$version" <<'PY'
 import json
@@ -93,6 +95,15 @@ install -m 0755 "$repo_root/lib/memory_signals.py" "$plugin/skills/llm-brain/scr
 install -m 0755 "$repo_root/lib/memory_lineage.py" "$plugin/skills/llm-brain/scripts/memory_lineage.py"
 install -m 0755 "$repo_root/lib/review_policy.py" "$plugin/skills/llm-brain/scripts/review_policy.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$plugin/skills/llm-brain/scripts/mcp_server.py"
+install -m 0755 "$repo_root/bin/memthena" "$plugin/skills/llm-brain/scripts/memthena"
+install -m 0755 "$repo_root/lib/memthena_s1.py" "$plugin/skills/llm-brain/scripts/memthena_s1.py"
+# Memthena models (embedder + System One); both stay opt-in at runtime.
+copy_models() {
+  [ -d "$repo_root/models" ] || return 0
+  cp -R "$repo_root/models" "$1/models"
+  find "$1/models" \( -name __pycache__ -o -name '.DS_Store' -o -name '._*' \) -prune -exec rm -rf {} +
+}
+copy_models "$plugin/skills/llm-brain"
 # Neural Expansion ships with synthetic data only; caches and OS junk never ship.
 copy_neural_expansion() {
   cp -R "$repo_root/neural-expansion" "$1/neural-expansion"
@@ -117,6 +128,9 @@ install -m 0755 "$repo_root/lib/memory_signals.py" "$standalone/lib/memory_signa
 install -m 0755 "$repo_root/lib/memory_lineage.py" "$standalone/lib/memory_lineage.py"
 install -m 0755 "$repo_root/lib/review_policy.py" "$standalone/lib/review_policy.py"
 install -m 0755 "$repo_root/lib/mcp_server.py" "$standalone/lib/mcp_server.py"
+install -m 0755 "$repo_root/bin/memthena" "$standalone/bin/memthena"
+install -m 0755 "$repo_root/lib/memthena_s1.py" "$standalone/lib/memthena_s1.py"
+copy_models "$standalone"
 install -m 0644 "$repo_root/adapters/generic.md" "$standalone/adapters/generic.md"
 install -m 0644 "$repo_root/docs/guide.md" "$standalone/docs/guide.md"
 install -m 0644 "$repo_root/docs/real-eval-results.md" "$standalone/docs/real-eval-results.md"
@@ -134,7 +148,10 @@ fi
 
 dist="$repo_root/dist"
 mkdir -p "$dist"
-python3 - "$stage_root" "$dist" "$name" "$version" <<'PY'
+# Optional System One 32m asset (separate download; see `llm-brain models install`).
+s1_optional="${LLM_BRAIN_S1_32M_DIR:-$repo_root/models-optional/memthena-s1-32m-int8}"
+[ -f "$s1_optional/memthena-s1-32m.int8.onnx" ] || s1_optional=""
+python3 - "$stage_root" "$dist" "$name" "$version" "$s1_optional" <<'PY'
 import gzip
 import hashlib
 import os
@@ -240,6 +257,33 @@ for kind in ("plugin", "standalone"):
     destination.with_suffix(destination.suffix + ".sha256").write_text(
         f"{digest}  {destination.name}\n", encoding="utf-8"
     )
+
+optional = sys.argv[5] if len(sys.argv) > 5 else ""
+if optional:
+    root = Path(optional)
+    if root.name != "memthena-s1-32m-int8":
+        raise ValueError("optional System One folder must be named memthena-s1-32m-int8")
+    import shutil, tempfile
+    staged = Path(tempfile.mkdtemp(prefix="s1-32m.", dir=dist)) / root.name
+    shutil.copytree(root, staged, symlinks=True, ignore=shutil.ignore_patterns("._*", ".DS_Store", "__pycache__"))
+    if any(item.is_symlink() for item in staged.rglob("*")):
+        raise ValueError("optional System One folder must not contain links")
+    root = staged
+    destination = dist / f"{name}-{version}-system-one-32m.tar.gz"
+    first = destination.with_suffix(destination.suffix + ".first")
+    second = destination.with_suffix(destination.suffix + ".second")
+    build(root, first)
+    build(root, second)
+    if first.read_bytes() != second.read_bytes():
+        raise ValueError(f"non-reproducible archive: {destination.name}")
+    first.replace(destination)
+    second.unlink()
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    destination.with_suffix(destination.suffix + ".sha256").write_text(
+        f"{digest}  {destination.name}\n", encoding="utf-8"
+    )
+    shutil.rmtree(staged.parent)
+    print(f"package=ok type=system-one-32m file={destination}")
 PY
 
 printf 'package=ok type=plugin file=%s\n' "$dist/${name}-${version}-plugin.tar.gz"

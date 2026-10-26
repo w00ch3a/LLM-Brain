@@ -14,6 +14,7 @@ The CLI (``bin/llm-brain``) owns locking, audit and all persistent writes.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import fnmatch
 import hashlib
@@ -57,8 +58,10 @@ BM25_K1 = 1.2
 PHRASE_BONUS = 2.0
 PATH_BOOST = 6.0
 # Fields that never carry retrievable meaning (hashes, ids, bookkeeping).
+# `description` (0.12 okf-backfill) repeats the body's lead sentence, so it is
+# skipped to keep rankings identical before and after the backfill.
 META_SKIP = re.compile(
-    r"(hash|sha256|_id$|^brain_schema_version$|^okf_version$|_at$|^timestamp$|^generated$|^verified$|^brain_provenance$|^brain_source_ref$|^brain_code_anchors$)"
+    r"(hash|sha256|_id$|^brain_schema_version$|^okf_version$|_at$|^timestamp$|^generated$|^verified$|^brain_provenance$|^brain_source_ref$|^brain_code_anchors$|^description$)"
 )
 # FSRS-4.5 default parameters (open-spaced-repetition).  Difficulty is held
 # at a neutral 5 because memory records have no per-item grading history.
@@ -141,7 +144,9 @@ def first_sentence(body: str, limit: int = 180) -> str:
         if sum(len(item) for item in lines) > limit:
             break
     text = " ".join(lines)
-    match = re.search(r"(.+?[.!?])(\s|$)", text)
+    # ``.`` never matches a newline, so without one any match starts at 0 and
+    # an anchored match finds the same span in linear rather than quadratic time.
+    match = (re.search if "\n" in text else re.match)(r"(.+?[.!?])(\s|$)", text)
     if match and len(match.group(1)) <= limit:
         text = match.group(1)
     if len(text) > limit:
@@ -209,7 +214,7 @@ class Vault:
 
     def body(self, path: Path) -> str:
         self.resolver.load(path)
-        return self.resolver.bodies.get(path.resolve(), "")
+        return self.resolver.bodies.get(okf.resolve_path(path), "")
 
     def rel(self, path: Path) -> str:
         return self.resolver.relative(path)
@@ -375,6 +380,24 @@ def command_bm25(args: argparse.Namespace) -> int:
     return 0
 
 
+# Paths this process already saw as regular, non-symlink files (lstat or an
+# O_NOFOLLOW open in okf.RecordCache).  For those, resolve(path) equals
+# resolve(parent) / name, so one memoised resolve per folder replaces one
+# lstat per path component per record (each a network round trip on a NAS).
+_REGULAR_FILES: set[str] = set()
+_DIR_RESOLVED: dict[str, Path] = {}
+
+
+def _resolve_record(item: str, path: Path) -> Path:
+    if item in _REGULAR_FILES and path.name not in ("", ".", ".."):
+        parent = os.fspath(path.parent)
+        found = _DIR_RESOLVED.get(parent)
+        if found is None:
+            found = _DIR_RESOLVED[parent] = path.parent.resolve()
+        return found / path.name
+    return path.resolve()
+
+
 def bm25_rows(
     project_dir: str,
     paths: list[str],
@@ -402,7 +425,7 @@ def bm25_rows(
         except (OSError, okf.OkfError):
             continue
         try:
-            rel = path.resolve().relative_to(project).as_posix()
+            rel = _resolve_record(item, path).relative_to(project).as_posix()
         except ValueError:
             continue
         globs = ref_list(metadata.get("brain_paths"))
@@ -496,6 +519,14 @@ def v2_anchor_texts(items: list[tuple[str, dict[str, str], dict[str, Any]]]) -> 
     for every markdown or [[wiki]] link that resolves to another record of
     this pass (exact project-relative path, path suffix or unique basename)."""
     by_rel = {rel: rel for rel, _, _ in items}
+    # Every "/"-boundary suffix of every path, so a suffix lookup is one dict
+    # get instead of a scan of all records (same matches as endswith("/" + t)).
+    by_suffix: dict[str, list[str]] = defaultdict(list)
+    for rel in by_rel:
+        start = rel.find("/")
+        while start != -1:
+            by_suffix[rel[start + 1:]].append(rel)
+            start = rel.find("/", start + 1)
     by_base: dict[str, list[str]] = defaultdict(list)
     for rel, _, _ in items:
         base = rel.rsplit("/", 1)[-1]
@@ -511,7 +542,7 @@ def v2_anchor_texts(items: list[tuple[str, dict[str, str], dict[str, Any]]]) -> 
                 continue
             found = by_rel.get(target)
             if found is None:
-                suffix = [item for item in by_rel if item.endswith("/" + target)]
+                suffix = by_suffix.get(target, ())
                 if len(suffix) == 1:
                     found = suffix[0]
             if found is None:
@@ -675,7 +706,7 @@ def bm25_rows_v2(
         except (OSError, okf.OkfError):
             continue
         try:
-            rel = path.resolve().relative_to(project).as_posix()
+            rel = _resolve_record(item, path).relative_to(project).as_posix()
         except ValueError:
             continue
         items.append((rel, fields, metadata))
@@ -1038,6 +1069,258 @@ def _yaml_valid_all(raws: list[bytes]) -> list[tuple[bool, tuple[dict[str, Any],
     return [_yaml_valid(raw) for raw in raws]
 
 
+# --- vault-scan: one pass over canonical records for the shell hot paths -----
+# Mirrors, byte for byte, what bin/llm-brain computes per record with
+# find/awk/sha256sum/tr/grep (canonical_files, canonical_file_effective with
+# the uncached frontmatter_field parse, build_indexes rows).  Anything it
+# cannot reproduce exactly raises _Unsure and the shell falls back to its
+# original per-record path.  Reads go through okf.RecordCache.
+
+def _awk_field_plain(raw: bytes, key: bytes, aliases: bytes = b"") -> bytes:
+    """frontmatter_field without MAINT_FIELDS_CACHE_DIR (the plain awk)."""
+    lines = raw.split(b"\n")
+    if raw.endswith(b"\n"):
+        lines.pop()
+    if not lines or lines[0] != b"---":
+        return b""
+    wanted = b"," + key + b"," + aliases + b","
+    for line in lines[1:]:
+        if line == b"---":
+            break
+        if b"\0" in line:
+            raise _Unsure()
+        field = line.split(b":", 1)[0]
+        if b"," + field + b"," in wanted:
+            colon = line.find(b":")
+            value = line[colon + 1 :] if colon >= 0 else line
+            value = value.strip(_AWK_SPACE)
+            if value.startswith(b'"'):
+                value = value[1:]
+            if value.endswith(b'"'):
+                value = value[:-1]
+            if value and (value[0] >= 0x80 or value[-1] >= 0x80):
+                raise _Unsure()
+            return value
+    return b""
+
+
+def _scan_canonical(project: bytes) -> list[bytes]:
+    """`find DIR/okf -type f -name '*.md' ! -name index.md ! -name log.md
+    ! -path '*/retractions/*' | LC_ALL=C sort`."""
+    found: list[bytes] = []
+
+    def walk(directory: bytes) -> None:
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            return
+        with iterator:
+            for entry in iterator:
+                path = directory + b"/" + entry.name
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        walk(path)
+                        continue
+                    regular = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                name = entry.name
+                if not regular or not name.endswith(b".md") or name in (b"index.md", b"log.md"):
+                    continue
+                if b"/retractions/" in path:
+                    continue
+                if b"\n" in path or b"\t" in path or b"\r" in path:
+                    raise _Unsure()
+                found.append(path)
+
+    walk(project + b"/okf")
+    return sorted(found)
+
+
+def _retraction_names(project: bytes) -> set[bytes]:
+    names: set[bytes] = set()
+    directory = project + b"/okf/retractions"
+    try:
+        with os.scandir(directory) as iterator:
+            for entry in iterator:
+                if entry.name.endswith(b".md") and os.path.isfile(directory + b"/" + entry.name):
+                    names.add(entry.name[:-3])
+    except OSError:
+        pass
+    return names
+
+
+def _plain_effective(raw: bytes, path: bytes, retracted: set[bytes]) -> bool:
+    if _record_id(path) in retracted:
+        return False
+    state = _awk_field_plain(raw, b"brain_review_state", b"review_state")
+    status = _awk_field_plain(raw, b"status")
+    if status == b"deprecated":
+        return False
+    if state:
+        if state != b"approved":
+            return False
+    elif (status or b"stable") != b"stable":
+        return False
+    sensitivity = _awk_field_plain(raw, b"brain_sensitivity", b"sensitivity") or b"internal"
+    return sensitivity != b"restricted"
+
+
+_LINK_RE = re.compile(rb"\[\[[^\]\n]+\]\]|\[[^\]\n]+\]\([^)\n]+\)")
+
+
+def _link_targets(raw: bytes) -> list[bytes]:
+    targets: list[bytes] = []
+    for match in _LINK_RE.finditer(raw):
+        target = match.group(0)
+        target = re.sub(rb"^\[\[", b"", target, count=1)
+        target = re.sub(rb"\]\]\Z", b"", target, count=1)
+        target = re.sub(rb"^[^\]]*\]\(", b"", target, count=1)
+        target = re.sub(rb"\)\Z", b"", target, count=1)
+        if target:
+            targets.append(target)
+    return targets
+
+
+def _term_counts(raw: bytes) -> dict[bytes, int]:
+    counts: dict[bytes, int] = {}
+    for word in re.split(rb"[^a-z0-9]+", raw.lower()):
+        if len(word) > 2:
+            counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+def _stat_text(entry: dict[str, Any]) -> bytes:
+    key = entry.get("k")
+    return b"-" if not key else ",".join(str(part) for part in key).encode("ascii")
+
+
+def command_vault_scan(args: argparse.Namespace) -> int:
+    project = os.fsencode(args.project_dir)
+    prefix = project + b"/"
+    cache = okf.RecordCache(args.project_dir, enabled=False if args.no_cache else None)
+    need_meta = args.mode in ("facts", "index", "layout")
+    out = sys.stdout.buffer
+    try:
+        files = _scan_canonical(project)
+        retracted = _retraction_names(project)
+        records: list[tuple[bytes, bytes, dict[str, Any]]] = []
+        for path in files:
+            rel = path[len(prefix):]
+            entry = cache.read(os.fsdecode(path), os.fsdecode(rel), need_meta=need_meta)
+            records.append((path, rel, entry))
+        cache.prune(os.fsdecode(rel) for _, rel, _ in records)
+        if args.mode == "signature":
+            for path, rel, entry in records:
+                if _plain_effective(entry["raw"], path, retracted):
+                    out.write(rel + b"\t" + entry["sha"].encode("ascii") + b"\n")
+        elif args.mode == "facts":
+            for path, _rel, entry in records:
+                facts = "" if "err" in entry else okf.facts_metadata_text(entry["meta"])
+                if "\n" in facts:
+                    raise _Unsure()
+                out.write(path + b"\t" + facts.encode("utf-8", "surrogateescape") + b"\n")
+        elif args.mode in ("index", "verify"):
+            stage = Path(args.out_dir)
+            effective = [(p, r, e) for p, r, e in records if _plain_effective(e["raw"], p, retracted)]
+            if args.mode == "verify":
+                recorded = (stage / "scan-stat.tsv").read_bytes().splitlines()
+                current = [r + b"\t" + e["sha"].encode("ascii") + b"\t" + _stat_text(e) for _, r, e in effective]
+                if (stage / "all-paths.txt").read_bytes() != b"".join(p + b"\n" for p in files):
+                    print("admission")
+                    return 1
+                if [line.split(b"\t")[0] for line in recorded] != [r for _, r, _ in effective]:
+                    print("admission")
+                    return 1
+                for old, new in zip(recorded, current):
+                    old_rel, old_sha, old_stat = old.split(b"\t")
+                    new_rel, new_sha, new_stat = new.split(b"\t")
+                    # Without the cache every file was re-read and re-hashed.
+                    if old_sha != new_sha or (cache.enabled and old_stat != new_stat):
+                        print("content")
+                        return 1
+                print("ok")
+                return 0
+            project_id = os.fsencode(args.project_id)
+            schema = os.fsencode(args.schema)
+            docs, terms, graph, manifest, stats = [], [], [], [], []
+            for path, rel, entry in effective:
+                raw = entry["raw"]
+                if b"\0" in raw or "err" in entry:
+                    raise _Unsure()
+                sha = entry["sha"].encode("ascii")
+                facts = okf.facts_metadata_text(entry["meta"]).encode("utf-8", "surrogateescape")
+                ftype, title, status, trust, freshness, generated_at, stale_after, source_count, runtime = facts.split(b"\t")
+                state = _awk_field_plain(raw, b"brain_review_state", b"review_state")
+                sensitivity = _awk_field_plain(raw, b"brain_sensitivity", b"sensitivity") or b"internal"
+                temperature = _awk_field_plain(raw, b"brain_loading_temperature") or b"warm"
+                topic_id = _awk_field_plain(raw, b"brain_topic_id", b"topic_id")
+                provenance = _awk_field_plain(raw, b"brain_provenance")
+                conflicts = _awk_field_plain(raw, b"brain_conflicts")
+                supersedes = _awk_field_plain(raw, b"brain_supersedes")
+                docs.append(b"\t".join((rel, sha, ftype, title, state, status, trust, freshness, sensitivity, temperature, topic_id, generated_at, stale_after, source_count, runtime)))
+                for word, count in _term_counts(raw).items():
+                    terms.append(word + b"\t" + rel + b"\t" + str(count).encode("ascii"))
+                graph.append(project_id + b"\tcontains\t" + rel)
+                if topic_id:
+                    graph.append(rel + b"\thas_topic\t" + topic_id)
+                if provenance:
+                    graph.append(rel + b"\tprovenance\t" + provenance)
+                if conflicts:
+                    graph.append(rel + b"\tconflicts_with\t" + conflicts)
+                if supersedes:
+                    graph.append(rel + b"\tsupersedes\t" + supersedes)
+                for target in _link_targets(raw):
+                    graph.append(rel + b"\tlinks_to\t" + target)
+                manifest.append(rel + b"\t" + sha + b"\t" + schema + b"\t")
+                stats.append(rel + b"\t" + sha + b"\t" + _stat_text(entry))
+            def write(name: str, rows: list[bytes]) -> None:
+                (stage / name).write_bytes(b"".join(row + b"\n" for row in rows))
+            write("all-paths.txt", files)
+            write("facts-paths.txt", [p for p, _, _ in effective])
+            write("scan-docs.rows", docs)
+            write("scan-terms.rows", terms)
+            write("scan-graph.rows", graph)
+            write("scan-manifest.rows", manifest)
+            write("scan-stat.tsv", stats)
+        elif args.mode == "layout":
+            # Read-only OKF layout report (the "migrate check" view of the
+            # optional OKF features this vault does not use yet).
+            missing_description = wikilink_only = no_generated_at = 0
+            for path, rel, entry in records:
+                meta = entry.get("meta") if "err" not in entry else None
+                if not isinstance(meta, dict):
+                    continue
+                if not str(meta.get("description") or "").strip():
+                    missing_description += 1
+                generated = meta.get("generated")
+                if not (isinstance(generated, dict) and generated.get("at")):
+                    no_generated_at += 1
+                body = entry["raw"]
+                if b"[[" in body and not re.search(rb"\]\((?:/|\.{0,2}/?)[^)]*\.md\)", body):
+                    wikilink_only += 1
+            directories = sorted({os.path.dirname(rel) for _, rel, _ in records})
+            missing_index = [d for d in directories if d and not os.path.isfile(project + b"/" + d + b"/index.md")]
+            log_entries = 0
+            try:
+                log_entries = len(re.findall(rb"(?m)^## [0-9]{4}-[0-9]{2}-[0-9]{2}", (Path(os.fsdecode(project)) / "okf" / "log.md").read_bytes()))
+            except OSError:
+                pass
+            print(f"okf_layout records={len(records)} missing_description={missing_description} "
+                  f"missing_generated_at={no_generated_at} wikilink_only={wikilink_only} "
+                  f"dirs_without_index={len(missing_index)} log_date_groups={log_entries} "
+                  f"migration_needed_for_description_backfill={'yes' if missing_description else 'no'}")
+            for directory in missing_index:
+                print("okf_layout dir_without_index=" + os.fsdecode(directory))
+        else:
+            return 64
+    except (_Unsure, OSError, KeyError, ValueError, okf.OkfError):
+        return 3
+    finally:
+        cache.save()
+    return 0
+
+
 def command_search_prepare(args: argparse.Namespace) -> int:
     project = os.fsencode(args.project_dir)
     out = Path(args.out_dir)
@@ -1057,10 +1340,27 @@ def command_search_prepare(args: argparse.Namespace) -> int:
     signature: list[bytes] = []
     supersession_lines: list[bytes] = []
     supersession: list[bytes] = []
+    # Stat-checked local cache: on a hit no read and no YAML parse.
+    cache = okf.RecordCache(args.project_dir, trust=True)
+    entries: list[dict[str, Any] | None] = []
     try:
         for path in paths:
-            with open(path, "rb") as stream:
-                raw = stream.read()
+            entry = None
+            if cache.enabled and path.startswith(prefix):
+                try:
+                    entry = cache.read(os.fsdecode(path), os.fsdecode(path[len(prefix):]), need_meta=False)
+                except (okf.OkfError, OSError):
+                    entry = None  # the plain read below decides, exactly as before
+            if entry is not None:
+                raw = entry["raw"]
+                try:
+                    _REGULAR_FILES.add(path.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+            else:
+                with open(path, "rb") as stream:
+                    raw = stream.read()
+            entries.append(entry)
             record = _Record(path, raw)
             records.append(record)
             if _effective(project, record):
@@ -1076,7 +1376,29 @@ def command_search_prepare(args: argparse.Namespace) -> int:
     eligible: list[str] = []
     parsed: dict[str, tuple[dict[str, Any], str]] = {}
     unsure = False
-    for record, (valid, document) in zip(records, _yaml_valid_all([record.raw for record in records])):
+    validity: list[tuple[bool, tuple[dict[str, Any], str] | None] | None] = []
+    pending: list[int] = []
+    for index, entry in enumerate(entries):
+        if entry is not None and "meta" in entry:
+            try:
+                metadata, body = okf.RecordCache.metadata_body(entry)
+                if "type" in metadata:
+                    okf.scalar_text(metadata["type"])
+                validity.append((True, (metadata, body)))
+                continue
+            except Exception:  # noqa: BLE001 - same verdict as _yaml_valid
+                pass
+        validity.append(None)
+        pending.append(index)
+    for index, result in zip(pending, _yaml_valid_all([records[index].raw for index in pending])):
+        validity[index] = result
+        entry = entries[index]
+        if result[0] and result[1] is not None and entry is not None and entry.get("k"):
+            entry["meta"] = copy.deepcopy(result[1][0])
+            entry["body_at"] = len(records[index].raw.decode("utf-8")) - len(result[1][1])
+            cache.dirty = True
+    cache.save()
+    for record, (valid, document) in zip(records, validity):
         try:
             verdict = b"1" if _eligible(project, record, valid, options, supersession) else b"0"
         except _Unsure:
@@ -1104,8 +1426,38 @@ def command_search_prepare(args: argparse.Namespace) -> int:
             with (out / "bm25.tsv").open("w", encoding="utf-8") as stream:
                 for rel, score, matched in rows:
                     stream.write(f"{rel}\t{score:.6f}\t{matched or '-'}\n")
+    if args.fields_dir:
+        _write_fields_cache(Path(args.fields_dir), os.fsencode(args.fields_strip or ""), records, out)
     (out / "eligible.tsv").write_bytes(b"".join(line + b"\n" for line in verdicts))
     return 0
+
+
+def _write_fields_cache(fields_dir: Path, strip: bytes, records: list["_Record"], out: Path) -> None:
+    """Fill frontmatter_field's per-run cache (what fields_cache_prewarm's awk
+    writes) from bytes this pass already holds, so the shell does not read
+    every record a second time (one open+read per record is a network round
+    trip on a NAS).  Only plain-ASCII headers are written; any other record
+    is left out and frontmatter_field fills it lazily with its own awk."""
+    try:
+        if not fields_dir.is_dir() or fields_dir.is_symlink() or any(fields_dir.iterdir()):
+            return
+        for record in records:
+            if record.unsure or not all(key.isascii() and value.isascii() for key, value in record.pairs):
+                continue
+            key = record.path[len(strip):] if strip and record.path.startswith(strip) else record.path
+            target = os.path.join(os.fsencode(fields_dir), key.replace(b"/", b"__"))
+            with open(target, "xb") as stream:
+                stream.write(b"".join(name + b"\t" + value + b"\n" for name, value in record.pairs))
+        (out / "fields.done").write_bytes(b"")
+    except OSError:
+        # Partial fill is still correct (missing entries are filled lazily);
+        # without fields.done the shell runs its own prewarm, which only
+        # runs on an empty directory, so clear what was written.
+        for child in fields_dir.iterdir() if fields_dir.is_dir() else ():
+            try:
+                child.unlink()
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------- usage data
@@ -1871,14 +2223,26 @@ def command_notices(args: argparse.Namespace) -> int:
 TRUST_ORDER = {"human-reviewed": 0, "machine-confirmed": 1, "unverified": 2}
 
 
-def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: int) -> dict[str, Any]:
+def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: int, applies: dict[str, str] | None = None) -> dict[str, Any]:
     durable = []
     recent = []
     stale = 0
+    scope_hidden = 0
+    scope_ok = None
+    if applies is not None:
+        # 26 Oct: brain_applies_when scope (same rule as packs and recall).
+        try:
+            import memory_lineage
+            scope_ok = memory_lineage.applies_when_ok
+        except Exception:  # an older partial install without the lineage helper
+            scope_ok = None
     for path in vault.semantic_files():
         if not vault.eligible(path, now):
             continue
         metadata = vault.meta(path)
+        if scope_ok is not None and not scope_ok(metadata.get("brain_applies_when"), applies):
+            scope_hidden += 1
+            continue
         freshness = okf.freshness(metadata, now.date())
         if freshness in ("stale", "invalid"):
             stale += 1
@@ -1929,7 +2293,7 @@ def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: i
     notices = lifecycle_notices(vault, now, "", 6)
     noticed = {item["ref"] for item in notices if item["kind"] == "correction"}
     durable = [item for item in durable if item["ref"] not in noticed]
-    return {"durable": durable, "recent": recent, "retractions": retractions, "stale_omitted": stale, "due_intentions": sorted(due), "notices": notices}
+    return {"durable": durable, "recent": recent, "retractions": retractions, "stale_omitted": stale, "due_intentions": sorted(due), "notices": notices, "scope_hidden": scope_hidden}
 
 
 def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recent_days: int, now: dt.datetime) -> tuple[str, int]:
@@ -1989,6 +2353,8 @@ def render_brief(project_id: str, payload: dict[str, Any], max_bytes: int, recen
                 break
     if payload["stale_omitted"]:
         add(f"({payload['stale_omitted']} stale record(s) omitted pending re-verification.)")
+    if payload.get("scope_hidden"):
+        add(f"({payload['scope_hidden']} record(s) scoped to another project, host or task omitted.)")
     if payload.get("forgotten"):
         never, stale = payload["forgotten"]
         add(f"({never} saved record(s) never recalled and {stale} request(s) with no update in 30+ days; run `llm-brain forgotten`.)")
@@ -2007,7 +2373,14 @@ def command_brief(args: argparse.Namespace) -> int:
     vault = Vault(args.project_dir, args.principal)
     now = now_from(args.now)
     max_bytes = max(args.max_bytes, 256)
-    payload = brief_payload(vault, now, max_bytes, args.recent_days)
+    applies = None
+    if getattr(args, "applies_context", None) is not None:
+        try:
+            import memory_lineage
+            applies = memory_lineage.parse_applies_context(args.applies_context)
+        except Exception:
+            applies = None
+    payload = brief_payload(vault, now, max_bytes, args.recent_days, applies)
     try:
         import memory_lineage
         payload["working"] = [
@@ -2046,7 +2419,7 @@ def command_brief(args: argparse.Namespace) -> int:
             "status": "ok", "derived": True, "project_id": args.project_id, "max_bytes": max_bytes,
             "bytes": utf8_len(text), "omitted": omitted, "durable_count": len(payload["durable"]),
             "recent_count": len(payload["recent"]) + len(payload["retractions"]),
-            "stale_omitted": payload["stale_omitted"], "compacted": compacted, "brief": text,
+            "stale_omitted": payload["stale_omitted"], "scope_hidden": payload.get("scope_hidden", 0), "compacted": compacted, "brief": text,
         }, ensure_ascii=False, separators=(",", ":")))
     else:
         sys.stdout.write(text)
@@ -2152,6 +2525,297 @@ def command_validate_anchor(args: argparse.Namespace) -> int:
     return 65 if error else 0
 
 
+# ------------------------------------------------------------------ raw-history baseline (eval)
+
+RAW_BM25_K1 = 1.2
+RAW_BM25_B = 0.75
+
+
+def _raw_history_files(project: Path, limit: int) -> list[Path]:
+    """Raw history: captured episodes plus the source custody they point at."""
+    found: list[Path] = []
+    for root in (project / "episodes", project / "sources"):
+        for directory, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith(".md") and name not in ("index.md", "log.md"):
+                    path = Path(directory) / name
+                    if path.is_file() and not path.is_symlink():
+                        found.append(path)
+    found.sort()
+    return found[:limit] if limit > 0 else found
+
+
+def _raw_body(raw: bytes) -> bytes:
+    if raw.startswith(b"---\n"):
+        end = raw.find(b"\n---", 4)
+        if end >= 0:
+            newline = raw.find(b"\n", end + 4)
+            return raw[newline + 1:] if newline >= 0 else b""
+    return raw
+
+
+def _raw_tokens(text: bytes) -> list[str]:
+    return TOKEN_RE.findall(text.decode("utf-8", "replace").lower())
+
+
+def _raw_embed(embedder: str, path: Path) -> list[float] | None:
+    try:
+        result = subprocess.run([embedder, os.fspath(path)], capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("vector:"):
+            try:
+                return [float(value) for value in line[7:].replace(",", " ").split()]
+            except ValueError:
+                return None
+    return None
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    if not left or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
+    return dot / norm if norm else 0.0
+
+
+def command_raw_baseline(args: argparse.Namespace) -> int:
+    """Rank raw history for a query with no memory pipeline at all.
+
+    The Raw-RAG baseline: plain BM25 (or one embedding per file) over the
+    episode and source-custody bodies, frontmatter stripped.  Packs and indexes must beat it.
+    Output: ``rel<TAB>rank<TAB>score`` for the top --limit files.
+    """
+    project = Path(args.project_dir)
+    files = _raw_history_files(project, args.max_docs)
+    bodies = []
+    for path in files:
+        try:
+            bodies.append((path, _raw_body(path.read_bytes())))
+        except OSError:
+            continue
+    scored: list[tuple[float, str]] = []
+    if args.mode == "bm25":
+        query = sorted(set(_raw_tokens(args.query.encode("utf-8"))))
+        docs = [(path, _raw_tokens(body)) for path, body in bodies]
+        count = len(docs)
+        average = (sum(len(tokens) for _, tokens in docs) / count) if count else 0.0
+        frequency: dict[str, int] = defaultdict(int)
+        for _, tokens in docs:
+            for token in set(tokens):
+                frequency[token] += 1
+        for path, tokens in docs:
+            if not tokens:
+                continue
+            counts: dict[str, int] = defaultdict(int)
+            for token in tokens:
+                counts[token] += 1
+            score = 0.0
+            for term in query:
+                tf = counts.get(term, 0)
+                if not tf:
+                    continue
+                idf = math.log(1 + (count - frequency[term] + 0.5) / (frequency[term] + 0.5))
+                score += idf * tf * (RAW_BM25_K1 + 1) / (tf + RAW_BM25_K1 * (1 - RAW_BM25_B + RAW_BM25_B * len(tokens) / (average or 1.0)))
+            if score > 0:
+                scored.append((score, os.path.relpath(path, project)))
+    else:
+        if not args.embedder or not os.access(args.embedder, os.X_OK):
+            return 69
+        cache = Path(args.cache_dir) if args.cache_dir else None
+        if cache is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+        query_file = (cache or Path(os.environ.get("TMPDIR", "/tmp"))) / f".raw-query.{os.getpid()}.md"
+        query_file.write_text(args.query + "\n", encoding="utf-8")
+        try:
+            query_vector = _raw_embed(args.embedder, query_file)
+        finally:
+            query_file.unlink(missing_ok=True)
+        if not query_vector:
+            return 69
+        for path, body in bodies:
+            digest = hashlib.sha256(body).hexdigest()
+            cached = cache / f"{digest}.vec" if cache is not None else None
+            vector = None
+            if cached is not None and cached.is_file():
+                try:
+                    vector = [float(value) for value in cached.read_text(encoding="ascii").split()]
+                except (OSError, ValueError):
+                    vector = None
+            if vector is None:
+                body_file = (cache or Path(os.environ.get("TMPDIR", "/tmp"))) / f".raw-body.{os.getpid()}.md"
+                body_file.write_bytes(body)
+                try:
+                    vector = _raw_embed(args.embedder, body_file)
+                finally:
+                    body_file.unlink(missing_ok=True)
+                if vector is None:
+                    return 69
+                if cached is not None:
+                    cached.write_text(" ".join(repr(value) for value in vector), encoding="ascii")
+            score = _cosine(query_vector, vector)
+            if score > 0:
+                scored.append((score, os.path.relpath(path, project)))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    for rank, (score, rel) in enumerate(scored[: args.limit], 1):
+        print(f"{rel}\t{rank}\t{score:.6f}")
+    return 0
+
+
+# ------------------------------------------------------------------ audit replay (doctor)
+
+AUDIT_CANONICAL_DIRS = ("claims", "procedures", "references", "topics")
+AUDIT_ADMIT_ACTIONS = {"review-promote", "migration-promote-context-architecture", "topic-add"}
+
+
+def _audit_canonical(project: Path, object_id: str) -> tuple[str, Path] | None:
+    for folder in AUDIT_CANONICAL_DIRS:
+        path = project / "okf" / folder / f"{object_id}.md"
+        if path.is_file() and not path.is_symlink():
+            return f"okf/{folder}/{object_id}.md", path
+    return None
+
+
+def command_audit_replay(args: argparse.Namespace) -> int:
+    """Replay audit.v2.tsv and compare it with frontmatter and the index.
+
+    Read-only.  For every canonical record the audit log admitted, retracted
+    or re-dated, the last event must agree with the record's frontmatter
+    (lifecycle state, retraction file, ``stale_after``) and, when the current
+    index generation was built after that event, with the index rows.
+    Records with no lifecycle events (hand-written, imported) are not judged.
+    Output lines: ``mismatch|note<TAB>kind<TAB>object<TAB>expected<TAB>found``
+    then ``summary<TAB>...``.  Exit 0 always unless the log is unreadable.
+    """
+    project = Path(args.project_dir)
+    audit = project / "audit.v2.tsv"
+    out = sys.stdout
+    if not audit.is_file():
+        print("summary\tevents=0\trecords=0\tmismatches=0\tnotes=0\taudit=missing")
+        return 0
+    life: dict[str, tuple[str, int]] = {}
+    stale: dict[str, tuple[str, int]] = {}
+    sweep_admitted: set[str] = set()
+    index_events: dict[str, int] = {}
+    events = 0
+    truncated = False
+    with audit.open("rb") as stream:
+        stream.readline()
+        for seq, line in enumerate(stream, 1):
+            if args.max_events > 0 and seq > args.max_events:
+                truncated = True
+                break
+            parts = line.rstrip(b"\r\n").decode("utf-8", "replace").split("\t")
+            if len(parts) < 11:
+                continue
+            events = seq
+            action, object_id, new_state, details = parts[2], parts[4], parts[6], parts[8]
+            if not re.fullmatch(r"[A-Za-z0-9._:@-]{1,200}", object_id) and action != "index-build":
+                continue
+            if action in AUDIT_ADMIT_ACTIONS:
+                life[object_id] = ("admitted", seq)
+            elif action == "review-sweep" and new_state == "approved" and "tier=AUTO" in details:
+                life[object_id] = ("admitted", seq)
+                sweep_admitted.add(object_id)
+            elif action == "review-sweep-undo" and object_id in sweep_admitted and life.get(object_id, ("", 0))[0] == "admitted":
+                life[object_id] = ("retracted", seq)
+            elif action == "retract":
+                life[object_id] = ("retracted", seq)
+            elif action == "stability-apply":
+                stale[object_id] = (new_state, seq)
+            elif action == "index-build" and object_id.startswith("indexes/"):
+                index_events[object_id[len("indexes/"):]] = seq
+    if truncated:
+        # A partial replay would judge records by a stale "last event": skip.
+        print(f"summary\tevents={events}\trecords=0\tmismatches=0\tnotes=0\ttruncated=yes")
+        return 0
+    generation = ""
+    try:
+        generation = (project / "indexes" / "current").read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        generation = ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", generation or "-") or not (project / "indexes" / "generations" / generation).is_dir():
+        generation = ""
+    index_seq = index_events.get(generation, 0) if generation else 0
+    index_rows: dict[str, list[str]] | None = None
+    if generation:
+        try:
+            with (project / "indexes" / "generations" / generation / "documents.tsv").open("r", encoding="utf-8", errors="replace") as stream:
+                stream.readline()
+                index_rows = {}
+                for line in stream:
+                    fields = line.rstrip("\n").split("\t")
+                    if fields and fields[0]:
+                        index_rows[fields[0]] = fields
+        except OSError:
+            index_rows = None
+    cache = okf.RecordCache(args.project_dir, enabled=False if args.no_cache else None, trust=True)
+    retracted = _retraction_names(os.fsencode(args.project_dir))
+    findings: list[tuple[str, str, str, str, str]] = []
+    notes: list[tuple[str, str, str, str, str]] = []
+    checked = 0
+    try:
+        for object_id in sorted(set(life) | set(stale)):
+            located = _audit_canonical(project, object_id)
+            expected_life = life.get(object_id)
+            if located is None:
+                if expected_life and expected_life[0] == "admitted":
+                    findings.append(("mismatch", "missing", object_id, "admitted", "no-canonical-file"))
+                continue
+            rel, path = located
+            try:
+                entry = cache.read(os.fspath(path), rel, need_meta=False)
+            except OSError:
+                findings.append(("mismatch", "unreadable", rel, "readable", "error"))
+                continue
+            checked += 1
+            raw = entry["raw"]
+            is_retracted = os.fsencode(object_id) in retracted
+            effective = _plain_effective(raw, os.fsencode(os.fspath(path)), retracted)
+            state = _awk_field_plain(raw, b"brain_review_state", b"review_state").decode("utf-8", "replace") or "none"
+            status = _awk_field_plain(raw, b"status").decode("utf-8", "replace") or "stable"
+            if expected_life:
+                verdict, seq = expected_life
+                if verdict == "retracted":
+                    if not is_retracted:
+                        findings.append(("mismatch", "lifecycle", rel, "retracted", "no-retraction-file"))
+                    if effective:
+                        findings.append(("mismatch", "admission", rel, "not-admitted", f"admitted(state={state},status={status})"))
+                else:
+                    if is_retracted:
+                        notes.append(("note", "unaudited-retraction", rel, "admitted", "retraction-file"))
+                    elif state not in ("approved", "none") or status == "deprecated":
+                        findings.append(("mismatch", "lifecycle", rel, "approved", f"state={state},status={status}"))
+                if index_rows is not None:
+                    if seq > index_seq:
+                        notes.append(("note", "index-behind", rel, f"event={seq}", f"index-build={index_seq or 'none'}"))
+                    elif verdict == "retracted" and rel in index_rows:
+                        findings.append(("mismatch", "index", rel, "not-indexed", "indexed"))
+                    elif verdict == "admitted" and effective and rel not in index_rows:
+                        findings.append(("mismatch", "index", rel, "indexed", "not-indexed"))
+                    elif verdict == "admitted" and rel in index_rows and len(index_rows[rel]) > 4 and index_rows[rel][1] == entry["sha"] and index_rows[rel][4] != (state if state != "none" else ""):
+                        findings.append(("mismatch", "index", rel, f"state={state}", f"state={index_rows[rel][4] or 'none'}"))
+            if object_id in stale:
+                wanted, seq = stale[object_id]
+                found = _awk_field_plain(raw, b"stale_after").decode("utf-8", "replace").strip("\"'") or "none"
+                if found != wanted:
+                    findings.append(("mismatch", "validity", rel, f"stale_after={wanted}", f"stale_after={found}"))
+                elif index_rows is not None and seq <= index_seq and rel in index_rows and len(index_rows[rel]) > 12 and index_rows[rel][1] == entry["sha"]:
+                    indexed = index_rows[rel][12].strip("\"'") or "none"
+                    if indexed != wanted:
+                        findings.append(("mismatch", "index", rel, f"stale_after={wanted}", f"stale_after={indexed}"))
+    except (_Unsure, KeyError, ValueError) as exc:
+        print(f"note\tunavailable\t-\t-\t{type(exc).__name__}")
+    for row in findings + notes:
+        out.write("\t".join(value.replace("\t", " ").replace("\n", " ") for value in row) + "\n")
+    print(f"summary\tevents={events}\trecords={checked}\tmismatches={len(findings)}\tnotes={len(notes)}\ttruncated=no")
+    return 0
+
+
 # ------------------------------------------------------------------ parser
 
 def parser() -> argparse.ArgumentParser:
@@ -2173,6 +2837,28 @@ def parser() -> argparse.ArgumentParser:
     bm25.add_argument("--hint-path", action="append")
     bm25.set_defaults(func=command_bm25)
 
+    vault_scan = commands.add_parser("vault-scan")
+    vault_scan.add_argument("--project-dir", required=True)
+    vault_scan.add_argument("--mode", required=True, choices=("signature", "facts", "index", "verify", "layout"))
+    vault_scan.add_argument("--out-dir", default="")
+    vault_scan.add_argument("--project-id", default="")
+    vault_scan.add_argument("--schema", default="")
+    vault_scan.add_argument("--no-cache", action="store_true")
+    vault_scan.set_defaults(func=command_vault_scan)
+    raw_baseline = commands.add_parser("raw-baseline")
+    raw_baseline.add_argument("--project-dir", required=True)
+    raw_baseline.add_argument("--query", required=True)
+    raw_baseline.add_argument("--mode", required=True, choices=("bm25", "embed"))
+    raw_baseline.add_argument("--embedder", default="")
+    raw_baseline.add_argument("--cache-dir", default="")
+    raw_baseline.add_argument("--limit", type=int, default=20)
+    raw_baseline.add_argument("--max-docs", type=int, default=20000)
+    raw_baseline.set_defaults(func=command_raw_baseline)
+    audit_replay = commands.add_parser("audit-replay")
+    audit_replay.add_argument("--project-dir", required=True)
+    audit_replay.add_argument("--max-events", type=int, default=0)
+    audit_replay.add_argument("--no-cache", action="store_true")
+    audit_replay.set_defaults(func=command_audit_replay)
     prepare = commands.add_parser("search-prepare")
     prepare.add_argument("--project-dir", required=True)
     prepare.add_argument("--paths-file", required=True)
@@ -2187,6 +2873,8 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--now", default="")
     prepare.add_argument("--query")
     prepare.add_argument("--hint-path", action="append")
+    prepare.add_argument("--fields-dir", default="")
+    prepare.add_argument("--fields-strip", default="")
     prepare.set_defaults(func=command_search_prepare)
 
     usage = base("usage", command_usage)
@@ -2219,6 +2907,7 @@ def parser() -> argparse.ArgumentParser:
     brief.add_argument("--no-compact", action="store_true")
     brief.add_argument("--since", default="")
     brief.add_argument("--session", default="")
+    brief.add_argument("--applies-context", default=None)
 
     notices = base("notices", command_notices)
     notices.add_argument("--task", default="")

@@ -1,10 +1,12 @@
-# Install LLM-Brain for me
+# Install Memthena for me
 
-Give this entire file to the local agent or interface where you want LLM-Brain installed.
+Memthena was formerly called LLM-Brain; the command is still `llm-brain` (with `memthena` as an alias).
+
+Give this entire file to the local agent or interface where you want Memthena installed.
 
 ---
 
-You are installing LLM-Brain for this user from the official repository:
+You are installing Memthena for this user from the official repository:
 
 `https://github.com/w00ch3a/LLM-Brain`
 
@@ -12,12 +14,12 @@ Your goal is to get useful, automatic memory working with the least effort from 
 
 ## Start here
 
-Inspect the current agent host, operating system, existing LLM-Brain installation and existing vaults without changing anything.
+Inspect the current agent host, operating system, existing Memthena installation and existing vaults without changing anything.
 
 Then show one short confirmation in this format:
 
 ```text
-Ready to install LLM-Brain
+Ready to install Memthena
 
 It will:
 - remember useful project context between sessions;
@@ -35,7 +37,7 @@ Do not present a technical questionnaire before this choice.
 
 If the user chooses **Install it for me**, continue without asking about retrieval strategies, token budgets, reflection policies, project IDs, timeouts, migration modes or experimental flags.
 
-Ask one additional question only when there is no safe default, an existing installation conflicts with the new one, or installation needs a separate download or external change not covered by installing LLM-Brain. Put the recommended answer first and explain the choice in one sentence.
+Ask one additional question only when there is no safe default, an existing installation conflicts with the new one, or installation needs a separate download or external change not covered by installing Memthena. Put the recommended answer first and explain the choice in one sentence.
 
 ## Recommended settings
 
@@ -77,19 +79,19 @@ Must:
 
 Never:
 
-- Never bypass locks. Wait for a live owner or recover ownership only when LLM-Brain proves the owner died.
+- Never bypass locks. Wait for a live owner or recover ownership only when Memthena proves the owner died.
 - Do not copy credentials, private keys, tokens, personal records or unrelated files into tests, logs or public repositories.
 - Do not migrate a live vault, enable experimental capabilities, make paid model calls, commit, push or publish without separate approval.
 
 Prefer the host's trusted plugin or extension manager when it is already configured. Do not change marketplace sources without approval.
 
-For Hermes, install the standalone plugin under `$HERMES_HOME/plugins/llm-brain/`, run `hermes memory setup llm-brain`, and confirm `hermes memory status`. Keep `context.engine` set to `compressor` unless the user explicitly chose the LLM-Brain ContextEngine.
+For Hermes, install the standalone plugin under `$HERMES_HOME/plugins/llm-brain/`, run `hermes memory setup llm-brain`, and confirm `hermes memory status`. Keep `context.engine` set to `compressor` unless the user explicitly chose the Memthena ContextEngine.
 
 For another local agent without a native plugin, use the host-neutral `bridge recall` and `bridge capture` commands rather than creating a second memory store.
 
 ## Test before claiming success
 
-1. Confirm LLM-Brain reports the selected version and passes `detect`, `doctor` and `lint` for the configured vault.
+1. Confirm Memthena reports the selected version and passes `detect`, `doctor` and `lint` for the configured vault.
 2. Resolve one approved workspace and recall a small provenance-labelled context block.
 3. Capture one clearly marked synthetic turn, replay it and prove the replay creates no duplicate episode.
 4. Confirm the test did not directly change canonical `okf/` memory and left no stuck work item.

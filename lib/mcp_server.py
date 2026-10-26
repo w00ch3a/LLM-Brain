@@ -64,6 +64,7 @@ def tool_definitions(read_only: bool) -> list[dict[str, Any]]:
             "task": text_property("Task description."),
             "budget_tokens": {"type": "integer", "minimum": 1, "maximum": 32000, "description": "Approximate token budget (default 1200)."},
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative file paths the task touches."},
+            "action_risk": {"type": "string", "enum": ["low", "medium", "high"], "description": "Optional. high flags stale or single-source premises 're-verify before acting'; low/medium (or omitted) give the default pack."},
         }, ["task"], False),
         tool("brain_recall", "Bridge recall: approved memory plus captured evidence, rendered as bounded markdown in JSON.", {
             "query": text_property("Recall question."),
@@ -128,7 +129,7 @@ class Server:
         # owner-only (0700) directory per server process, never a shared cache.
         self.scratch = Path(tempfile.mkdtemp(prefix="llm-brain-mcp-"))
         os.chmod(self.scratch, 0o700)
-        self.env = {key: value for key, value in os.environ.items() if not key.startswith("LLM_BRAIN_ROOT")}
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith(("LLM_BRAIN_ROOT", "MEMTHENA_ROOT"))}
         self.env["LLM_BRAIN_ROOT"] = self.root
         self.env["TMPDIR"] = str(self.scratch)
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -218,6 +219,11 @@ class Server:
             command = ["pack", "build", self.project(arguments), "--task", self.line_arg(arguments, "task", True), "--agent", "mcp", "--budget-tokens", str(self.int_arg(arguments, "budget_tokens", 1200, 1, 32000))]
             for path in self.paths_arg(arguments):
                 command += ["--path", path]
+            action_risk = arguments.get("action_risk")
+            if action_risk is not None:
+                if action_risk not in ("low", "medium", "high"):
+                    raise ToolError("action_risk must be low, medium or high")
+                command += ["--action-risk", action_risk]
             output = self.run_cli(*command, *self.principal(arguments))
             fields = dict(part.split("=", 1) for part in output.split() if "=" in part)
             pack_file = fields.get("file", "")

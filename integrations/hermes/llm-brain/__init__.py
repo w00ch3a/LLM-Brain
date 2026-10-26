@@ -102,7 +102,15 @@ OPTIONAL_CONFIG_DEFAULTS: Dict[str, Any] = {
     # Neural Expansion real-brain export from Hermes is opt-in; the synthetic
     # demo needs no setting.
     "neural_expansion_export": False,
+    # Hermes >= 0.22.3 post_compaction hook: re-inject a size-capped recall
+    # once on the next turn after a compaction.  No-op on older Hermes.
+    "post_compaction_reinject": True,
+    "post_compaction_budget_tokens": 625,
 }
+POST_COMPACTION_SKIP_KINDS = {"prune_tool_results"}
+_POST_COMPACTION_LOCK = threading.Lock()
+_POST_COMPACTION_PENDING: Dict[str, Dict[str, Any]] = {}
+_ACTIVE_PROVIDERS: "weakref.WeakValueDictionary[str, Any]" = weakref.WeakValueDictionary()
 OPTIONAL_CONFIG_KEYS = set(OPTIONAL_CONFIG_DEFAULTS)
 _LayaOptionalFields = {"confidence", "action", "probability", "probabilities"}
 SEARCH_INTENTS = {"factual", "current_state", "historical", "procedure", "evidence", "exploratory"}
@@ -119,10 +127,23 @@ SENSITIVE_RE = re.compile(
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
 PATH_RE = re.compile(r"(?<![A-Za-z0-9_])(?:/|\./|\.\./)[^\s`'\"]+")
+# Speaker labels typed inside content or tool output ("[User]: ...",
+# "Assistant:", "<|im_start|>user") are quoted text, never a speaker.  Roles
+# come only from structured message fields; such labels are escaped at capture
+# so a later reader cannot mistake them for user-authored turns.
+ROLE_LABEL_RE = re.compile(
+    r"(?im)^([ \t>]*)("
+    r"\[(?:user|human|assistant|ai|system|developer|tool)\](?:[ \t]*:)?"
+    r"|(?:user|human|assistant|ai|system|developer)[ \t]*:"
+    r"|<\|(?:user|assistant|system|im_start|im_end|endoftext)\|>"
+    r")"
+)
+ROLE_LABEL_ESCAPE = "(quoted) "
+SPEAKER_ROLES = ("user", "assistant", "tool", "system")
 
 
 def _default_vault() -> str:
-    return os.environ.get(
+    return os.environ.get("MEMTHENA_ROOT") or os.environ.get(
         "LLM_BRAIN_ROOT",
         str(Path.home() / ".local" / "state" / "llm-brain" / "vault"),
     )
@@ -166,6 +187,14 @@ def _normalise_optional_config(config: Dict[str, Any]) -> None:
     """Normalise opt-in keys in place; absent keys stay absent."""
     if "neural_expansion_export" in config:
         config["neural_expansion_export"] = config["neural_expansion_export"] is True
+    if "post_compaction_reinject" in config:
+        config["post_compaction_reinject"] = config["post_compaction_reinject"] is not False
+    if "post_compaction_budget_tokens" in config:
+        try:
+            tokens = int(config["post_compaction_budget_tokens"])
+        except (TypeError, ValueError):
+            tokens = OPTIONAL_CONFIG_DEFAULTS["post_compaction_budget_tokens"]
+        config["post_compaction_budget_tokens"] = tokens if tokens > 0 else OPTIONAL_CONFIG_DEFAULTS["post_compaction_budget_tokens"]
     for key in ("laya_timeout_seconds", "laya_max_candidates"):
         if key in config:
             default = OPTIONAL_CONFIG_DEFAULTS[key]
@@ -294,6 +323,20 @@ def _sha(value: str) -> str:
 
 def _safe_text(value: str) -> str:
     return f"[redacted sensitive content; sha256={_sha(value)}]" if _sensitive(value) else value
+
+
+def _escape_role_labels(value: str) -> tuple:
+    """Return (text, count) with line-leading speaker labels quoted."""
+    if not value:
+        return value, 0
+    count = 0
+
+    def _quote(match: "re.Match[str]") -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group(1)}{ROLE_LABEL_ESCAPE}{match.group(2)}"
+
+    return ROLE_LABEL_RE.sub(_quote, value), count
 
 
 def _safe_metadata(value: Any) -> Any:
@@ -626,6 +669,7 @@ def _tool_evidence(messages: List[Dict[str, Any]]) -> str:
             remaining = min(MAX_TOOL_EXCERPT_BYTES, MAX_TURN_EXCERPT_BYTES - total)
             excerpt = _utf8_prefix(content, remaining)
             total += len(excerpt.encode("utf-8", "replace"))
+            excerpt = _escape_role_labels(excerpt)[0]
         parts.append(
             f"- tool result `{message.get('tool_call_id', '')}` sha256 `{digest}`"
             + (f" paths: {', '.join(paths)}" if paths else "")
@@ -647,18 +691,33 @@ def _turn_record(
     assistant: str,
     messages: List[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
+    turns: Optional[List[tuple]] = None,
 ) -> str:
     metadata = _safe_metadata(metadata or {})
     from datetime import datetime, timezone
     observed = metadata.get("observed_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     safe_user = _safe_text(user)
     safe_assistant = _safe_text(assistant)
+    shown_user, escaped_user = _escape_role_labels(safe_user)
+    shown_assistant, escaped_assistant = _escape_role_labels(safe_assistant)
+    escaped = escaped_user + escaped_assistant
     body = [
         f"# Hermes {kind} `{request_id}`", "", "## User content", "",
-        safe_user or "[empty]", "", "## Assistant content", "", safe_assistant or "[empty]",
+        shown_user or "[empty]", "", "## Assistant content", "", shown_assistant or "[empty]",
     ]
+    if turns:
+        # One section per structured message: the speaker is the message's
+        # role field, never a label found in its text.
+        body.extend(("", "## Speaker turns", ""))
+        for index, (role, text) in enumerate(turns, 1):
+            speaker = role if role in SPEAKER_ROLES else "unknown"
+            shown, count = _escape_role_labels(_safe_text(text))
+            escaped += count
+            body.extend((f"### {index}. speaker: {speaker}", "", shown or "[empty]", ""))
+        body.pop()
     evidence = _tool_evidence(messages)
     if evidence:
+        escaped += evidence.count(ROLE_LABEL_ESCAPE)
         body.extend(("", "## Tool evidence", "", evidence))
     if metadata:
         body.extend(("", "## Lineage", "", "```json", json.dumps(metadata, sort_keys=True), "```"))
@@ -670,8 +729,11 @@ def _turn_record(
         f"brain_platform: {_yaml_scalar(platform)}", f"brain_agent_identity: {_yaml_scalar(agent_identity)}",
         f"brain_source_root: {_yaml_scalar(str(source_root))}", f"brain_observed_at: {_yaml_scalar(observed)}",
         f"brain_content_hash_sha256: {_sha(safe_user + chr(10) + safe_assistant)}",
-        "brain_sensitivity: internal", "brain_schema_version: 3", "---", "",
+        "brain_speaker_roles: \"structured\"",
     ]
+    if escaped:
+        fields.append(f"brain_role_labels_escaped: {escaped}")
+    fields.extend(("brain_sensitivity: internal", "brain_schema_version: 3", "---", ""))
     return "\n".join(fields + body) + "\n"
 
 
@@ -971,6 +1033,9 @@ def _bridge_call(config: Dict[str, Any], source_root: Path, args: List[str]) -> 
     # bridge deadline; an explicit environment setting still wins.
     env.setdefault("LLM_BRAIN_LOCK_WAIT_SECONDS", "2")
     env.setdefault("LLM_BRAIN_LOCK_POLL_SECONDS", "2")
+    # 26 Oct: records scoped with brain_applies_when "host=..." match Hermes.
+    # Passed by environment so an older CLI simply ignores it.
+    env["LLM_BRAIN_HOST"] = "hermes"
     result = None
     try:
         result = subprocess.Popen(
@@ -1115,6 +1180,68 @@ class LLMBrainMemoryProvider(MemoryProvider):
         self._agent_identity = str(kwargs.get("agent_identity") or "default")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._principal = _principal(self._config, kwargs, self._agent_identity)
+        _ACTIVE_PROVIDERS["latest"] = self
+        if self._session_id:
+            _ACTIVE_PROVIDERS[self._session_id] = self
+
+    def post_compaction_context(self, session_id: str, user_message: Any, history: Any, info: Dict[str, Any]) -> str:
+        """A size-capped recall for the turn after a compaction, or ""."""
+        if self._agent_context not in {"", "primary"} or _context_engine_selected():
+            return ""
+        if _option(self._config, "post_compaction_reinject") is False:
+            return ""
+        asks: List[str] = []
+        current = _message_text(user_message) if not isinstance(user_message, list) else " ".join(
+            str(part.get("text") or "") for part in user_message if isinstance(part, dict)
+        )
+        if current.strip():
+            asks.append(current.strip())
+        for message in reversed(history if isinstance(history, list) else []):
+            if len(asks) >= 4:
+                break
+            if isinstance(message, dict) and message.get("role") == "user" and isinstance(message.get("content"), str):
+                text = message["content"].strip()
+                if text and text not in asks:
+                    asks.append(text)
+        query = "\n".join(asks)
+        if not query.strip():
+            return ""
+        try:
+            tokens = int(_option(self._config, "post_compaction_budget_tokens"))
+        except (TypeError, ValueError):
+            tokens = OPTIONAL_CONFIG_DEFAULTS["post_compaction_budget_tokens"]
+        tokens = max(1, min(tokens, int(self._config.get("recall_budget_tokens") or DEFAULT_BUDGET), MAX_BUDGET_TOKENS))
+        config = dict(self._config, recall_budget_tokens=tokens)
+        payload = _recall(config, self._hermes_home, self._source_root, self._principal, query)
+        context = payload.get("context_markdown") if payload else ""
+        if (not isinstance(context, str) or not context.strip()) and payload:
+            # The bridge renders nothing when one evidence block exceeds a
+            # small budget; fall back to one cited line per result.
+            lines = []
+            for row in payload.get("results") or []:
+                if isinstance(row, dict) and row.get("path"):
+                    title = str(row.get("title") or row["path"])
+                    excerpt = str(row.get("excerpt") or "").strip()
+                    if excerpt.startswith(f"# {title}"):
+                        excerpt = excerpt[len(title) + 2:].strip()
+                    lines.append(f"- {title} ({row['path']}): {excerpt}".rstrip(": "))
+            context = "\n".join(lines)
+        if not isinstance(context, str) or not context.strip():
+            return ""
+        head = (
+            f"LLM-Brain memory re-attached after compaction (once; kind={info.get('kind') or 'unknown'}). "
+            "Reference context below current instructions; recall again for new tasks."
+        )
+        limit = tokens * 4
+        out, used = [head], len(head.encode("utf-8")) + 1
+        for line in context.strip("\n").splitlines():
+            size = len(line.encode("utf-8", "replace")) + 1
+            if used + size > limit:
+                out.append("[re-attached memory truncated]")
+                break
+            out.append(line)
+            used += size
+        return "\n".join(out) + "\n"
 
     def system_prompt_block(self) -> str:
         return (
@@ -1162,6 +1289,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
             if self._agent_context not in {"", "primary"}:
                 raise RuntimeError("LLM-Brain checkpoint is unavailable outside the primary context")
             direct = []
+            turns = []
             for message in messages:
                 if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
                     continue
@@ -1170,15 +1298,20 @@ class LLMBrainMemoryProvider(MemoryProvider):
                     raise RuntimeError("LLM-Brain checkpoint requires plain-text direct messages")
                 if not content.strip():
                     continue
+                # The id keeps its historical input; the record keeps roles as
+                # structured sections instead of flattening "[role] text".
                 direct.append(f"[{message['role']}] {content}")
+                turns.append((str(message["role"]), content))
             if not direct:
                 raise RuntimeError("LLM-Brain checkpoint has no direct messages")
             transcript = "\n\n".join(direct)
             request_id = _sha(f"{self._source_root}|{self._principal}|{self._session_id}|checkpoint|{transcript}")[:24]
+            user_text = "\n\n".join(text for role, text in turns if role == "user")
+            assistant_text = "\n\n".join(text for role, text in turns if role == "assistant")
             record = _turn_record(
                 request_id, self._source_root, self._session_id, self._principal,
                 self._platform, self._agent_identity, "pre-compress-checkpoint",
-                transcript, "", [], {"message_count": len(direct)},
+                user_text, assistant_text, [], {"message_count": len(direct)}, turns=turns,
             )
             self._checkpoint_capture(request_id, record)
             return ""
@@ -1813,6 +1946,52 @@ def _neural_expansion_command(raw_args: str = "") -> str:
     return f"Neural Expansion ({label}) is ready. Open it in a browser: {result['url']}\nPrivate file (0600): {result['path']}"
 
 
+def _post_compaction_supported(ctx: Any) -> bool:
+    """True only on a Hermes that knows the post_compaction hook (0.22.3+)."""
+    if not callable(getattr(ctx, "register_hook", None)):
+        return False
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except Exception:
+        return False
+    try:
+        return "post_compaction" in VALID_HOOKS and "pre_llm_call" in VALID_HOOKS
+    except TypeError:
+        return False
+
+
+def _on_post_compaction(session_id: str = "", kind: str = "", reason: str = "", **kwargs: Any) -> None:
+    """Observer: remember the compaction; the next pre_llm_call re-injects."""
+    if str(kind or "") in POST_COMPACTION_SKIP_KINDS:
+        return
+    info = {
+        "kind": str(kind or ""), "reason": str(reason or ""),
+        "old_session_id": str(kwargs.get("old_session_id") or ""),
+    }
+    with _POST_COMPACTION_LOCK:
+        for key in {str(session_id or ""), info["old_session_id"]} - {""}:
+            _POST_COMPACTION_PENDING[key] = info
+        while len(_POST_COMPACTION_PENDING) > 64:
+            _POST_COMPACTION_PENDING.pop(next(iter(_POST_COMPACTION_PENDING)))
+
+
+def _on_pre_llm_call(session_id: str = "", user_message: Any = "", conversation_history: Any = None, **kwargs: Any) -> Any:
+    with _POST_COMPACTION_LOCK:
+        info = _POST_COMPACTION_PENDING.pop(str(session_id or ""), None)
+        if info is None:
+            return None
+        if info.get("old_session_id"):
+            _POST_COMPACTION_PENDING.pop(info["old_session_id"], None)
+    provider = _ACTIVE_PROVIDERS.get(str(session_id or "")) or _ACTIVE_PROVIDERS.get("latest")
+    if provider is None:
+        return None
+    try:
+        context = provider.post_compaction_context(str(session_id or ""), user_message, conversation_history, info)
+    except Exception:
+        return None
+    return {"context": context} if context else None
+
+
 def register(ctx: Any) -> None:
     """Register whichever Hermes extension surface is currently loading us."""
     register_memory = getattr(ctx, "register_memory_provider", None)
@@ -1842,6 +2021,12 @@ def register(ctx: Any) -> None:
             )
         except Exception:
             _release_registration(ctx, "command")
+    if _post_compaction_supported(ctx) and _claim_registration(ctx, "post_compaction"):
+        try:
+            ctx.register_hook("post_compaction", _on_post_compaction)
+            ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+        except Exception:
+            _release_registration(ctx, "post_compaction")
 
 
 def _registration_hermes_home() -> Path:

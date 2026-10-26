@@ -1,6 +1,6 @@
-# LLM-Brain architecture reference
+# Memthena architecture reference
 
-LLM-Brain is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction. Markdown and TSV remain the inspectable recovery surface; indexes, packs, receipts and other derived artefacts are never canonical truth.
+Memthena is a portable, filesystem-first memory lifecycle. `VERSION` is the package version; `schema.version` in a project is storage schema `3`. The canonical bundle implements Google Open Knowledge Format (OKF) v0.2. Schemas 1 and 2 remain readable and migrate only through an explicit staged migration or upgrade transaction. Markdown and TSV remain the inspectable recovery surface; indexes, packs, receipts and other derived artefacts are never canonical truth.
 
 ## Data layers
 
@@ -30,7 +30,7 @@ Consumers derive:
 - `today >= stale_after` → stale;
 - absent `status` → stable.
 
-Indexes, search results and context packs surface lifecycle, trust and freshness. Effective memory still honours LLM-Brain sensitivity, retraction, conflict and supersession controls. `Attested Computation` documents are validated, indexed, preserved and exported; LLM-Brain does not execute their computation, executor or attester.
+Indexes, search results and context packs surface lifecycle, trust and freshness. Effective memory still honours Memthena sensitivity, retraction, conflict and supersession controls. `Attested Computation` documents are validated, indexed, preserved and exported; Memthena does not execute their computation, executor or attester.
 
 Project writes use a durable directory lease under `.locks/`. Contenders wait for the owning process to finish; an owner proven dead is recovered only after its metadata is retained as a Markdown `LockRecovery` record. Writes keep temp-file-then-rename semantics and audit updates remain inside the lease. There is no lock-bypass mode. Vault migration and upgrade transition locks remain hard stops while owned by a live process because those operations replace or transform the vault as a whole; current releases record an owner so a dead transaction can be recovered, while legacy unowned transition locks remain a deliberate manual stop.
 
@@ -155,3 +155,11 @@ Retraction is a two-step safety boundary: `retract --preview` resolves the exact
 `LLM_BRAIN_REVIEW_POLICY` defaults to `tiered`: capture records custody markers as `captured`, closeout applies deterministic tiers to candidates received after the project's start marker, and only real exceptions stay open for a person. `strict` keeps the pre-0.11 behaviour byte for byte. Health, privacy, legal and finance facts are stored with owner-only `private` sensitivity. Secret-bearing records are never redacted or rewritten: they stay byte for byte as written, are visible only to the owner (`LLM_BRAIN_OWNER_PRINCIPAL` when set) and are excluded from `export knowledge-catalog` and `export bundle`. `review sweep PROJECT_ID|--all` changes an existing backlog only through `--dry-run` (counts and a confirm token), `--apply --confirm TOKEN` (per-project lock, labels, audit rows and a manifest under `migrations/review-sweep/`) and `--undo RUN_ID` (byte-for-byte restore). `--scan-sources` is a read-only, counts-only secret census. Nothing is deleted.
 
 Lexical search uses BM25F profile `v2` by default, with link anchors and state order on (`LLM_BRAIN_LEXICAL_ANCHORS=0`, `LLM_BRAIN_LEXICAL_STATE_ORDER=0` to opt out; `LLM_BRAIN_LEXICAL_PROFILE=legacy` restores the earlier scores). No embedding model is required.
+
+## Capture roles, pack freshness, scope and retraction completion (26 Oct)
+
+- Capture keeps structured speaker roles (`brain_speaker_roles`, `brain_speaker_turns`, `brain_role_labels_escaped`). Role labels inside content or tool output are escaped and are never user-authored.
+- The Hermes plugin re-injects a pack capped at `post_compaction_budget_tokens` on `post_compaction`. It is a no-op when the host has no such hook.
+- Packs carry `brain_index_audit_seq` and `brain_unindexed_captures`: the last `index-build` audit seq and the number of `ingest-capture` rows after it. The values feed the pack hash, so a pack stays idempotent until either changes. Opt out with `LLM_BRAIN_PACK_FRESHNESS=0`.
+- `brain_applies_when` (`;`-separated `project|host|task=v1,v2`, `*` wildcard, case-insensitive) is enforced in `pack build`, standing constraints and `bridge recall`. Context comes from `--host`/`LLM_BRAIN_HOST`/`--agent` and `--task-type`/`LLM_BRAIN_TASK_TYPE`. Scope fails open: a clause hides only when the caller's value is known and different (unknown/`generic`/`mcp` host, no task type or no project never hide); malformed clauses or unknown keys show the record with a `memthena:` warning.
+- Retraction: belief support excludes sources that have a receipt tombstone (`okf/retractions/receipts/<id>--src-<sha12>.md`, type Retraction, no `brain_retracts`). A full retraction runs `memory_lineage retract-finish` under the project lock. It purges `audit/retrieval-receipts.jsonl` rows (`query_sha256: purged`, `extra` dropped, refs rewritten to the tombstone, `purged_for`, receipt ids kept). It also purges feedback notes (`brain_purged_for`), deletes `indexes/embeddings/<hash>-*`, and rebuilds summaries. It then verifies search-index, embeddings, folder-summary, receipts, feedback and neural-expansion-export, using pages registered in `audit/neural-expansion-exports.tsv`. Any failure fails closed with exit 75 and `failed_stores`.

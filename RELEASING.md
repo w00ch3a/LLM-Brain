@@ -1,4 +1,4 @@
-# Releasing LLM-Brain
+# Releasing Memthena
 
 `VERSION` is the only package-version authority. Storage schema and OKF version are independent.
 
@@ -7,7 +7,7 @@ are opt-in; verify retraction as a preview/confirm operation without mutating a
 live vault. Do not describe evaluation-only portability, repair or research
 results as production guarantees, or an unreleased change as published.
 
-LLM-Brain is distributed under Apache License 2.0, subject to its disclaimers
+Memthena is distributed under Apache License 2.0, subject to its disclaimers
 and applicable-law limits. Users remain responsible for installation,
 validation and deployment; release checks are not guarantees.
 
@@ -45,7 +45,7 @@ Build the Hermes archive with `scripts/package-hermes-archive.sh`; the packaging
 
 For Codex, test both marketplace source types: a local marketplace must consume the verified plugin archive without running a Git refresh, while a Git marketplace must refresh natively. Treat a host inventory failure as a blocker; never fall back to a different installation type when detection is incomplete.
 
-After installing the published release, start one fresh Codex, Claude and Gemini session with an ordinary non-trivial project request that does not mention LLM-Brain. Acceptance requires relevant memory retrieval, an authorised closeout capture, the documented opt-out, and one end-user confirmation. Static package checks do not replace this host-session proof.
+After installing the published release, start one fresh Codex, Claude and Gemini session with an ordinary non-trivial project request that does not mention Memthena. Acceptance requires relevant memory retrieval, an authorised closeout capture, the documented opt-out, and one end-user confirmation. Static package checks do not replace this host-session proof.
 
 ## Vault migration gate
 

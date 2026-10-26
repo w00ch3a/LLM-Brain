@@ -1,9 +1,9 @@
 ---
 name: llm-brain
-description: Retrieve approved filesystem-first LLM-Brain context before non-trivial project work and capture an auditable outcome at closeout. Use advanced commands only for memory maintenance, migration, experiments, evaluation, or package work.
+description: Retrieve approved filesystem-first Memthena (formerly LLM-Brain) context before non-trivial project work and capture an auditable outcome at closeout. Use advanced commands only for memory maintenance, migration, experiments, evaluation, or package work.
 ---
 
-# LLM-Brain
+# Memthena
 
 Canonical knowledge is OKF v0.2 with storage schema 3. Receipts are opt-in
 (`search --receipt`); retraction is preview-then-confirm (`retract
@@ -51,6 +51,6 @@ When a procedure capsule is requested, include every explicit dependency that th
 
 Use `--intent evidence` only when the task needs the bounded lifecycle context around selected records. JSON `evidence_bundles` preserve supporting, conflicting, superseded, derived and unresolved roles, state, excerpts and source custody hashes; hidden evidence must not appear in explanations or counts, and warnings/incomplete mark unresolved or budget-limited relationships. `evidence_opened` requires a visible, hash-verified source actually read during rendering; `evidence_incomplete` is not semantic proof. Current-state warnings come first; tight evidence/current-state packs prefer distinct verified roots. External or derived text cannot gain authority through a summary or relationship.
 
-Opt-in receipts retain the old JSONL fields while identity version 2 separates principal, intent, as-of and rendered selection. Hermes capture stays non-blocking by default; required compression checkpoints wait for a matching durable bridge receipt, not just an outbox write. OpenClaw staging is explicit and non-canonical; Pi, Oh My Pi and Claude Code session stores are not LLM-Brain canonical writers.
+Opt-in receipts retain the old JSONL fields while identity version 2 separates principal, intent, as-of and rendered selection. Hermes capture stays non-blocking by default; required compression checkpoints wait for a matching durable bridge receipt, not just an outbox write. OpenClaw staging is explicit and non-canonical; Pi, Oh My Pi and Claude Code session stores are not Memthena canonical writers.
 
 The lifecycle evaluation harness is disposable and ground-truth-first. Run the repository-only `scripts/eval-lifecycle.py --cases CASES.json --output NEW_DIR --seed 0 --repeats 5`; it covers thirteen scenario families at 20-event and 200-event checkpoints. It seeds facts, temporal validity, trust, visibility and as-of dates before applying updates, conflicts, poisoning, repair and capsule operations. Each checkpoint measures six modes—`none`, `raw-source`, `factual`, `explicit` (`current_state`), `evidence` and `historical`—plus stale-result leakage, provenance-root independence, repair isolation, capsule preparation/validation and poisoning resistance, together with candidate hits, unresolved state, context/token estimates, latency, degradation, operation/write cost and repeat reliability. An optional answer runner adds model-answer outcomes; it is a trusted local executable with no OS sandbox requirement, and without one model-answer accuracy is unmeasured. Keep all evaluation output derived and outside canonical OKF memory. See `docs/evaluation.md`.

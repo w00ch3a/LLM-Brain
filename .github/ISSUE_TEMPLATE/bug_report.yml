@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in LLM-Brain
+description: Report a reproducible problem in Memthena
 title: "[Bug]: "
 labels:
   - bug
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve LLM-Brain. Please search existing issues first and include the smallest reproducible example.
+        Thanks for helping improve Memthena. Please search existing issues first and include the smallest reproducible example.
 
   - type: textarea
     id: summary
@@ -56,9 +56,9 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Include the LLM-Brain version, operating system and relevant integration versions.
+      description: Include the Memthena version, operating system and relevant integration versions.
       placeholder: |
-        LLM-Brain:
+        Memthena:
         OS:
         Integration:
     validations:

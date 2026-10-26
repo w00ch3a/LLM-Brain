@@ -197,13 +197,60 @@ The lifecycle fixture also includes an `interference` family. One fact is
 superseded seven times in quick succession, and every memory-backed mode must
 return only the newest version, with zero stale leakage.
 
+## Raw-history baseline arms
+
+`eval run` accepts two baseline strategies besides the memory arms:
+
+- `raw-bm25`: plain BM25 (k1 1.2, b 0.75) over the raw history, meaning
+  `episodes/**` and the `sources/` custody copies, with frontmatter stripped;
+- `raw-embed`: one embedding per raw file, ranked by cosine. It uses
+  `--query-embedder` when given, otherwise the bundled `models/lbembed.py`. If
+  neither is available, the arm is recorded as degraded
+  (`raw-embed-unavailable`) and does not fail the run.
+
+When a raw arm is requested, `report.md` adds a "Raw-history baseline" table.
+It compares every memory arm with the best raw arm by hits (ties go to the
+smaller context) and labels it `beats-baseline`, `ties-baseline` or
+`loses-to-baseline`. A raw arm can only hit when the case lists the episode or
+source path among its `expected_paths`. Requests without a raw arm produce the
+same report as before. Test: `tests/raw-baseline-eval-self-check.sh`.
+
+## Personal eval kit
+
+`scripts/personal-eval.py --brain ROOT --project ID --output DIR` measures
+memory on your own work, not on a public benchmark. It works in four steps:
+
+1. It copies the brain (derived indexes, packs and caches are left empty) into
+   a private temporary folder and makes that snapshot read-only.
+2. It mines approved canonical records that are corrections
+   (`brain_supersedes` or correction wording) or decisions. It also mines
+   episodes that read as corrections or decisions and links each one to the
+   canonical record that cites its episode id. Sessions with no such record are
+   counted as `unpromoted_sessions`.
+3. For each target it writes a follow-up query from the record's distinctive
+   terms. You can supply your own queries with `--queries FILE`
+   (`target_hash<TAB>query`).
+4. It adds `--filler N` off-topic records that share query words to a second,
+   writable copy, rebuilds the index there and runs `pack build`.
+
+`results.tsv` gives one row per case: hashed case and target, kind, hit, rank,
+filler ranked above the target and pack size. `summary.json` gives the hit
+rate, MRR, per-kind counts and `source_unchanged`. Neither file contains
+record text, titles, ids, queries or paths. Targets are
+`sha256(project/rel)[:16]`, and restricted, secret and owner-only records are
+never targets. The kit refuses an output folder inside the brain, ignores
+inherited `MEMTHENA_*`/`LLM_BRAIN_*` settings and exits 70 if the source
+changed during the run. It has only been run on the synthetic fixture in
+`tests/personal-eval-self-check.sh`. Run it on a real brain only on a copy,
+deliberately.
+
 ## Real-agent evaluation (Codex CLI)
 
 `evals/real/` runs a real coding agent with memory on and off. It contains 12
 coding tasks and 12 research tasks. Each family has 10 memory-dependent tasks,
 one control where memory is irrelevant, and one harm control where memory is
 deliberately stale. The knowledge each task needs exists only in a seeded
-LLM-Brain brain, and the harness checks that:
+Memthena brain, and the harness checks that:
 
 - off and on work trees are identical before the agent starts;
 - memory-only markers are absent from the files and the base prompt.

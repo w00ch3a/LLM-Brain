@@ -2,7 +2,7 @@
 
 These are the measured results behind the numbers in the README. The harness,
 task list and method are in [`evals/real/README.md`](../evals/real/README.md).
-Each task gives a real coding agent the same work twice, once with LLM-Brain
+Each task gives a real coding agent the same work twice, once with Memthena
 memory and once without, and grades the result.
 
 - Runner: Codex CLI (codex-cli 0.159.1), default model, memory via the CLI

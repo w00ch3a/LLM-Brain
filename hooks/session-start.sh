@@ -4,6 +4,15 @@
 #   session   SessionStart (default)
 #   subagent  SubagentStart; opt-in, see below
 #   --stdin   the host pipes its hook JSON on stdin (hooks.json passes this)
+# Memthena env aliases (same rule as the CLI): MEMTHENA_X sets LLM_BRAIN_X.
+for _mv in $(env | sed -n 's/^MEMTHENA_\([A-Z0-9_][A-Z0-9_]*\)=.*/\1/p'); do
+  eval "export LLM_BRAIN_${_mv}=\"\${MEMTHENA_${_mv}}\""
+done
+unset _mv
+# brain_applies_when "host=..." scope for the brief: the host is this agent
+# (LLM_BRAIN_AGENT, default claude-code) unless LLM_BRAIN_HOST is set.
+LLM_BRAIN_HOST=${LLM_BRAIN_HOST:-${LLM_BRAIN_AGENT:-claude-code}}
+export LLM_BRAIN_HOST
 [ "${LLM_BRAIN_PASSIVE:-1}" = "0" ] && exit 0
 mode=${1:-session}
 # Read host JSON only when asked to, so a manual run never waits on stdin.
@@ -71,10 +80,61 @@ if [ "${LLM_BRAIN_HANDOVER:-1}" != "0" ]; then
     [ -z "${LLM_BRAIN_AGENT:-}" ] || set -- "$@" --session "$agent"
   fi
 fi
-brief=$(run_cli "$@") || brief=""
+# Last-good brief (outside the vault, per user): when the live brief cannot
+# finish inside the hook budget (a slow NAS, a cold cache), show the last good
+# one, clearly labelled, and let the live brief finish in the background so
+# the next session gets a fresh copy.  Disable with LLM_BRAIN_BRIEF_FALLBACK=0.
+cache_file=""
+if [ "${LLM_BRAIN_BRIEF_FALLBACK:-1}" != "0" ]; then
+  cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/llm-brain/briefs
+  scope_key=""   # unchanged key (and cache) for the default host and no task type
+  [ "$LLM_BRAIN_HOST" = "${LLM_BRAIN_AGENT:-claude-code}" ] && [ -z "${LLM_BRAIN_TASK_TYPE:-}" ] || scope_key="|$LLM_BRAIN_HOST|${LLM_BRAIN_TASK_TYPE:-}"
+  cache_key=$(printf '%s|%s|%s%s' "$PWD" "$brief_bytes" "${LLM_BRAIN_AGENT:-claude-code}" "$scope_key" | cksum 2>/dev/null | awk '{ print $1 }')
+  [ -z "$cache_key" ] || cache_file="$cache_dir/$cache_key"
+fi
+if [ -z "$cache_file" ]; then
+  brief=$(run_cli "$@") || brief=""
+  fresh=1
+else
+  (umask 077; mkdir -p "$cache_dir" 2>/dev/null) || true
+  out="$cache_file.run.$$"
+  busy="$cache_file.busy" already=0
+  # One background refresh at a time per directory; a refresh older than
+  # five minutes is presumed dead and replaced.
+  [ -z "$(find "$busy" -maxdepth 0 -mmin +5 2>/dev/null)" ] || rmdir "$busy" 2>/dev/null || true
+  # The background job is the only writer of the cache: it replaces the
+  # cached brief atomically, and only with a complete, successful brief.
+  if ! mkdir "$busy" 2>/dev/null; then
+    already=1; : >"$out.done"   # a refresh is already running: use the cached brief now
+  else (
+    trap 'rmdir "$busy" 2>/dev/null' EXIT
+    if bash "$cli" "$@" >"$out" 2>/dev/null && [ -s "$out" ]; then
+      (umask 077; date -u '+%Y-%m-%dT%H:%M:%SZ' >"$out.at" && cat "$out" >>"$out.at" && mv -f "$out.at" "$cache_file") 2>/dev/null || true
+      : >"$out.ok"
+    fi
+    : >"$out.done"
+  ) </dev/null >/dev/null 2>&1 &
+  fi
+  waited=0 limit=${LLM_BRAIN_BRIEF_WAIT_TENTHS:-30}
+  case "$limit" in ''|*[!0-9]*) limit=30 ;; esac
+  while [ ! -f "$out.done" ] && [ "$waited" -lt "$limit" ]; do sleep 0.1 2>/dev/null || sleep 1; waited=$((waited + 1)); done
+  brief="" fresh=0 running=1
+  if [ -f "$out.done" ]; then
+    running=0
+    [ -f "$out.ok" ] && brief=$(cat "$out" 2>/dev/null) && fresh=1
+    rm -f "$out" "$out.ok" "$out.done" 2>/dev/null
+  fi
+  if { [ "$running" = 1 ] || [ "$already" = 1 ]; } && [ -f "$cache_file" ]; then
+    cached_at=$(head -n 1 "$cache_file" 2>/dev/null)
+    brief=$(printf '(Cached brief from %s: the live brief did not finish in time and is refreshing in the background. Search before relying on details.)\n' "$cached_at"; tail -n +2 "$cache_file" 2>/dev/null)
+  fi
+  # A run that outlives the hook cleans up its own temp files.
+  [ "$running" = 0 ] || ( while [ ! -f "$out.done" ]; do sleep 1; done; rm -f "$out" "$out.ok" "$out.done" ) </dev/null >/dev/null 2>&1 &
+fi
 if [ -n "$brief" ]; then
   printf '\n%s\n' "$brief"
-  if [ -n "$marker" ]; then
+  # Only a live brief moves the handover marker, so changes are never skipped.
+  if [ -n "$marker" ] && [ "$fresh" = 1 ]; then
     (umask 077; mkdir -p "$state_dir" 2>/dev/null && date -u '+%Y-%m-%dT%H:%M:%SZ' >"$marker" 2>/dev/null) || true
   fi
 fi

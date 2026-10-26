@@ -1,6 +1,8 @@
-# LLM-Brain for Hermes Agent
+# Memthena for Hermes Agent
 
-This standalone plugin connects Hermes Agent to a local LLM-Brain vault. Hermes receives automatic project recall and durable turn capture while Markdown remains the source of truth.
+Memthena was formerly called LLM-Brain. The Hermes provider id, plugin directory and settings file keep the `llm-brain` name.
+
+This standalone plugin connects Hermes Agent to a local Memthena vault. Hermes receives automatic project recall and durable turn capture while Markdown remains the source of truth.
 
 The current release uses OKF v0.2 canonical records in storage schema 3. Hermes defaults remain unchanged: factual prefetch through the MemoryProvider and the native `compressor`; current-state and evidence retrieval are explicit caller choices.
 
@@ -40,7 +42,7 @@ The provider stops injecting recall while this engine owns context selection. Ca
 
 ### Optional governed maintenance
 
-Maintenance is an explicit LLM-Brain CLI workflow, not a Hermes memory
+Maintenance is an explicit Memthena CLI workflow, not a Hermes memory
 provider feature. `maintenance preview` and `maintenance status` are
 read-only; `maintenance run` writes only the bounded derived report under the
 project's `maintenance/` directory. Reports cover freshness, retention
@@ -102,7 +104,7 @@ Add these to `llm-brain.json` by hand only when you need them. Absent keys keep 
 
 The filter is fail-open. Recall is returned unfiltered, with `local_laya.status` set to `unavailable`, `ambiguous` or `candidate_limit`, when the endpoint times out, refuses the connection, redirects or returns a malformed or out-of-range answer, when no clear margin separates kept and dropped results, or when there are too many candidates. The endpoint must be `localhost` or a loopback, private or link-local IP literal (for example `http://localhost:8080/decide`); public addresses, other hostnames, embedded credentials, proxies and redirects are refused. The filter applies to automatic recall and to the `llm_brain_search` tool, and can add up to `laya_timeout_seconds` to a recall.
 
-**Context-engine registration.** Hermes holds a single plugin context-engine slot and only uses a registered engine when `context.engine` names it. With the default `always`, LLM-Brain claims that slot whenever Hermes supports it, so a second context-engine plugin is rejected even though LLM-Brain's engine is not selected. Set `when-selected` to register only while `context.engine` is `llm-brain` (restart Hermes after changing `context.engine`). Recall and capture through the memory provider are unaffected either way.
+**Context-engine registration.** Hermes holds a single plugin context-engine slot and only uses a registered engine when `context.engine` names it. With the default `always`, Memthena claims that slot whenever Hermes supports it, so a second context-engine plugin is rejected even though Memthena's engine is not selected. Set `when-selected` to register only while `context.engine` is `llm-brain` (restart Hermes after changing `context.engine`). Recall and capture through the memory provider are unaffected either way.
 
 **Bridge timeouts.** Each bridge call runs in its own process group. When `timeout_seconds` expires the whole group is stopped, so a timed-out recall or capture leaves no CLI processes behind holding or waiting for the vault lock on slow (for example NAS) storage. Bridge calls also set `LLM_BRAIN_LOCK_WAIT_SECONDS=2` unless the environment already sets it, so lock contention fails quickly and capture retries from the outbox.
 
@@ -119,9 +121,9 @@ Records live under `$HERMES_HOME/llm-brain/outbox/`. A short-lived standard-libr
 
 Hermes keeps working when recall times out or returns malformed JSON. Capture failures stay in the outbox with bounded attempts and error state.
 
-By default pre-compression observation is best-effort and non-blocking. The outbox is durable work, but writing it is **not** a bridge completion receipt. On Hermes builds with checkpoint API v2, an operator may explicitly set `compression.checkpoint_required: true`. In that mode LLM-Brain synchronously captures Hermes' normalised direct user/assistant messages and returns success only after `bridge capture` reports a matching request ID, episode reference and source hash. Failure raises so Hermes keeps the uncompressed transcript for retry. Sensitive direct text is redacted before custody; that is a privacy boundary, not lossless transcript backup. Worker threads preserve the active Hermes profile context; older Hermes builds use a standard-library fallback.
+By default pre-compression observation is best-effort and non-blocking. The outbox is durable work, but writing it is **not** a bridge completion receipt. On Hermes builds with checkpoint API v2, an operator may explicitly set `compression.checkpoint_required: true`. In that mode Memthena synchronously captures Hermes' normalised direct user/assistant messages and returns success only after `bridge capture` reports a matching request ID, episode reference and source hash. Failure raises so Hermes keeps the uncompressed transcript for retry. Sensitive direct text is redacted before custody; that is a privacy boundary, not lossless transcript backup. Worker threads preserve the active Hermes profile context; older Hermes builds use a standard-library fallback.
 
-This setting is not needed for ordinary use. Hermes documents that required checkpoints disable server-native compaction, micro-compaction and `codex_app_server` compaction paths; verify the host's desired compression behaviour before enabling it. No LLM-Brain selector configuration change is required.
+This setting is not needed for ordinary use. Hermes documents that required checkpoints disable server-native compaction, micro-compaction and `codex_app_server` compaction paths; verify the host's desired compression behaviour before enabling it. No Memthena selector configuration change is required.
 
 ## Host-neutral bridge
 
@@ -142,9 +144,9 @@ When a caller requests `intent: evidence`, the bridge includes bounded lifecycle
 
 ## Runtime footprint
 
-The adapter uses Python's standard library, Hermes' existing interfaces and the LLM-Brain CLI. It adds no daemon, database, network service, zvec engine or Python dependency; the opt-in Laya filter is a standard-library client for a local endpoint you run yourself. LLM-Brain's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
+The adapter uses Python's standard library, Hermes' existing interfaces and the Memthena CLI. It adds no daemon, database, network service, zvec engine or Python dependency; the opt-in Laya filter is a standard-library client for a local endpoint you run yourself. Memthena's core remains OKF v0.2 and storage schema 3; any optional host-native scheduler is outside the core.
 
-Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. LLM-Brain is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.
+Retraction and receipts remain CLI-controlled: preview a canonical target with `retract ... --reason TEXT --preview`, then use the returned token with `retract ... --reason TEXT --confirm TOKEN`; `search ... --receipt` is opt-in and derived. The plugin never executes these actions automatically. Memthena is provided under Apache License 2.0; applicable-law limits apply, and use, validation and deployment remain the user's responsibility without guarantees of correctness, security or fitness.
 
 ## Neural Expansion in Hermes (0.9)
 

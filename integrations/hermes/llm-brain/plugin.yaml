@@ -1,5 +1,5 @@
 name: llm-brain
 version: __LLM_BRAIN_VERSION__
-description: "Local Markdown-canonical LLM-Brain memory and optional Hermes context engine."
-author: LLM-Brain
+description: "Local Markdown-canonical Memthena memory and optional Hermes context engine."
+author: Memthena
 kind: standalone

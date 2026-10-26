@@ -11,14 +11,16 @@ import os
 import re
 import stat
 import sys
+import time
+import copy
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterable
 
 try:
     import yaml
 except ImportError as exc:  # pragma: no cover - exercised by upgrade bootstrap tests
     raise SystemExit(
-        "llm-brain: PyYAML is unavailable; run `llm-brain upgrade check` "
+        "memthena: PyYAML is unavailable; run `llm-brain upgrade check` "
         "and install the hash-locked OKF runtime"
     ) from exc
 
@@ -404,7 +406,7 @@ def reserved_issues(path: Path, root: Path) -> list[str]:
     return issues
 
 
-def validate_bundle(root: Path) -> tuple[list[tuple[Path, str]], int]:
+def validate_bundle(root: Path, cache: "RecordCache | None" = None) -> tuple[list[tuple[Path, str]], int]:
     issues: list[tuple[Path, str]] = []
     concepts = 0
     if not root.is_dir():
@@ -418,12 +420,27 @@ def validate_bundle(root: Path) -> tuple[list[tuple[Path, str]], int]:
         else:
             concepts += 1
             try:
-                metadata, body = split_frontmatter(path)
+                metadata, body = _cached_frontmatter(path, cache)
                 current = concept_issues(metadata, body)
             except OkfError as exc:
                 current = [str(exc)]
         issues.extend((path.relative_to(root), issue) for issue in current)
     return issues, concepts
+
+
+def _cached_frontmatter(path: Path, cache: "RecordCache | None") -> tuple[dict[str, Any], str]:
+    """split_frontmatter(path) through the stat-checked record cache when one
+    is given; symlinks, unreadable files and anything outside the cache root
+    take the original path, so errors and messages are unchanged."""
+    if cache is not None and cache.enabled:
+        try:
+            full = os.path.join(os.path.realpath(path.parent), path.name)
+            rel = os.path.relpath(full, cache.root)
+            if not rel.startswith(".." + os.sep) and rel != ".." and not path.is_symlink():
+                return RecordCache.metadata_body(cache.read(full, rel.replace(os.sep, "/")))
+        except (OSError, ValueError):
+            pass
+    return split_frontmatter(path)
 
 
 def trust_tier(metadata: dict[str, Any]) -> str:
@@ -709,7 +726,14 @@ def audit_counts(root: Path) -> dict[str, int]:
 
 def command_validate(args: argparse.Namespace) -> int:
     root = Path(args.bundle)
-    issues, concepts = validate_bundle(root)
+    # Share the project's record cache (rel paths "okf/...") so a lint on a
+    # NAS vault stats records instead of re-reading every one.
+    cache = None
+    if root.name == "okf" and root.is_dir() and not root.is_symlink():
+        cache = RecordCache(root.parent)
+    issues, concepts = validate_bundle(root, cache)
+    if cache is not None:
+        cache.save()
     for path, issue in issues:
         print(f"okf:error path={path.as_posix()} issue={issue}")
     print(
@@ -857,6 +881,472 @@ def command_valid_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Local, derived read cache (Memthena speed work) -------------------------
+# A per-machine mirror of canonical records keyed on (size, mtime_ns,
+# ctime_ns, inode).  It lives on local disk (never in the vault), is never
+# authoritative and can be deleted at any time.  A hit costs one stat and no
+# read, which is what makes NAS (SMB/NFS) brains fast.  Entries whose mtime is
+# within RECORD_CACHE_RACY_NS of the moment they were cached are not trusted
+# (git's "racy clean" rule), so a write that lands inside a coarse timestamp
+# tick is always re-read.  Every writer replaces files atomically, which also
+# changes the inode, so other machines' writes on a shared NAS are seen as
+# misses.  Disable with LLM_BRAIN_CACHE=0 or MEMTHENA_CACHE=0.
+RECORD_CACHE_FORMAT = 1
+RECORD_CACHE_RACY_NS = 2_000_000_000
+
+
+def record_cache_enabled() -> bool:
+    for name in ("MEMTHENA_CACHE", "LLM_BRAIN_CACHE"):
+        if os.environ.get(name, "").strip().lower() in ("0", "off", "false", "no"):
+            return False
+    return True
+
+
+TRUST_SECONDS_DEFAULT = 0  # opt-in; bulk folder stat made the window unnecessary
+
+
+def _trust_seconds() -> int:
+    """MEMTHENA_NAS_TRUST_SECONDS (alias LLM_BRAIN_NAS_TRUST_SECONDS): opt-in, default 0 (off).
+    Anything that is not a whole number disables it too (fail safe)."""
+    for name in ("MEMTHENA_NAS_TRUST_SECONDS", "LLM_BRAIN_NAS_TRUST_SECONDS"):
+        value = os.environ.get(name)
+        if value is not None and value.strip() != "":
+            value = value.strip()
+            return int(value) if value.isdigit() else 0
+    return TRUST_SECONDS_DEFAULT
+
+
+def _change_token(root: str, extra_dirs: Iterable[str] = ()) -> list[Any]:
+    """(dir, mtime_ns, ctime_ns, inode) for the project folder, every folder
+    under okf/, every other folder holding a cached record, the vault's
+    .locks/ folder and the audit log.  Every CLI write (and so every Hermes
+    and MCP write, which go through the CLI) takes the project lock, which
+    creates and removes a folder in .locks/, and records are written by
+    atomic rename, so any write changes the token at once.  An in-place edit
+    by hand does not, which is why trust is opt-in and time-boxed."""
+    token: list[Any] = []
+    stack = [root]
+    okf_root = os.path.join(root, "okf")
+    projects = os.path.dirname(root)
+    locks = os.path.join(os.path.dirname(projects), ".locks") if os.path.basename(projects) == "projects" else None
+    for extra in sorted(set(extra_dirs)) + ([locks] if locks else []):
+        try:
+            st = os.lstat(extra)
+            token.append((os.path.relpath(extra, root), st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
+        except OSError:
+            token.append((os.path.relpath(extra, root), None))
+    while stack:
+        current = stack.pop()
+        try:
+            st = os.lstat(current)
+        except OSError:
+            token.append((current, None)); continue
+        token.append((os.path.relpath(current, root), st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
+        if current == root:
+            stack.append(okf_root)
+            for extra in ("audit.v2.tsv", os.path.join("audit", "audit.v2.tsv")):
+                try:
+                    st = os.lstat(os.path.join(root, extra))
+                    token.append((extra, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    pass
+            continue
+        try:
+            with os.scandir(current) as entries:
+                stack.extend(sorted(e.path for e in entries if e.is_dir(follow_symlinks=False)))
+        except OSError:
+            token.append((current, "unreadable"))
+    return token
+
+
+# --- Bulk folder stat (macOS getattrlistbulk) --------------------------------
+# On an SMB share every lstat is a network round trip once the client's
+# attribute cache has gone cold (about 30 s idle): about 4 ms each, 20 s for
+# 5,000 records.  One getattrlistbulk enumeration of the folder returns the
+# same (size, mtime, ctime, inode, device) for every entry from SMB
+# QUERY_DIRECTORY in a few round trips (about 2.5 s for 5,000 records).  It is
+# the same per-file freshness check, just batched per folder: values match
+# lstat exactly (checked on all 5,000 records of the NAS bench vault).  Used
+# only by read-only callers, falls back to lstat on any doubt, and is off
+# with MEMTHENA_BULK_STAT=0 (alias LLM_BRAIN_BULK_STAT=0).
+BULK_STAT_MIN_READS = 8
+
+
+def bulk_stat_enabled() -> bool:
+    for name in ("MEMTHENA_BULK_STAT", "LLM_BRAIN_BULK_STAT"):
+        value = os.environ.get(name)
+        if value is not None and value.strip() != "":
+            return value.strip().lower() not in ("0", "off", "false", "no")
+    return sys.platform == "darwin"
+
+
+class _BulkStat:
+    __slots__ = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
+
+    def __init__(self, size: int, mtime_ns: int, ctime_ns: int, ino: int, dev: int) -> None:
+        self.st_size, self.st_mtime_ns, self.st_ctime_ns, self.st_ino, self.st_dev = size, mtime_ns, ctime_ns, ino, dev
+
+
+_GETATTRLISTBULK: Any = None
+
+
+def _bulk_scan(folder: str) -> dict[str, _BulkStat] | None:
+    """{name: stat} for the regular files in FOLDER, or None when unsupported
+    or anything looks wrong (the caller then uses lstat per file)."""
+    global _GETATTRLISTBULK
+    import ctypes
+    import ctypes.util
+    import struct
+
+    if _GETATTRLISTBULK is None:
+        _GETATTRLISTBULK = False
+        if sys.platform == "darwin":
+            try:
+                fn = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True).getattrlistbulk
+                fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64]
+                fn.restype = ctypes.c_int
+                _GETATTRLISTBULK = fn
+            except (OSError, AttributeError):
+                pass
+    if not _GETATTRLISTBULK:
+        return None
+
+    class AttrList(ctypes.Structure):
+        _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16), ("commonattr", ctypes.c_uint32),
+                    ("volattr", ctypes.c_uint32), ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                    ("forkattr", ctypes.c_uint32)]
+
+    # name, devid, objtype, modtime, chgtime, fileid (+ error, returned set); file data length.
+    need = 0x1 | 0x2 | 0x8 | 0x400 | 0x800 | 0x2000000
+    attrs = AttrList(5, 0, 0x80000000 | 0x20000000 | need, 0, 0, 0x200, 0)
+    try:
+        fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return None
+    found: dict[str, _BulkStat] = {}
+    buffer = ctypes.create_string_buffer(256 * 1024)
+    try:
+        while True:
+            count = _GETATTRLISTBULK(fd, ctypes.byref(attrs), buffer, len(buffer), 0x8 | 0x1)  # PACK_INVAL_ATTRS|NOFOLLOW
+            if count < 0:
+                return None
+            if count == 0:
+                return found
+            raw, offset = buffer.raw, 0
+            for _ in range(count):
+                length = struct.unpack_from("<I", raw, offset)[0]
+                at = offset + 4
+                returned = struct.unpack_from("<5I", raw, at); at += 20
+                error = struct.unpack_from("<I", raw, at)[0]; at += 4
+                name_at, name_len = struct.unpack_from("<iI", raw, at)
+                name = raw[at + name_at:at + name_at + name_len].split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+                at += 8
+                dev = struct.unpack_from("<i", raw, at)[0] & 0xFFFFFFFF; at += 4
+                kind = struct.unpack_from("<I", raw, at)[0]; at += 4
+                msec, mnsec, csec, cnsec = struct.unpack_from("<qqqq", raw, at); at += 32
+                ino = struct.unpack_from("<Q", raw, at)[0]; at += 8
+                offset += length
+                if kind != 1:  # VREG only; anything else is left to lstat
+                    continue
+                if error or (returned[0] & need) != need or not returned[3] & 0x200 or not length or length > len(raw):
+                    return None
+                size = struct.unpack_from("<q", raw, at)[0]
+                found[name] = _BulkStat(size, msec * 1_000_000_000 + mnsec, csec * 1_000_000_000 + cnsec, ino, dev)
+    except Exception:  # noqa: BLE001 - any surprise means "use lstat"
+        return None
+    finally:
+        os.close(fd)
+
+
+def _code_fingerprint() -> str:
+    digest = hashlib.sha256()
+    here = Path(__file__).resolve().parent
+    for name in ("okf.py", "memory_signals.py"):
+        try:
+            digest.update((here / name).read_bytes())
+        except OSError:
+            digest.update(name.encode())
+    digest.update(yaml.__version__.encode())
+    return digest.hexdigest()[:16]
+
+
+class _CacheUnpickler:
+    """pickle.Unpickler restricted to plain data plus datetime values."""
+
+    ALLOWED = {
+        ("datetime", "date"), ("datetime", "datetime"), ("datetime", "time"),
+        ("datetime", "timezone"), ("datetime", "timedelta"),
+        ("builtins", "set"), ("builtins", "frozenset"), ("builtins", "bytearray"),
+    }
+
+    @classmethod
+    def load(cls, stream: Any) -> Any:
+        import pickle
+
+        class Restricted(pickle.Unpickler):
+            def find_class(self, module: str, name: str) -> Any:  # noqa: D401
+                if (module, name) in cls.ALLOWED:
+                    return super().find_class(module, name)
+                raise pickle.UnpicklingError(f"blocked {module}.{name}")
+
+        return Restricted(stream).load()
+
+
+class RecordCache:
+    """Stat-checked local cache of raw record bytes, sha256 and parsed YAML."""
+
+    def __init__(self, root: Path | str, enabled: bool | None = None, trust: bool = False) -> None:
+        self.root = os.path.realpath(os.fspath(root))
+        self.enabled = record_cache_enabled() if enabled is None else enabled
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.dirty = False
+        # Opt-in NAS mode (read-only callers only): skip the per-record lstat
+        # while the folder change token is unchanged and the last full sweep
+        # is younger than LLM_BRAIN_NAS_TRUST_SECONDS.  Default off.
+        self.trust_seconds = _trust_seconds() if trust else 0
+        self.trusted = False
+        self.token: list[Any] | None = None
+        # Read-only callers only (the same ones that may use trust mode).
+        self.bulk = trust and bulk_stat_enabled()
+        self._bulk_maps: dict[str, dict[str, _BulkStat] | None] = {}
+        self._bulk_reads: dict[str, int] = {}
+        self.swept = 0.0
+        self.hits = 0
+        self.misses = 0
+        self.path: Path | None = None
+        if not self.enabled:
+            return
+        base = os.environ.get("LLM_BRAIN_CACHE_DIR") or os.path.join(
+            os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+            "llm-brain",
+        )
+        base_real = os.path.realpath(base)
+        # Never cache inside the vault itself (derived data stays off the NAS).
+        if base_real == self.root or base_real.startswith(self.root + os.sep):
+            self.enabled = False
+            return
+        key = hashlib.sha256(self.root.encode("utf-8", "surrogateescape")).hexdigest()[:24]
+        self.path = Path(base) / "records" / f"{key}.v{RECORD_CACHE_FORMAT}.pickle"
+        self.fingerprint = _code_fingerprint()
+        try:
+            with open(self.path, "rb") as stream:
+                payload = _CacheUnpickler.load(stream)
+            if (
+                isinstance(payload, dict)
+                and payload.get("format") == RECORD_CACHE_FORMAT
+                and payload.get("root") == self.root
+                and isinstance(payload.get("entries"), dict)
+            ):
+                if payload.get("code") == self.fingerprint:
+                    self.entries = payload["entries"]
+                    if self.trust_seconds > 0:
+                        self.token = _change_token(self.root, self._entry_dirs())
+                        swept = payload.get("swept")
+                        if (
+                            isinstance(swept, (int, float))
+                            and payload.get("token") == self.token
+                            and 0 <= time.time() - swept < self.trust_seconds
+                        ):
+                            self.trusted, self.swept = True, float(swept)
+                else:
+                    # New code (an upgrade): keep only what is a pure function
+                    # of the bytes (raw, sha, stat key, write time) and drop
+                    # parsed/derived fields, so the first run after an upgrade
+                    # does not re-read every record over the network.
+                    keep = ("raw", "sha", "k", "t")
+                    self.entries = {
+                        rel: {name: entry[name] for name in keep if name in entry}
+                        for rel, entry in payload["entries"].items()
+                        if isinstance(entry, dict) and "raw" in entry and "sha" in entry and "k" in entry
+                    }
+                    self.dirty = bool(self.entries)
+        except Exception:  # noqa: BLE001 - a broken cache is just a cold cache
+            self.entries = {}
+        if self.trust_seconds > 0 and not self.trusted:
+            # This run does the full stat sweep; record it so the next
+            # read-only run inside the window can trust the cache.
+            self.token = self.token if self.token is not None else _change_token(self.root, self._entry_dirs())
+            self.swept = time.time()
+            self.dirty = True
+
+    def _entry_dirs(self) -> list[str]:
+        """Folders outside okf/ that hold cached records (e.g. review/ for --include-proposed)."""
+        dirs = {os.path.dirname(rel) for rel in self.entries}
+        return [os.path.join(self.root, d) for d in dirs if d and d != "okf" and not d.startswith("okf/")]
+
+    @staticmethod
+    def stat_key(st: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev)
+
+    def get(self, rel: str, st: os.stat_result) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        entry = self.entries.get(rel)
+        if (
+            entry is not None
+            and entry.get("k") == self.stat_key(st)
+            and entry.get("t", 0) - st.st_mtime_ns >= RECORD_CACHE_RACY_NS
+        ):
+            self.hits += 1
+            return entry
+        self.misses += 1
+        return None
+
+    def put(self, rel: str, st: os.stat_result, entry: dict[str, Any]) -> dict[str, Any]:
+        entry["k"] = self.stat_key(st)
+        entry["t"] = time.time_ns()
+        if self.enabled:
+            self.entries[rel] = entry
+            self.dirty = True
+        return entry
+
+    def prune(self, live: Iterable[str]) -> None:
+        keep = set(live)
+        for rel in [rel for rel in self.entries if rel not in keep]:
+            del self.entries[rel]
+            self.dirty = True
+
+    def save(self) -> None:
+        if not (self.enabled and self.dirty and self.path is not None):
+            return
+        import pickle
+        import tempfile
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(prefix=".rc.", dir=os.fspath(self.path.parent))
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    pickle.dump(
+                        {"format": RECORD_CACHE_FORMAT, "code": self.fingerprint, "root": self.root, "entries": self.entries,
+                         "token": self.token, "swept": self.swept},
+                        stream,
+                        protocol=4,
+                    )
+                os.replace(temporary, self.path)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+        except Exception:  # noqa: BLE001 - caching must never fail a command
+            pass
+        self.dirty = False
+
+    def _read_fd(self, path: str, rel: str) -> dict[str, Any]:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OkfError("not a regular file")
+            entry = self.get(rel, st)
+            if entry is None:
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+                after = os.fstat(fd)
+                entry = {"raw": raw, "sha": hashlib.sha256(raw).hexdigest()}
+                # Only cache when the file did not change while we read it.
+                if self.stat_key(after) == self.stat_key(st):
+                    self.put(rel, st, entry)
+                else:
+                    entry["k"] = None
+        finally:
+            os.close(fd)
+        return entry
+
+    def read(self, path: str, rel: str, need_meta: bool = True) -> dict[str, Any]:
+        """Entry for PATH with raw, sha and (optionally) parsed metadata.
+
+        Reads the file only on a miss.  ``meta``/``body_at`` are present when
+        the YAML frontmatter parsed; otherwise ``err`` holds the OkfError text.
+        """
+        # Hit path: one lstat and no open.  On SMB an open+fstat+close is
+        # three round trips (about 20 ms per record measured on a NAS); a
+        # symlink or non-regular file falls through to the O_NOFOLLOW open
+        # below, which fails exactly as before.
+        if self.trusted:
+            hit = self.entries.get(rel)
+            if hit is not None and hit.get("k") and (not need_meta or "meta" in hit or "err" in hit):
+                self.hits += 1
+                return hit
+        entry = None
+        bulk = self._bulk_stat(path) if self.bulk and self.enabled else None
+        if bulk is not None:
+            hit = self.get(rel, bulk)
+            if hit is not None and (not need_meta or "meta" in hit or "err" in hit):
+                return hit
+            # A miss reads through the O_NOFOLLOW open below, which re-checks
+            # the file with fstat; a hit with no parse reuses the cached bytes.
+            entry = hit
+            lst = None
+        else:
+            try:
+                lst = os.lstat(path)
+            except OSError:
+                lst = None
+        if lst is not None and stat.S_ISREG(lst.st_mode):
+            hit = self.get(rel, lst)
+            if hit is not None and (not need_meta or "meta" in hit or "err" in hit):
+                return hit
+            entry = hit  # cached bytes are current; only the parse is missing
+        if entry is None:
+            entry = self._read_fd(path, rel)
+        if need_meta and "meta" not in entry and "err" not in entry:
+            try:
+                text = entry["raw"].decode("utf-8")
+            except UnicodeDecodeError:
+                entry["err"] = "not valid UTF-8"
+            else:
+                try:
+                    metadata, body = split_frontmatter_text(text)
+                    entry["meta"] = metadata
+                    entry["body_at"] = len(text) - len(body)
+                except OkfError as exc:
+                    entry["err"] = str(exc)
+            self.dirty = self.dirty or self.enabled
+        return entry
+
+    def _bulk_stat(self, path: str) -> _BulkStat | None:
+        folder, name = os.path.split(path)
+        if folder not in self._bulk_maps:
+            seen = self._bulk_reads.get(folder, 0) + 1
+            self._bulk_reads[folder] = seen
+            if seen < BULK_STAT_MIN_READS:
+                return None
+            self._bulk_maps[folder] = _bulk_scan(folder)
+        found = self._bulk_maps[folder]
+        return None if found is None else found.get(name)
+
+    @staticmethod
+    def metadata_body(entry: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        if "err" in entry:
+            raise OkfError(entry["err"])
+        text = entry["raw"].decode("utf-8")
+        return copy.deepcopy(entry["meta"]), text[entry["body_at"]:]
+
+
+_RESOLVED: dict[str, Path] = {}
+
+
+def resolve_path(path: Path) -> Path:
+    """Path.resolve() memoised for one process.  The resolver resolves the
+    same record paths many times per command (about 25 times per record in a
+    brief); each resolve is one lstat per path component, which is a network
+    round trip on SMB/NFS.  Failures are not cached and raise as before."""
+    key = os.fspath(path)
+    found = _RESOLVED.get(key)
+    if found is None:
+        found = Path(path).resolve()
+        _RESOLVED[key] = found
+    return found
+
+
 class LifecycleResolver:
     """Small, read-only resolver shared by capsule and retrieval metadata.
 
@@ -902,7 +1392,7 @@ class LifecycleResolver:
                 if candidate.name in RESERVED or "retractions" in candidate.parts:
                     continue
                 try:
-                    resolved = candidate.resolve()
+                    resolved = resolve_path(candidate)
                     resolved.relative_to(self.root)
                 except (OSError, ValueError):
                     continue
@@ -910,19 +1400,40 @@ class LifecycleResolver:
                     files.append(resolved)
         self.files = sorted(set(files))
         self.file_set = set(self.files)
+        self.cache = RecordCache(self.root)
         # Parse once per request so reverse expansion and state resolution see
         # one stable view and malformed records fail closed consistently.
         for path in self.files:
             self.load(path)
+        if self.cache.enabled:
+            live = []
+            for path in self.files:
+                try:
+                    live.append(path.relative_to(self.root).as_posix())
+                except ValueError:
+                    pass
+            self.cache.prune(live)
+            self.cache.save()
 
     def load(self, path: Path) -> dict[str, Any]:
         try:
-            path = path.resolve()
+            path = resolve_path(path)
         except OSError:
             return {}
         if path not in self.metadata:
             try:
-                metadata, body = split_frontmatter(path)
+                cache = getattr(self, "cache", None)
+                if cache is not None and cache.enabled:
+                    try:
+                        rel = path.relative_to(self.root).as_posix()
+                    except ValueError:
+                        rel = ""
+                if cache is not None and cache.enabled and rel:
+                    entry = cache.read(os.fspath(path), rel)
+                    self.__dict__.setdefault("_raw", {})[path] = entry["raw"]
+                    metadata, body = RecordCache.metadata_body(entry)
+                else:
+                    metadata, body = split_frontmatter(path)
             except (OSError, OkfError):
                 metadata, body = {}, ""
                 self.errors[path] = "malformed-record"
@@ -1001,13 +1512,18 @@ class LifecycleResolver:
             return None
 
     def relative(self, path: Path) -> str:
-        return path.resolve().relative_to(self.root).as_posix()
+        return resolve_path(path).relative_to(self.root).as_posix()
 
     def _secret_bearing(self, path: Path) -> bool:
         cache = self.__dict__.setdefault("_secret_cache", {})
         if path not in cache:
             try:
-                cache[path] = bool(SECRET_BEARING.search(path.read_bytes()))
+                # Same bytes the resolver parsed (stat-validated cache entry);
+                # otherwise read the file as before.
+                raw = self.__dict__.get("_raw", {}).get(resolve_path(path))
+                if raw is None:
+                    raw = path.read_bytes()
+                cache[path] = bool(SECRET_BEARING.search(raw))
             except OSError:
                 cache[path] = True
         return cache[path]
@@ -1021,7 +1537,7 @@ class LifecycleResolver:
 
     def visible(self, path: Path, *, strict_principal: bool = True) -> bool:
         try:
-            path = path.resolve()
+            path = resolve_path(path)
         except OSError:
             return False
         if path not in self.file_set or path in self.errors:
@@ -1050,7 +1566,7 @@ class LifecycleResolver:
 
     def effective(self, path: Path) -> bool:
         try:
-            path = path.resolve()
+            path = resolve_path(path)
         except OSError:
             return False
         if path not in self.file_set or path in self.errors:
@@ -1079,7 +1595,7 @@ class LifecycleResolver:
         if text in self.ref_cache:
             return self.ref_cache[text]
         try:
-            candidate_path = (self.root / text).resolve()
+            candidate_path = resolve_path(self.root / text)
             candidate_path.relative_to(self.root)
         except (OSError, ValueError):
             candidate_path = None
@@ -1163,7 +1679,7 @@ class LifecycleResolver:
         self, path: Path, stack: tuple[str, ...] = (), depth: int = 0
     ) -> dict[str, Any]:
         try:
-            path = path.resolve()
+            path = resolve_path(path)
         except OSError:
             return {"state": "unresolved-dependency", "reason": "missing", "effective_ref": ""}
         rel = self.relative(path) if path in self.file_set else ""
@@ -1509,7 +2025,7 @@ class LifecycleResolver:
         roots: list[Path] = []
         for candidate in requested_roots:
             try:
-                resolved = candidate.resolve()
+                resolved = resolve_path(candidate)
             except OSError:
                 continue
             # Root selection is itself visibility-filtered so restricted or
@@ -1647,7 +2163,7 @@ class LifecycleResolver:
             is_root: bool = False,
         ) -> None:
             try:
-                path = path.resolve()
+                path = resolve_path(path)
             except OSError:
                 warn("unresolved-relation")
                 return
@@ -1906,6 +2422,481 @@ def command_manifest_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_audit_verify(args: argparse.Namespace) -> int:
+    """One line per problem, in file order, exactly as verify_audit_v2's shell
+    loop reports them: truncated, discontinuity, mismatch.  The header line
+    is checked by the caller.  Exit 3 when a byte could make the shell read
+    differ (the caller then runs its own loop)."""
+    try:
+        raw = Path(args.file).read_bytes()
+    except OSError as exc:
+        raise OkfError(str(exc)) from exc
+    lines = raw.split(b"\n")
+    lines = lines[1:-1]  # header, and the unterminated tail `read` never sees
+    expected_prev = b""
+    findings: list[str] = []
+    for line in lines:
+        if b"\0" in line or b"\x1c" in line:
+            return 3
+        fields = line.split(b"\t")
+        if len(fields) != 11 or line == b"":
+            findings.append("truncated")
+            continue
+        if fields[9] != expected_prev:
+            findings.append("discontinuity")
+        if hashlib.sha256(b"|".join(fields[:10])).hexdigest().encode("ascii") != fields[10]:
+            findings.append("mismatch")
+        expected_prev = fields[10]
+    for finding in findings:
+        print(finding)
+    return 0
+
+
+# --- OKF backfill (0.12): additive `description:` + generated per-folder index.md ---
+# Only adds: one front-matter line per record (inserted before the closing
+# `---`, body bytes untouched) and index.md files in folders that have none.
+# Every write is atomic; the undo manifest stores the exact inserted bytes
+# and offsets so `--undo` restores each file byte for byte.
+BACKFILL_MARKER = "<!-- memthena:okf-index v1 (generated; `llm-brain index build` refreshes it) -->"
+BACKFILL_DIR = "migrations/okf-backfill"
+RESTRICTED_TITLE = "Restricted record"
+_DESC_MAX = 200
+_BF_VERSION = 1
+
+
+def _bf_records(okf_root: Path) -> list[Path]:
+    out = []
+    for path in okf_root.rglob("*.md"):
+        if path.name in RESERVED or path.is_symlink() or not path.is_file():
+            continue
+        out.append(path)
+    return sorted(out)
+
+
+def _bf_restricted(meta: dict[str, Any] | None, raw: bytes) -> bool:
+    """Secret-bearing, non-internal or principal/audience-scoped: owner-only."""
+    if SECRET_BEARING.search(raw):
+        return True
+    if not isinstance(meta, dict):
+        return True
+    sensitivity = meta.get("brain_sensitivity", meta.get("sensitivity", "internal"))
+    if sensitivity not in (None, "internal"):
+        return True
+    for field in ("brain_principal", "brain_audience"):
+        value = meta.get(field)
+        if value not in (None, "", []):
+            return True
+    return False
+
+
+def _bf_clean(text: str, limit: int) -> str:
+    text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[`*_~<>\[\]\"\\]", "", text)
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    text = re.sub(r"\s+", " ", text).strip(" -:#")
+    if len(text) > limit:
+        cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:")
+        text = cut + "..."
+    return text
+
+
+def _bf_description(body: str) -> str:
+    paragraph: list[str] = []
+    fence = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = not fence
+            if paragraph:
+                break
+            continue
+        if fence:
+            continue
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if stripped.startswith(("#", "|", "<!--", "---", ">")) and not paragraph:
+            continue
+        paragraph.append(re.sub(r"^([-*+]|\d+[.)])\s+", "", stripped))
+    text = " ".join(paragraph)
+    match = re.match(r"(.{20,}?[.!?])(\s|$)", text)
+    if match:
+        text = match.group(1)
+    text = _bf_clean(text, _DESC_MAX)
+    if len(text) < 12 or SECRET_BEARING.search(text.encode("utf-8")):
+        return ""
+    return text
+
+
+def _bf_title(meta: dict[str, Any] | None, path: Path, restricted: bool) -> str:
+    if restricted:
+        return RESTRICTED_TITLE
+    title = meta.get("title") if isinstance(meta, dict) else None
+    title = _bf_clean(title if isinstance(title, str) and title.strip() else path.stem, 120)
+    if not title or SECRET_BEARING.search(title.encode("utf-8")):
+        return RESTRICTED_TITLE
+    return title
+
+
+def _bf_insertion(raw: bytes, description: str) -> tuple[int, bytes] | None:
+    """Offset and bytes for one `description:` line before the closing ---."""
+    if raw.startswith(b"---\r\n"):
+        newline = b"\r\n"
+    elif raw.startswith(b"---\n"):
+        newline = b"\n"
+    else:
+        return None
+    offset = 0
+    for index, line in enumerate(raw.splitlines(keepends=True)):
+        if index > 0 and line.rstrip(b"\r\n") == b"---":
+            if not raw[:offset].endswith(newline):
+                return None
+            line_bytes = b"description: " + json.dumps(description, ensure_ascii=False).encode("utf-8") + newline
+            return offset, line_bytes
+        offset += len(line)
+    return None
+
+
+def _bf_atomic_write(path: Path, data: bytes, mode: int | None, expect: os.stat_result | None) -> bool:
+    if expect is not None:
+        try:
+            now = os.lstat(path)
+        except OSError:
+            return False
+        if RecordCache.stat_key(now) != RecordCache.stat_key(expect):
+            return False
+    temporary = path.with_name(f".{path.name}.okfbf.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, stat.S_IMODE(mode) if mode is not None else 0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _bf_one(path: Path, rel: str, entry: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    """(count key, index record, edit plan or None) for one record's bytes."""
+    raw = entry["raw"]
+    meta = entry.get("meta")
+    restricted = _bf_restricted(meta, raw)
+    record = {"title": _bf_title(meta, path, restricted), "restricted": restricted, "description": ""}
+    if "err" in entry:
+        return "unparseable", record, None
+    if restricted:
+        return "restricted", record, None
+    existing = meta.get("description")
+    if isinstance(existing, str) and existing.strip():
+        clean = _bf_clean(existing, _DESC_MAX)
+        record["description"] = "" if SECRET_BEARING.search(clean.encode("utf-8")) else clean
+        return "has_description", record, None
+    if "description" in meta:
+        return "has_description", record, None
+    if "/retractions/" in "/" + rel:
+        return "retraction", record, None
+    body = raw.decode("utf-8")[entry["body_at"]:]
+    description = _bf_description(body)
+    if not description:
+        return "no_lead", record, None
+    insertion = _bf_insertion(raw, description)
+    if insertion is None:
+        return "no_frontmatter_slot", record, None
+    offset, line_bytes = insertion
+    new_raw = raw[:offset] + line_bytes + raw[offset:]
+    try:
+        new_meta, new_body = split_frontmatter_text(new_raw.decode("utf-8"))
+    except OkfError:
+        return "no_frontmatter_slot", record, None
+    expected = dict(meta)
+    expected["description"] = description
+    if new_meta != expected or new_body != body:
+        return "no_frontmatter_slot", record, None
+    record["description"] = description
+    plan = {"offset": offset, "insert": line_bytes.decode("utf-8"), "before_sha": entry["sha"], "after_sha": hashlib.sha256(new_raw).hexdigest(), "description": description}
+    return "add", record, plan
+
+
+def _bf_scan(project: Path, cache: RecordCache) -> dict[str, Any]:
+    okf_root = project / "okf"
+    plans: list[dict[str, Any]] = []
+    counts = {"records": 0, "add": 0, "has_description": 0, "restricted": 0, "no_lead": 0, "unparseable": 0, "retraction": 0, "no_frontmatter_slot": 0}
+    info: dict[str, dict[str, Any]] = {}
+    for path in _bf_records(okf_root):
+        rel = path.relative_to(project).as_posix()
+        counts["records"] += 1
+        entry = cache.read(os.fspath(path), rel)
+        # The derived result rides in the stat-checked cache entry, so a
+        # warm check or index-build refresh skips the YAML re-verification.
+        derived = entry.get("bf")
+        if not (isinstance(derived, tuple) and len(derived) == 4 and derived[0] == _BF_VERSION):
+            key, record, plan = _bf_one(path, rel, entry)
+            derived = (_BF_VERSION, key, record, plan)
+            if entry.get("k") is not None:
+                entry["bf"] = derived
+                cache.dirty = cache.dirty or cache.enabled
+        _, key, record, plan = derived
+        # 26 Oct: a retracted record stays listed (lineage) but loses its
+        # title and description in generated folder indexes.
+        if "/retractions/" not in "/" + rel and (okf_root / "retractions" / path.name).is_file():
+            record, plan = {"title": "Retracted record", "restricted": True, "description": ""}, None
+        counts[key] += 1
+        info[rel] = dict(record, rel=rel)
+        if plan is not None:
+            plans.append(dict(plan, rel=rel))
+    return {"plans": plans, "counts": counts, "info": info}
+
+
+def _bf_folders(project: Path, info: dict[str, dict[str, Any]]) -> list[str]:
+    folders: set[str] = set()
+    for rel in info:
+        parent = PurePosixPath(rel).parent
+        while parent.as_posix() not in ("okf", "."):
+            folders.add(parent.as_posix())
+            parent = parent.parent
+    return sorted(folders)
+
+
+def _bf_index_text(folder: str, folders: list[str], info: dict[str, dict[str, Any]]) -> str:
+    name = PurePosixPath(folder).name
+    lines = [BACKFILL_MARKER, f"# {name.replace('-', ' ').replace('_', ' ').title()}", ""]
+    subs = [f for f in folders if PurePosixPath(f).parent.as_posix() == folder]
+    if subs:
+        lines += ["## Folders", ""]
+        lines += [f"* [{PurePosixPath(s).name}]({PurePosixPath(s).name}/)" for s in subs]
+        lines.append("")
+    records = sorted(rel for rel in info if PurePosixPath(rel).parent.as_posix() == folder)
+    if records:
+        lines += ["## Records", ""]
+        for rel in records:
+            record = info[rel]
+            item = f"* [{record['title']}]({PurePosixPath(rel).name})"
+            if record["description"] and not record["restricted"]:
+                item += f" - {record['description']}"
+            lines.append(item)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _bf_is_ours(path: Path) -> bool:
+    try:
+        with open(path, "rb") as stream:
+            return stream.readline().rstrip(b"\r\n") == BACKFILL_MARKER.encode("utf-8")
+    except OSError:
+        return False
+
+
+def _bf_index_plan(project: Path, info: dict[str, dict[str, Any]], only: set[str] | None, create: bool) -> tuple[list[tuple[str, str, str]], dict[str, int]]:
+    folders = _bf_folders(project, info)
+    plan: list[tuple[str, str, str]] = []
+    counts = {"folders": len(folders), "index_create": 0, "index_refresh": 0, "index_user_kept": 0, "index_current": 0}
+    for folder in folders:
+        if only is not None and folder not in only:
+            continue
+        target = project / folder / "index.md"
+        text = _bf_index_text(folder, folders, info)
+        if target.exists() or target.is_symlink():
+            if not _bf_is_ours(target):
+                counts["index_user_kept"] += 1
+                continue
+            if target.read_bytes() == text.encode("utf-8"):
+                counts["index_current"] += 1
+                continue
+            counts["index_refresh"] += 1
+            plan.append((folder, "refresh", text))
+        elif create:
+            counts["index_create"] += 1
+            plan.append((folder, "create", text))
+    return plan, counts
+
+
+def _bf_print(prefix: str, counts: dict[str, int]) -> None:
+    print(prefix + " " + " ".join(f"{key}={value}" for key, value in counts.items()))
+
+
+def command_okf_backfill(args: argparse.Namespace) -> int:
+    project = Path(os.path.realpath(args.project_dir))
+    if not (project / "okf").is_dir():
+        raise OkfError(f"project has no okf bundle: {project}")
+    state_dir = project / BACKFILL_DIR
+    active = state_dir / "active"
+    if args.mode == "undo":
+        return _bf_undo(project, state_dir, args.id)
+    cache = RecordCache(project)
+    scan = _bf_scan(project, cache)
+    cache.save()
+    if args.mode == "refresh":
+        if not active.is_file():
+            print("okf_backfill=refresh state=inactive")
+            return 0
+        only = None
+        if args.folder:
+            only = set()
+            parent = PurePosixPath(args.folder)
+            while parent.as_posix() not in ("okf", "."):
+                only.add(parent.as_posix())
+                parent = parent.parent
+        plan, counts = _bf_index_plan(project, scan["info"], only, create=True)
+        for folder, _action, text in plan:
+            target = project / folder / "index.md"
+            if target.exists() and not _bf_is_ours(target):
+                continue
+            _bf_atomic_write(target, text.encode("utf-8"), None, None)
+        _bf_print("okf_backfill=refresh", counts)
+        return 0
+    index_plan, index_counts = _bf_index_plan(project, scan["info"], None, create=True)
+    if args.mode == "check":
+        _bf_print("okf_backfill=check", {**scan["counts"], **index_counts})
+        for plan in scan["plans"][: max(0, args.samples)]:
+            print(f"okf_backfill:sample path={plan['rel']} description={json.dumps(plan['description'], ensure_ascii=False)}")
+        return 0
+    # apply
+    if not re.fullmatch(r"okfbf-[A-Za-z0-9-]{1,64}", args.id or ""):
+        raise OkfError("apply requires --id okfbf-...")
+    run_dir = state_dir / args.id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    preexisting_ours = sorted(
+        p.relative_to(project).as_posix() for p in (project / "okf").rglob("index.md") if p.parent != project / "okf" and _bf_is_ours(p)
+    )
+    manifest = {
+        "format": 1, "id": args.id, "state": "in-progress", "created_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "edits": [{k: p[k] for k in ("rel", "offset", "insert", "before_sha", "after_sha")} for p in scan["plans"]],
+        "index_created": [f"{folder}/index.md" for folder, action, _ in index_plan if action == "create"],
+        "index_refreshed": [{"rel": f"{folder}/index.md", "before": (project / folder / "index.md").read_text(encoding="utf-8")} for folder, action, _ in index_plan if action == "refresh"],
+        "preexisting_generated": preexisting_ours,
+        "skipped_changed": [],
+    }
+    manifest_path = run_dir / "manifest.json"
+
+    def save_manifest() -> None:
+        _bf_atomic_write(manifest_path, (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode("utf-8"), 0o644, None)
+
+    save_manifest()  # journal first: an interrupted apply is still undoable
+    _bf_atomic_write(active, (args.id + "\n").encode("utf-8"), 0o644, None)
+    applied = 0
+    for edit in manifest["edits"]:
+        path = project / edit["rel"]
+        st = os.lstat(path)
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != edit["before_sha"]:
+            manifest["skipped_changed"].append(edit["rel"])
+            continue
+        offset, insert = edit["offset"], edit["insert"].encode("utf-8")
+        if not _bf_atomic_write(path, raw[:offset] + insert + raw[offset:], st.st_mode, st):
+            manifest["skipped_changed"].append(edit["rel"])
+            continue
+        applied += 1
+    manifest["edits"] = [e for e in manifest["edits"] if e["rel"] not in set(manifest["skipped_changed"])]
+    for folder, action, text in index_plan:
+        target = project / folder / "index.md"
+        if action == "create" and (target.exists() or target.is_symlink()):
+            continue
+        _bf_atomic_write(target, text.encode("utf-8"), 0o644 if action == "create" else None, None)
+    manifest["state"] = "applied"
+    save_manifest()
+    print(
+        f"okf_backfill=applied id={args.id} descriptions={applied} skipped_changed={len(manifest['skipped_changed'])} "
+        f"index_created={len(manifest['index_created'])} index_refreshed={len(manifest['index_refreshed'])} "
+        f"manifest={manifest_path.relative_to(project).as_posix()} manifest_sha256={hashlib.sha256(manifest_path.read_bytes()).hexdigest()}"
+    )
+    return 0
+
+
+def command_describe_new(args: argparse.Namespace) -> int:
+    """Insert an OKF `description:` into a freshly written (not yet canonical)
+    record file, using exactly the okf-backfill rules: restricted, secret,
+    non-internal or principal/audience-scoped records, retractions, records
+    that already have one and bodies with no lead sentence are left
+    byte-for-byte alone.  Prints the outcome key; always exits 0 unless the
+    file cannot be read (the caller then keeps the file as it is)."""
+    path = Path(args.file)
+    raw = path.read_bytes()
+    entry: dict[str, Any] = {"raw": raw, "sha": hashlib.sha256(raw).hexdigest()}
+    try:
+        text = raw.decode("utf-8")
+        meta, body = split_frontmatter_text(text)
+        entry["meta"] = meta
+        entry["body_at"] = len(text) - len(body)
+    except (UnicodeDecodeError, OkfError) as exc:
+        entry["err"] = str(exc)
+    key, _record, plan = _bf_one(path, args.rel or path.name, entry)
+    if plan is not None:
+        offset = plan["offset"]
+        new_raw = raw[:offset] + plan["insert"].encode("utf-8") + raw[offset:]
+        temp = path.with_name(path.name + ".desc")
+        temp.write_bytes(new_raw)
+        os.chmod(temp, stat.S_IMODE(os.stat(path).st_mode))
+        os.replace(temp, path)
+    print(key)
+    return 0
+
+
+def _bf_undo(project: Path, state_dir: Path, run_id: str | None) -> int:
+    if not re.fullmatch(r"okfbf-[A-Za-z0-9-]{1,64}", run_id or ""):
+        raise OkfError("undo requires --id okfbf-...")
+    manifest_path = state_dir / run_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("state") == "undone":
+        print(f"okf_backfill=undo id={run_id} state=already-undone")
+        return 0
+    restores: list[tuple[Path, bytes, os.stat_result]] = []
+    conflicts = already = 0
+    for edit in manifest["edits"]:
+        path = project / edit["rel"]
+        try:
+            st = os.lstat(path)
+            raw = path.read_bytes()
+        except OSError:
+            conflicts += 1
+            continue
+        sha = hashlib.sha256(raw).hexdigest()
+        if sha == edit["before_sha"]:
+            already += 1
+            continue
+        insert = edit["insert"].encode("utf-8")
+        offset = edit["offset"]
+        original = raw[:offset] + raw[offset + len(insert):]
+        if sha != edit["after_sha"] or raw[offset:offset + len(insert)] != insert or hashlib.sha256(original).hexdigest() != edit["before_sha"]:
+            conflicts += 1
+            continue
+        restores.append((path, original, st))
+    if conflicts:
+        print(f"okf_backfill=undo id={run_id} state=refused conflicts={conflicts} (records edited after the backfill; nothing changed)")
+        return 75
+    for path, original, st in restores:
+        if not _bf_atomic_write(path, original, st.st_mode, st):
+            print(f"okf_backfill=undo id={run_id} state=partial reason=record-changed-during-undo")
+            return 75
+    for item in manifest.get("index_refreshed", []):
+        target = project / item["rel"]
+        if _bf_is_ours(target):
+            _bf_atomic_write(target, item["before"].encode("utf-8"), None, None)
+    keep = set(manifest.get("preexisting_generated", [])) | {i["rel"] for i in manifest.get("index_refreshed", [])}
+    removed = 0
+    for path in sorted((project / "okf").rglob("index.md")):
+        rel = path.relative_to(project).as_posix()
+        if path.parent != project / "okf" and rel not in keep and _bf_is_ours(path):
+            path.unlink()
+            removed += 1
+    active = state_dir / "active"
+    if active.is_file() and active.read_text(encoding="utf-8").strip() == run_id:
+        active.unlink()
+    manifest["state"] = "undone"
+    manifest["undone_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _bf_atomic_write(manifest_path, (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode("utf-8"), 0o644, None)
+    print(f"okf_backfill=undone id={run_id} restored={len(restores)} already_original={already} index_removed={removed}")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -1967,6 +2958,9 @@ def parser() -> argparse.ArgumentParser:
     bundle.add_argument("--at", required=True)
     bundle.set_defaults(func=command_migrate_bundle)
 
+    audit_verify = commands.add_parser("audit-verify")
+    audit_verify.add_argument("file")
+    audit_verify.set_defaults(func=command_audit_verify)
     audit = commands.add_parser("audit")
     audit.add_argument("bundle")
     audit.add_argument("--json", action="store_true")
@@ -1984,6 +2978,17 @@ def parser() -> argparse.ArgumentParser:
     manifest_info = commands.add_parser("manifest-info")
     manifest_info.add_argument("json_file")
     manifest_info.set_defaults(func=command_manifest_info)
+    backfill = commands.add_parser("okf-backfill")
+    backfill.add_argument("--project-dir", required=True)
+    backfill.add_argument("--mode", choices=("check", "apply", "undo", "refresh"), default="check")
+    backfill.add_argument("--id")
+    backfill.add_argument("--samples", type=int, default=3)
+    backfill.add_argument("--folder")
+    backfill.set_defaults(func=command_okf_backfill)
+    describe = commands.add_parser("describe-new")
+    describe.add_argument("--file", required=True)
+    describe.add_argument("--rel")
+    describe.set_defaults(func=command_describe_new)
     return result
 
 

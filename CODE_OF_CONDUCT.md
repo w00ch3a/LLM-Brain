@@ -1,6 +1,6 @@
 # Code of Conduct
 
-LLM-Brain is a technical project built around privacy, inspectability and
+Memthena is a technical project built around privacy, inspectability and
 good-faith collaboration. Keep project spaces useful, safe and focused on the
 work.
 

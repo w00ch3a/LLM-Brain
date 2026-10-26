@@ -1,11 +1,11 @@
 ---
 name: llm-brain
-description: Automatically use filesystem-first LLM-Brain memory before and after every non-trivial project task, without waiting for the user to name it. Also use when asked to build, inspect, repair, migrate or retrieve durable project memory, OKF knowledge, reviews, indexes, context packs, adapters or exports. Skip automatic use only when LLM_BRAIN_PASSIVE=0. Never replace current repository authority with an older memory record.
+description: Automatically use filesystem-first Memthena (formerly LLM-Brain) memory before and after every non-trivial project task, without waiting for the user to name it. Also use when asked to build, inspect, repair, migrate or retrieve durable project memory, OKF knowledge, reviews, indexes, context packs, adapters or exports. Skip automatic use only when LLM_BRAIN_PASSIVE=0. Never replace current repository authority with an older memory record.
 ---
 
-# LLM-Brain operating skill
+# Memthena operating skill
 
-LLM-Brain is durable, inspectable project memory. It is not a prompt, a chat transcript, or a prettier wiki.
+Memthena is durable, inspectable project memory. It is not a prompt, a chat transcript, or a prettier wiki.
 
 The shipped package uses canonical OKF v0.2 in storage schema 3. `search
 --receipt` is opt-in; forgetting requires `retract --preview` followed by the
@@ -19,7 +19,7 @@ Canonical semantic memory is a conformant Open Knowledge Format v0.2 bundle unde
 
 ## Automatic operation, passive for the user
 
-LLM-Brain is active infrastructure. “Passive” describes the user experience: the agent uses LLM-Brain naturally, without requiring the user to remember, invoke or manage it.
+Memthena is active infrastructure. “Passive” describes the user experience: the agent uses Memthena naturally, without requiring the user to remember, invoke or manage it.
 
 For every non-trivial project task, unless `LLM_BRAIN_PASSIVE=0`:
 
@@ -34,7 +34,7 @@ Set `LLM_BRAIN_PASSIVE=0` to suppress the automatic status check as well as
 automatic retrieval and capture. For a requested maintenance review, use the
 progressive-disclosure [maintenance skill](skills/llm-brain-maintenance/SKILL.md).
 
-Do this naturally. Do not require the user to say “use LLM-Brain”, and do not narrate routine retrieval unless it affects the result or is blocked.
+Do this naturally. Do not require the user to say “use Memthena”, and do not narrate routine retrieval unless it affects the result or is blocked.
 
 ## Permission gate
 
@@ -131,7 +131,7 @@ Candidate frontmatter may request `brain_commitment_action` (`persist`, `use-now
 
 For explicit evidence/current-state work, read warnings before resolved records. A visible reference is not an opened source: `evidence_opened` is true only after rendering reads custody bytes and verifies their expected SHA-256; `evidence_incomplete` marks missing, hidden, changed or budget-omitted custody. This proves custody, not semantic support. Opt-in receipts keep old JSONL fields while identity version 2 separates principal, intent, as-of and rendered selection. Hermes' default capture remains non-blocking; only its explicitly required checkpoint mode waits for a durable bridge completion receipt. Never claim a queued outbox item is complete.
 
-OpenClaw descriptors for 2026.9.2 and 2026.9.6 are LLM-Brain export envelopes for explicit, non-canonical staging, not native OpenClaw profiles. Do not ingest session transcripts or make Pi, Oh My Pi or Claude Code a second canonical writer.
+OpenClaw descriptors for 2026.9.2 and 2026.9.6 are Memthena export envelopes for explicit, non-canonical staging, not native OpenClaw profiles. Do not ingest session transcripts or make Pi, Oh My Pi or Claude Code a second canonical writer.
 
 For migration, first run `migrate check`. `migrate apply --all` is a vault-wide, staging-and-rollback operation and requires explicit authorisation. It never runs as a side effect of normal work.
 

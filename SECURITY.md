@@ -1,6 +1,6 @@
 # Security policy
 
-LLM-Brain stores durable project knowledge and may be pointed at source material. Treat its vault as private by default.
+Memthena stores durable project knowledge and may be pointed at source material. Treat its vault as private by default.
 
 ## Reporting
 
@@ -18,4 +18,4 @@ No warranty of secret detection is implied. Review source scope before ingesting
 
 ## Licence and responsibility
 
-LLM-Brain is provided under the Apache License 2.0, subject to that licence's disclaimers and applicable-law limits. Users remain responsible for access controls, source selection, validation, migration and deployment. No security policy, test or evaluation guarantees that all secrets, attacks or unsafe content will be detected.
+Memthena is provided under the Apache License 2.0, subject to that licence's disclaimers and applicable-law limits. Users remain responsible for access controls, source selection, validation, migration and deployment. No security policy, test or evaluation guarantees that all secrets, attacks or unsafe content will be detected.

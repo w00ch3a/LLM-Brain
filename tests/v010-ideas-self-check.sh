@@ -194,7 +194,7 @@ cp "$vault/writer.format" "$fixture/writer.bak"
 printf 'format_level=99\nwriter_version=9.9.9\n' >"$vault/writer.format"
 set +e; out="$(b working add "$pid" 'should be refused' 2>&1)"; rc=$?; set -e
 [ "$rc" = 75 ] || fail "#8 older build wrote a newer vault (rc=$rc): $out"
-grep -Fq 'written by a newer LLM-Brain (format level 99, version 9.9.9)' <<<"$out" || fail "#8 refusal unclear: $out"
+grep -Fq 'written by a newer Memthena build (format level 99, version 9.9.9)' <<<"$out" || fail "#8 refusal unclear: $out"
 [ ! -d "$vault/.locks/project-$pid.lock" ] || fail '#8 refusal left the lock behind'
 b search "$pid" 'tariff rate' >/dev/null || fail '#8 reads blocked by the guard'
 grep -Fxq 'format_level=99' "$vault/writer.format" || fail '#8 guard downgraded the vault level'

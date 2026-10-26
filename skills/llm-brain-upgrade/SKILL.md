@@ -1,9 +1,9 @@
 ---
 name: llm-brain-upgrade
-description: Upgrade LLM-Brain when the user asks to upgrade, update, migrate or refresh LLM-Brain, its plugin, extension, OKF format or configured vaults. Perform one read-only preflight, ask once before writes, then update the existing trusted host source, verify and retain receipt-based rollback. The current release is migration-free unless a separate migration is explicitly authorised.
+description: Upgrade Memthena (formerly LLM-Brain) when the user asks to upgrade, update, migrate or refresh Memthena or LLM-Brain, its plugin, extension, OKF format or configured vaults. Perform one read-only preflight, ask once before writes, then update the existing trusted host source, verify and retain receipt-based rollback. The current release is migration-free unless a separate migration is explicitly authorised.
 ---
 
-# LLM-Brain upgrade
+# Memthena upgrade
 
 Upgrade the installed package and configured vaults as one transaction.
 

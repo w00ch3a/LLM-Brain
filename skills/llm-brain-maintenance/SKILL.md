@@ -1,9 +1,9 @@
 ---
 name: llm-brain-maintenance
-description: Inspect and run bounded, derived LLM-Brain maintenance reports for freshness, retention candidates, conflicts, provenance, work, receipts and index health. Use only when maintenance is requested; never delete, promote, schedule or alter canonical memory automatically.
+description: Inspect and run bounded, derived Memthena (formerly LLM-Brain) maintenance reports for freshness, retention candidates, conflicts, provenance, work, receipts and index health. Use only when maintenance is requested; never delete, promote, schedule or alter canonical memory automatically.
 ---
 
-# LLM-Brain maintenance
+# Memthena maintenance
 
 Maintenance is an inspectable health view over a project. It is not a second
 memory store and it never becomes canonical OKF knowledge.
@@ -75,5 +75,5 @@ No daemon, database, zvec engine, cloud backend or new dependency is needed.
 - Use `--strict` only when a caller wants a non-zero result for `attention` or
   `blocked`; ordinary status remains fail-open.
 
-Read the [full LLM-Brain workflow](../../SKILL.md) for custody, review and
+Read the [full Memthena workflow](../../SKILL.md) for custody, review and
 closeout rules.

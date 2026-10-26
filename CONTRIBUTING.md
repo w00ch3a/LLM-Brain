@@ -1,4 +1,4 @@
-# Contributing to LLM-Brain
+# Contributing to Memthena
 
 Thanks for helping improve local-first, inspectable memory for AI agents.
 
