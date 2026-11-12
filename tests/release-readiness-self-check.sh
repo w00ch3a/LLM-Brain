@@ -122,6 +122,7 @@ core_checks() {
     bash "$repo_root/tests/independent-sources-self-check.sh" -- \
     bash "$repo_root/tests/pack-footer-self-check.sh" -- \
     bash "$repo_root/tests/nested-inherits-self-check.sh" -- \
+    bash "$repo_root/tests/conflict-decision-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

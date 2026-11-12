@@ -170,6 +170,7 @@ Commands:
   review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
                                               Tiered backlog clean-up; dry-run prints counts only
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
+  conflict decide PROJECT_ID REF_A REF_B --winner a|b|both --reason TEXT | conflict list PROJECT_ID
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--source REF] [--preview [--principal ID]|--confirm TOKEN] | --finish
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--fusion rrf|zscore] [--fusion-alpha A] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
@@ -6080,7 +6081,10 @@ state_resolution_for_file() {
   [ "$hops" -lt 32 ] || { STATE_RESOLUTION="invalid-cycle"; STATE_REASON="lineage-hop-limit"; return 0; }
   stack="${stack}|${rel}|"
   canonical_file_effective "$dir" "$file" || { STATE_RESOLUTION="historical"; STATE_REASON="not-effective"; return 0; }
-  [ "$(file_conflict_state "$file" "${SEARCH_GRAPH_FILE:-}")" = "conflicted" ] && { STATE_RESOLUTION="unresolved-conflict"; STATE_REASON="explicit-conflict"; return 0; }
+  case "$(file_conflict_state "$file" "${SEARCH_GRAPH_FILE:-}")" in
+    conflicted) STATE_RESOLUTION="unresolved-conflict"; STATE_REASON="explicit-conflict"; return 0 ;;
+    lost) STATE_RESOLUTION="historical"; STATE_REASON="conflict-decided-against"; return 0 ;;
+  esac
   brain_temporal_eligible "$file" "$as_of" 0 || { STATE_RESOLUTION="historical"; STATE_REASON="outside-validity"; return 0; }
 
   local chain_supersedes chain_version_of depends_on
@@ -6697,6 +6701,14 @@ search_eligible_memo() {
 # conflicts_with edge. Paths awk would read differently (backslashes,
 # numeric-looking) use file_conflict_state itself.
 search_row_conflicted() {
+  if search_row_conflicted_raw "$@"; then
+    [ "$(conflict_decision_role_for_file "$1")" != winner ]
+    return
+  fi
+  return 1
+}
+
+search_row_conflicted_raw() {
   local file="$1" graph_file="${2:-}" rels_file="$3" conflicts rel graph_root line
   fm_get conflicts "$file" brain_conflicts
   [ -z "$conflicts" ] || return 0
@@ -6709,11 +6721,11 @@ search_row_conflicted() {
   rel="${file#"$graph_root"/}"
   case "$rel" in
     *\\*|*[!0-9eE.+-]*) ;;
-    *) [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return ;;
+    *) [ "$(file_conflict_state "$file" "$graph_file" CONFLICT_RAW)" = conflicted ]; return ;;
   esac
-  case "$rel" in *\\*) [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return ;; esac
+  case "$rel" in *\\*) [ "$(file_conflict_state "$file" "$graph_file" CONFLICT_RAW)" = conflicted ]; return ;; esac
   if [ ! -f "$rels_file" ]; then
-    awk -F '\t' '$2 == "conflicts_with" { print $1; print $3 }' "$graph_file" >"$rels_file" 2>/dev/null || { rm -f "$rels_file"; [ "$(file_conflict_state "$file" "$graph_file")" = conflicted ]; return; }
+    awk -F '\t' '$2 == "conflicts_with" { print $1; print $3 }' "$graph_file" >"$rels_file" 2>/dev/null || { rm -f "$rels_file"; [ "$(file_conflict_state "$file" "$graph_file" CONFLICT_RAW)" = conflicted ]; return; }
   fi
   while IFS= read -r line; do
     [ "$line" != "$rel" ] || return 0
@@ -6721,11 +6733,162 @@ search_row_conflicted() {
   return 1
 }
 
+# #7 (2 Nov): a conflict decision is its own record under conflict-decisions/,
+# tied to the sha256 of both sides.  It holds only while both sides are
+# unchanged and unretracted; otherwise it is re-opened and both sides are
+# conflicting again.  Prints "valid" or "reopened<TAB>why".
+conflict_decision_status() {
+  local pdir="$1" decision="$2" side rel want have why=""
+  for side in a b; do
+    rel="$(frontmatter_field "$decision" "brain_conflict_$side")"
+    want="$(frontmatter_field "$decision" "brain_conflict_${side}_sha256")"
+    if [ ! -f "$pdir/$rel" ]; then why="${why}${why:+; }$rel was removed"; continue; fi
+    if [ -f "$pdir/okf/retractions/$(basename "$rel" .md).md" ]; then why="${why}${why:+; }$rel was retracted"; continue; fi
+    have="$(sha256_file "$pdir/$rel")"
+    [ "$have" = "$want" ] || why="${why}${why:+; }$rel was edited after the decision"
+  done
+  if [ -z "$why" ]; then printf 'valid\n'; else printf 'reopened\t%s\n' "$why"; fi
+}
+
+# Role of REL under the valid decisions of PDIR: winner, loser or none.
+conflict_decision_role() {
+  local pdir="$1" rel="$2" decision a b winner
+  [ -d "$pdir/conflict-decisions" ] || { printf 'none\n'; return; }
+  for decision in "$pdir"/conflict-decisions/*.md; do
+    [ -f "$decision" ] || continue
+    a="$(frontmatter_field "$decision" brain_conflict_a)"; b="$(frontmatter_field "$decision" brain_conflict_b)"
+    [ "$rel" = "$a" ] || [ "$rel" = "$b" ] || continue
+    [ "$(conflict_decision_status "$pdir" "$decision")" = valid ] || continue
+    winner="$(frontmatter_field "$decision" brain_conflict_winner)"
+    if [ "$winner" = both ] || [ "$winner" = "$rel" ]; then printf 'winner\n'; else printf 'loser\n'; fi
+    return
+  done
+  printf 'none\n'
+}
+
+# Project dir and relative path of a canonical file, for decision lookups.
+conflict_decision_role_for_file() {
+  local file="$1"
+  case "$file" in */okf/*) ;; *) printf 'none\n'; return ;; esac
+  [ -d "${file%%/okf/*}/conflict-decisions" ] || { printf 'none\n'; return; }
+  conflict_decision_role "${file%%/okf/*}" "okf/${file#*/okf/}"
+}
+
+conflict_ref_rel() {
+  local pdir="$1" ref="$2"
+  case "$ref" in okf/*) ;; *.md) ref="okf/claims/$ref" ;; *) ref="okf/claims/$ref.md" ;; esac
+  [ -f "$pdir/$ref" ] || return 1
+  printf '%s\n' "$ref"
+}
+
+# True when REL_A names REL_B in brain_conflicts (path or id) or the index
+# graph has a conflicts_with edge between them.
+conflict_pair_marked() {
+  local pdir="$1" a="$2" b="$3" item graph
+  while IFS= read -r item; do
+    item="${item#./}"
+    [ "$item" = "$b" ] || [ "$item" = "$(basename "$b" .md)" ] || [ "$item" = "$(basename "$b")" ] && return 0
+  done < <(frontmatter_field "$pdir/$a" brain_conflicts | tr -d '[]"' | tr ',' '\n' | sed 's/^ *//; s/ *$//')
+  graph="$(index_file_path "$pdir" graph.tsv 2>/dev/null || true)"
+  [ -n "$graph" ] && [ -f "$graph" ] && awk -F '\t' -v a="$a" -v b="$b" '$2 == "conflicts_with" && $1 == a && $3 == b { f=1 } END { exit !f }' "$graph"
+}
+
+cmd_conflict() {
+  local action="${1:-}" project_id="${2:-}"; shift 2 || die 64 "conflict requires decide|list PROJECT_ID"
+  local dir a="" b="" winner="" reason="" side_a side_b id file tmp status why decision
+  require_project "$project_id" dir
+  case "$action" in
+    decide)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --winner) winner="${2:-}"; shift 2 ;;
+          --reason) reason="${2:-}"; shift 2 ;;
+          *) if [ -z "$a" ]; then a="$1"; elif [ -z "$b" ]; then b="$1"; else die 64 "conflict decide takes two records"; fi; shift ;;
+        esac
+      done
+      [ -n "$a" ] && [ -n "$b" ] && [ -n "$reason" ] || die 64 "conflict decide PROJECT_ID REF_A REF_B --winner a|b|both --reason TEXT"
+      validate_scalar "$reason" || die 65 "--reason must be a single line"
+      side_a="$(conflict_ref_rel "$dir" "$a")" || die 66 "record not found: $a"
+      side_b="$(conflict_ref_rel "$dir" "$b")" || die 66 "record not found: $b"
+      [ "$side_a" != "$side_b" ] || die 64 "a conflict needs two different records"
+      case "$winner" in a) winner="$side_a" ;; b) winner="$side_b" ;; both) ;; *) die 64 "--winner must be a, b or both" ;; esac
+      conflict_pair_marked "$dir" "$side_a" "$side_b" || conflict_pair_marked "$dir" "$side_b" "$side_a" ||
+        die 65 "these two records are not marked as conflicting with each other (brain_conflicts); nothing to decide"
+      id="conflictdecision_$(sha256_text "$side_a|$side_b|$winner|$(sha256_file "$dir/$side_a")|$(sha256_file "$dir/$side_b")" | cut -c1-12)"
+      file="$dir/conflict-decisions/$id.md"
+      acquire_lock "project-$project_id"
+      mkdir -p "$dir/conflict-decisions"
+      if [ ! -f "$file" ]; then
+        # A newer decision on the same pair replaces older ones.
+        for decision in "$dir"/conflict-decisions/*.md; do
+          [ -f "$decision" ] || continue
+          if { [ "$(frontmatter_field "$decision" brain_conflict_a)" = "$side_a" ] && [ "$(frontmatter_field "$decision" brain_conflict_b)" = "$side_b" ]; } || { [ "$(frontmatter_field "$decision" brain_conflict_a)" = "$side_b" ] && [ "$(frontmatter_field "$decision" brain_conflict_b)" = "$side_a" ]; }; then
+            mkdir -p "$dir/conflict-decisions/replaced"; mv "$decision" "$dir/conflict-decisions/replaced/"
+          fi
+        done
+        tmp="$file.tmp.$$"
+        {
+          printf '%s\n' '---' 'type: ConflictDecision' "title: $(yaml_quote "Conflict decision: $side_a vs $side_b")" "brain_project_id: $project_id" "brain_conflict_decision_id: $id"
+          printf 'brain_conflict_a: %s\nbrain_conflict_a_sha256: %s\nbrain_conflict_b: %s\nbrain_conflict_b_sha256: %s\nbrain_conflict_winner: %s\nbrain_reason: %s\nbrain_decided_by: %s\nbrain_decided_at: %s\nbrain_schema_version: %s\n---\n' "$side_a" "$(sha256_file "$dir/$side_a")" "$side_b" "$(sha256_file "$dir/$side_b")" "$winner" "$(yaml_quote "$reason")" "$(yaml_quote "$ACTOR")" "$(now_utc)" "$SCHEMA_VERSION"
+          printf '# Conflict decision\n\n%s\n\nWinner: `%s`. This decision holds only while both records keep the hashes above and neither is retracted.\n' "$reason" "$winner"
+        } >"$tmp"
+        mv "$tmp" "$file"
+        audit_v2 "$dir" "conflict-decided" "$id" "" "$winner" "$(sha256_file "$file")" "a=$side_a b=$side_b"
+      fi
+      release_lock
+      printf 'conflict=decided decision_id=%s winner=%s\n' "$id" "$winner"
+      ;;
+    list)
+      printf 'decision_id\tstatus\ta\tb\twinner\twhy\n'
+      for decision in "$dir"/conflict-decisions/*.md; do
+        [ -f "$decision" ] || continue
+        IFS=$'\t' read -r status why <<<"$(conflict_decision_status "$dir" "$decision")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$decision" .md)" "$status" "$(frontmatter_field "$decision" brain_conflict_a)" "$(frontmatter_field "$decision" brain_conflict_b)" "$(frontmatter_field "$decision" brain_conflict_winner)" "${why:--}"
+      done
+      ;;
+    *) die 64 "conflict requires decide or list" ;;
+  esac
+}
+
+# Pack lines for decisions touching the selected records (TAB-free text).
+conflict_decision_pack_lines() {
+  local pdir="$1" selected="$2" decision a b winner status why reason at
+  [ -d "$pdir/conflict-decisions" ] || return 0
+  for decision in "$pdir"/conflict-decisions/*.md; do
+    [ -f "$decision" ] || continue
+    a="$(frontmatter_field "$decision" brain_conflict_a)"; b="$(frontmatter_field "$decision" brain_conflict_b)"
+    printf '%s\n' "$selected" | grep -Fxq -e "$a" -e "$b" || continue
+    winner="$(frontmatter_field "$decision" brain_conflict_winner)"; reason="$(frontmatter_field "$decision" brain_reason)"; at="$(frontmatter_field "$decision" brain_decided_at)"
+    IFS=$'\t' read -r status why <<<"$(conflict_decision_status "$pdir" "$decision")"
+    if [ "$status" = valid ]; then
+      if [ "$winner" = both ]; then
+        printf -- '- `%s` and `%s` were decided compatible on %s (%s). The decision holds while both are unchanged.\n' "$a" "$b" "$at" "$reason"
+      else
+        printf -- '- `%s` wins over `%s` (decided %s: %s). Use the winner; the decision holds while both are unchanged.\n' "$winner" "$([ "$winner" = "$a" ] && printf '%s' "$b" || printf '%s' "$a")" "$at" "$reason"
+      fi
+    else
+      printf -- '- RE-OPENED: the decision of %s on `%s` vs `%s` no longer holds (%s). Treat them as conflicting until decided again.\n' "$at" "$a" "$b" "$why"
+    fi
+  done
+}
+
 file_conflict_state() {
+  file_conflict_state_raw "$1" "${2:-}"
+  if [ "$FCS_RESULT" = conflicted ] && [ "${3:-}" != CONFLICT_RAW ]; then
+    case "$(conflict_decision_role_for_file "$1")" in
+      winner) FCS_RESULT=clear ;;
+      loser) FCS_RESULT=lost ;;
+    esac
+  fi
+  printf '%s\n' "$FCS_RESULT"
+}
+
+file_conflict_state_raw() {
   local file="$1" graph_file="${2:-}" rel graph_root
   local conflicts
+  FCS_RESULT=clear
   fm_get conflicts "$file" brain_conflicts
-  [ -n "$conflicts" ] && { printf 'conflicted\n'; return; }
+  [ -n "$conflicts" ] && { FCS_RESULT=conflicted; return; }
   if [ -n "$graph_file" ] && [ -f "$graph_file" ]; then
     case "$graph_file" in
       */indexes/generations/*/graph.tsv) graph_root="${graph_file%%/indexes/generations/*}" ;;
@@ -6734,10 +6897,9 @@ file_conflict_state() {
     esac
     rel="${file#"$graph_root"/}"
     if awk -F '\t' -v path="$rel" '$2 == "conflicts_with" && ($1 == path || $3 == path) { found=1 } END { exit !found }' "$graph_file"; then
-      printf 'conflicted\n'; return
+      FCS_RESULT=conflicted; return
     fi
   fi
-  printf 'clear\n'
 }
 
 build_indexes() {
@@ -7984,7 +8146,7 @@ cmd_pack() {
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
   local record_sources=0 record_voices=0 records_rendered=0 state_skipped=0
-  local inherits="" inherited_file="" inherited_hash="" inherited_count=0 parent_id parent_dir
+  local inherits="" inherited_file="" inherited_hash="" inherited_count=0 parent_id parent_dir decisions_text="" decisions_hash=""
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local pack_host="" pack_task_type="${LLM_BRAIN_TASK_TYPE:-}" scope_hidden="" scope_hidden_count=0 index_seq="" unindexed_captures=0 freshness_hash=""
@@ -8194,6 +8356,9 @@ cmd_pack() {
   if [ "$intent" = current_state ]; then
     awk -F '\t' 'NR > 1 && $4 != "current" { print $9 "\t" $1 "\t" $4 ":" $16 }' "$results" >"$warnings"
   fi
+  # #7: decisions on a selected conflict pair, valid or re-opened.
+  decisions_text="$(conflict_decision_pack_lines "$dir" "$render_order" 2>/dev/null || true)"
+  [ -z "$decisions_text" ] || decisions_hash="$(sha256_text "$decisions_text")"
   # #6: a nested project sees parent memory only when it declared
   # `brain_inherits` (project ensure --inherits).  Each declared parent is
   # searched with the same task and principal; its top records are rendered
@@ -8230,7 +8395,7 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
@@ -8298,6 +8463,10 @@ cmd_pack() {
         printf '%s — `%s` (%s)\n' "$warning_title" "$warning_path" "$warning_state"
       done <"$warnings"
       printf '\n'
+    fi
+    if [ -n "$decisions_text" ]; then
+      printf '## Conflict decisions\n\n%s\n\n' "$decisions_text"
+      bytes=$((bytes + ${#decisions_text}))
     fi
     if [ -n "$current_file" ] && awk -F '\t' '$1 == "notice" { f=1 } END { exit !f }' "$current_file"; then
       printf '## Changed recently\n\n'
@@ -12182,6 +12351,7 @@ main() {
       exec python3 "$_s1" serve "${1:-bundled}" "${@:2}" ;;
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;
+    conflict) cmd_conflict "$@" ;;
     index) cmd_index "$@" ;;
     search) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; SEARCH_MARK_SCOPE=1 cmd_search "$@" ;;
     pack) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; cmd_pack "$@" ;;
