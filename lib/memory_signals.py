@@ -2081,6 +2081,39 @@ def intention_due(vault: Vault, metadata: dict[str, Any], now: dt.datetime, task
     return ""
 
 
+# Pro-Memory (#12): a fired trigger is a cue to assess, not an order.  Defer
+# words in the same clause as the cue, or an unmet declared condition, make
+# it WAIT; only then-and-there ACT cues go in the "act on these first" list.
+DEFER_RE = re.compile(
+    r"(?<![a-z])(?:not yet|don't|do not|hold off|wait(?:ing)? (?:for|on|until)|until|postpone[sd]?|"
+    r"defer(?:red)?|blocked|pending|later|after the|before the|skip)(?![a-z])"
+)
+
+
+def intention_assess(vault: Vault, metadata: dict[str, Any], now: dt.datetime, task: str, due: str) -> tuple[str, str]:
+    """("act"|"wait", why) for a fired trigger, judged against its condition."""
+    condition = clean(metadata.get("brain_intention_condition"))
+    if condition.startswith("after:"):
+        when = parse_time(condition[6:])
+        if when is not None and when > now:
+            return "wait", f"condition after:{condition[6:]} not reached"
+    elif condition.startswith("state:"):
+        key = condition[6:]
+        baseline = clean(metadata.get("brain_condition_baseline"))
+        if not baseline or state_fingerprint(vault, key, now) == baseline:
+            return "wait", f"condition state:{key} unchanged"
+    if due.startswith(("keyword-named~", "keyword-stem~")):
+        word = due.split("~", 1)[1]
+        stem = keyword_stem(word)
+        for clause in re.split(r"[.;:!?\n,]+", task.lower()):
+            tokens = re.findall(r"[a-z0-9]+", clause)
+            if word in clause or any(keyword_stem(t) == stem for t in tokens):
+                match = DEFER_RE.search(clause)
+                if match:
+                    return "wait", f"cue says '{match.group(0)}'"
+    return "act", due
+
+
 def command_intentions(args: argparse.Namespace) -> int:
     vault = Vault(args.project_dir, args.principal)
     now = now_from(args.now)
@@ -2096,11 +2129,14 @@ def command_intentions(args: argparse.Namespace) -> int:
         if scope and (not args.principal or args.principal not in scope):
             continue
         due = intention_due(vault, metadata, now, args.task or "", hints) if status == "open" else ""
-        if args.due_only and not due:
+        decision, why = intention_assess(vault, metadata, now, args.task or "", due) if due else ("", "")
+        if args.due_only and not (decision == "act" or (decision == "wait" and args.include_wait)):
             continue
         rows.append({
             "id": clean(metadata.get("brain_intention_id")) or path.stem,
-            "status": status, "due": bool(due), "reason": due or "-",
+            "status": status, "due": decision == "act", "reason": (why if decision == "wait" else due) or "-",
+            "decision": decision or "-",
+            "proposed_at": clean(metadata.get("brain_last_surfaced_at")) or "-",
             "trigger_kind": clean(metadata.get("brain_trigger_kind")),
             "trigger_value": clean(metadata.get("brain_trigger_value")),
             "action": clean(metadata.get("brain_intention_action")) or clean(metadata.get("title")),
@@ -2111,9 +2147,9 @@ def command_intentions(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"status": "ok", "now": iso(now), "intentions": rows}, ensure_ascii=False, separators=(",", ":")))
         return 0
-    print("id\tstatus\tdue\treason\ttrigger\taction\tpath")
+    print("id\tstatus\tdue\treason\ttrigger\taction\tpath\tdecision\tproposed_at")
     for row in rows:
-        print(f"{row['id']}\t{row['status']}\t{'true' if row['due'] else 'false'}\t{row['reason']}\t{row['trigger_kind']}:{clean(row['trigger_value'])}\t{clean(row['action'])}\t{row['path']}")
+        print(f"{row['id']}\t{row['status']}\t{'true' if row['due'] else 'false'}\t{row['reason']}\t{row['trigger_kind']}:{clean(row['trigger_value'])}\t{clean(row['action'])}\t{row['path']}\t{row['decision']}\t{row['proposed_at']}")
     return 0
 
 
@@ -2894,6 +2930,7 @@ def parser() -> argparse.ArgumentParser:
     intentions.add_argument("--hint-path", action="append")
     intentions.add_argument("--status", default="open", choices=("open", "done", "cancelled", "all"))
     intentions.add_argument("--due-only", action="store_true")
+    intentions.add_argument("--include-wait", action="store_true")
     intentions.add_argument("--json", action="store_true")
 
     fingerprint = base("state-fingerprint", command_state_fingerprint)

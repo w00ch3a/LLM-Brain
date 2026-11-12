@@ -153,8 +153,12 @@ grep -Fq 'Finish the regional table' <<<"$(b working list "$project_id" --all)" 
 once="$(b intention add "$project_id" --action 'Email the reviewer' --trigger keyword:reviewer --once | sed -n 's/.*intention_id=\([^ ]*\).*/\1/p')"
 pack="$(b pack build "$project_id" --task 'reply to the reviewer' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
 grep -Fq 'Email the reviewer' "$pack" || fail 'fire-once intention did not surface'
-! grep -Fq "$once" <<<"$(b intention list "$project_id" --due --task 'reply to the reviewer')" || fail 'fire-once intention still due after firing'
-grep -Fq "quiet	$once" <<<"$(b intention board "$project_id")" || fail 'board does not show quiet'
+# 13 Nov (#12): surfacing is a proposal; the intention retires only once done.
+grep -Fq "proposed	$once" <<<"$(b intention board "$project_id")" || fail 'board does not show proposed'
+pack="$(b pack build "$project_id" --task 'reply to the reviewer again' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"
+grep -Fq 'Already proposed at' "$pack" || fail 'second surfacing does not say it was already proposed'
+b intention done "$project_id" "$once" --reason 'email sent' --evidence 'sent-mail:fixture' >/dev/null
+! grep -Fq "$once" <<<"$(b intention list "$project_id" --due --task 'reply to the reviewer')" || fail 'fire-once intention still due after done'
 done_id="$(b intention add "$project_id" --action 'Archive raw extracts' --trigger keyword:archive | sed -n 's/.*intention_id=\([^ ]*\).*/\1/p')"
 b intention done "$project_id" "$done_id" --reason archived >/dev/null
 pack="$(b pack build "$project_id" --task 'archive the extracts' | sed -n 's/.*file=\([^ ]*\).*/\1/p')"

@@ -1343,6 +1343,8 @@ def intention_phase(meta: dict[str, Any], due: str, now: dt.datetime, revisions:
         return "quiet"
     if clean(meta.get("brain_intention_once")).lower() == "true" and clean(meta.get("brain_last_fired_at")):
         return "quiet"
+    if clean(meta.get("brain_last_surfaced_at")):
+        return "proposed"
     if due:
         return "filtered-due"
     return "revised" if revisions else "formed"

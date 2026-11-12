@@ -122,8 +122,8 @@ Commands:
   brief [PROJECT_ID] [--source-root PATH] [--max-bytes N] [--recent-days N] [--principal ID] [--since ISO] [--session ID] [--reattach-since ISO] [--host NAME] [--task-type TYPE] [--json]   --since adds the session handover; --reattach-since re-attaches the newest pack once after compaction
   intention add PROJECT_ID --action TEXT --trigger date:ISO|path:GLOB|keyword:WORD|state:STATE_KEY [--principal ID]
   intention list PROJECT_ID [--status open|done|cancelled|all] [--due] [--task TEXT] [--path FILE] [--json]
-  intention done|cancel PROJECT_ID INTENTION_ID --reason TEXT
-  intention add ... [--once] [--observe STATE_KEY]   Fire-once intentions go quiet after surfacing
+  intention done|cancel PROJECT_ID INTENTION_ID --reason TEXT [--evidence REF]
+  intention add ... [--once] [--observe STATE_KEY] [--condition after:ISO|state:STATE_KEY]   A fired cue is assessed: ACT, or WAIT when its condition is unmet or the cue defers; fire-once intentions retire only on `intention done`
   intention revise PROJECT_ID INTENTION_ID (--reschedule TRIGGER|--override ACTION) --reason TEXT
   intention quiet PROJECT_ID INTENTION_ID --until ISO --reason TEXT
   intention board|observe PROJECT_ID [--task TEXT] [--within-days N]
@@ -7829,7 +7829,7 @@ cmd_pack() {
   # rendered first.  Evaluation is read-only; intentions never self-complete.
   intentions_file="$(mktemp "$dir/context-packs/.intentions.XXXXXX")"
   if [ -d "$dir/intentions" ]; then
-    local -a intention_args=(intentions --project-dir "$dir" --task "$task" --due-only)
+    local -a intention_args=(intentions --project-dir "$dir" --task "$task" --due-only --include-wait)
     [ -z "$principal" ] || intention_args+=(--principal "$principal")
     [ -z "$as_of" ] || intention_args+=(--now "$as_of")
     if [ "${#pack_path_hints[@]}" -gt 0 ]; then
@@ -7838,7 +7838,7 @@ cmd_pack() {
     memory_signals "${intention_args[@]}" 2>/dev/null | tail -n +2 >"$intentions_file" || : >"$intentions_file"
   fi
   if [ -s "$intentions_file" ]; then
-    intentions_due="$(wc -l <"$intentions_file" | tr -d ' ')"
+    intentions_due="$(awk -F '\t' '$8 != "wait"' "$intentions_file" | wc -l | tr -d ' ')"
     intentions_hash="$(sha256_file "$intentions_file")"
   fi
   # Corrections and retractions are rendered regardless of lexical match: a
@@ -7942,11 +7942,22 @@ cmd_pack() {
     if [ "$action_risk" = high ]; then
       printf '## Action Risk — high\n\nPremises marked "re-verify before acting" are stale or rest on a single source. Check them against the live system before an irreversible step.\n\n'
     fi
-    if [ -s "$intentions_file" ]; then
+    if [ "${intentions_due:-0}" -gt 0 ]; then
       printf '## Due Intentions — act on these first\n\n'
-      while IFS=$'\t' read -r intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path; do
-        [ -n "$intention_id" ] || continue
-        line="- ${intention_action} (\`${intention_id}\`; trigger \`${intention_trigger}\`; ${intention_reason}). Close with \`intention done\` or \`intention cancel\`."
+      while IFS=$'\t' read -r intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path intention_decision intention_proposed; do
+        [ -n "$intention_id" ] && [ "$intention_decision" != wait ] || continue
+        line="- ${intention_action} (\`${intention_id}\`; trigger \`${intention_trigger}\`; ${intention_reason}). Close with \`intention done\` once the action has actually gone out, or \`intention cancel\`."
+        [ "${intention_proposed:--}" = - ] || line="$line Already proposed at ${intention_proposed}: if it went out, close it with \`intention done\` and do not repeat it."
+        printf '%s\n' "$line"
+        bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
+      done <"$intentions_file"
+      printf '\n'
+    fi
+    if [ -s "$intentions_file" ] && awk -F '\t' '$8 == "wait" { f=1 } END { exit !f }' "$intentions_file"; then
+      printf '## Intentions on hold — the cue appeared but its condition is not met; do not act yet\n\n'
+      while IFS=$'\t' read -r intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path intention_decision intention_proposed; do
+        [ "$intention_decision" = wait ] || continue
+        line="- ${intention_action} (\`${intention_id}\`; trigger \`${intention_trigger}\`; wait: ${intention_reason})."
         printf '%s\n' "$line"
         bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
       done <"$intentions_file"
@@ -8036,13 +8047,17 @@ cmd_pack() {
   } >"${pack}.tmp.$$"
   mv "${pack}.tmp.$$" "$pack"
   audit_v2 "$dir" "pack-build" "$(basename "$pack")" "" "built" "$(sha256_file "$pack")" "bytes=$bytes"
-  # Fire-once intentions go quiet after surfacing (aftereffect suppression).
+  # Fire-once intentions: surfacing is only a proposal.  The first ACT
+  # surfacing is recorded (brain_last_surfaced_at), and later packs say it was
+  # already proposed; the intention is retired only by `intention done`, after
+  # the action actually went out (#12).
   if [ -s "$intentions_file" ]; then
-    while IFS=$'\t' read -r intention_id _; do
+    while IFS=$'\t' read -r intention_id _ _ _ _ _ _ intention_decision intention_proposed; do
       [ -n "$intention_id" ] && [ -f "$dir/intentions/$intention_id.md" ] || continue
+      [ "$intention_decision" != wait ] && [ "${intention_proposed:--}" = - ] || continue
       case "$(frontmatter_field "$dir/intentions/$intention_id.md" brain_intention_once)" in true|True)
-        set_frontmatter_field "$dir/intentions/$intention_id.md" brain_last_fired_at "$(yaml_quote "$(now_utc)")"
-        audit_v2 "$dir" "intention-fired" "$intention_id" open quiet "$(sha256_file "$dir/intentions/$intention_id.md")" "pack=$(basename "$pack")" ;;
+        set_frontmatter_field "$dir/intentions/$intention_id.md" brain_last_surfaced_at "$(yaml_quote "$(now_utc)")"
+        audit_v2 "$dir" "intention-proposed" "$intention_id" open proposed "$(sha256_file "$dir/intentions/$intention_id.md")" "pack=$(basename "$pack")" ;;
       esac
     done <"$intentions_file"
   fi
@@ -8888,10 +8903,11 @@ cmd_intention() {
   require_project "$project_id" dir
   case "$action" in
     add)
-      local action_text="" trigger="" principal="" kind value baseline="" intention_id file scan once=0 observe=""
+      local action_text="" trigger="" principal="" kind value baseline="" intention_id file scan once=0 observe="" condition="" condition_baseline=""
       while [ $# -gt 0 ]; do
         case "$1" in
           --once) once=1; shift ;;
+          --condition) condition="${2:-}"; shift 2 ;;
           --observe) observe="${2:-}"; shift 2 ;;
           --action) action_text="${2:-}"; shift 2 ;;
           --trigger) trigger="${2:-}"; shift 2 ;;
@@ -8911,6 +8927,13 @@ cmd_intention() {
       if ! secret_scan_file "$scan"; then rm -f "$scan"; die 65 "intention text matched the secret scanner"; fi
       rm -f "$scan"
       [ -z "$observe" ] || validate_scalar "$observe" || die 65 "invalid --observe state key"
+      case "$condition" in
+        '') ;;
+        after:*) validate_scalar "$condition" && [ -n "${condition#after:}" ] || die 65 "invalid --condition" ;;
+        state:*) validate_scalar "$condition" && [ -n "${condition#state:}" ] || die 65 "invalid --condition"
+          condition_baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "${condition#state:}")" ;;
+        *) die 64 "--condition must be after:ISO or state:STATE_KEY" ;;
+      esac
       [ "$kind" != state ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$value")"
       [ -z "$observe" ] || [ -n "$baseline" ] || baseline="$(memory_signals state-fingerprint --project-dir "$dir" --key "$observe")"
       intention_id="intention_$(sha256_text "$project_id|$action_text|$kind|$value|$principal" | cut -c1-16)"
@@ -8925,6 +8948,8 @@ cmd_intention() {
           [ -z "$principal" ] || printf 'brain_principal: %s\n' "$(yaml_quote "$principal")"
           [ "$once" = 0 ] || printf 'brain_intention_once: true\n'
           [ -z "$observe" ] || printf 'brain_intention_observe: %s\n' "$(yaml_quote "$observe")"
+          [ -z "$condition" ] || printf 'brain_intention_condition: %s\n' "$(yaml_quote "$condition")"
+          [ -z "$condition_baseline" ] || printf 'brain_condition_baseline: %s\n' "$condition_baseline"
           printf 'brain_sensitivity: internal\nbrain_artifact_state: operational\nbrain_created_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
           printf '%s\n' '---'
           printf '# Intention\n\nWhen `%s:%s` fires: %s\n\nThis is prospective memory, not canonical knowledge. Close it with `intention done` or `intention cancel`.\n' "$kind" "$value" "$action_text"
@@ -8957,9 +8982,10 @@ cmd_intention() {
       memory_signals "${args[@]}"
       ;;
     done|cancel)
-      local intention_id="${1:-}" reason="" file old new
+      local intention_id="${1:-}" reason="" file old new evidence=""
       shift || true
-      while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; *) die 64 "unknown intention option: $1" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; --evidence) evidence="${2:-}"; shift 2 ;; *) die 64 "unknown intention option: $1" ;; esac; done
+      validate_scalar "$evidence" || die 65 "invalid --evidence"
       [ -n "$intention_id" ] || die 64 "intention $action requires INTENTION_ID --reason TEXT"
       [ -n "$reason" ] || die 64 "intention $action requires --reason TEXT"
       validate_id "$intention_id" || die 64 "invalid intention id"
@@ -8973,6 +8999,7 @@ cmd_intention() {
       set_frontmatter_field "$file" brain_intention_status "$new"
       set_frontmatter_field "$file" brain_closed_at "$(yaml_quote "$(now_utc)")"
       set_frontmatter_field "$file" brain_close_reason "$(yaml_quote "$reason")"
+      [ -z "$evidence" ] || set_frontmatter_field "$file" brain_done_evidence "$(yaml_quote "$evidence")"
       memory_lineage intention-patch --project-dir "$dir" --intention-id "$intention_id" --patch decide --old open --new "$new" --reason "$reason" >/dev/null 2>&1 || true
       audit_v2 "$dir" "intention-$action" "$intention_id" open "$new" "$(sha256_file "$file")" "reason=$(slug "$reason")"
       release_lock
