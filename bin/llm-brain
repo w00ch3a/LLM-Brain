@@ -170,6 +170,7 @@ Commands:
   review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
                                               Tiered backlog clean-up; dry-run prints counts only
   validate-source PROJECT_ID CANONICAL_ID FILE --reason TEXT
+  host-memory snapshot|list|diff PROJECT_ID|auto --host claude-code|codex|hermes [--session ID] [--home DIR] [--project-root DIR] [--label L]
   conflict decide PROJECT_ID REF_A REF_B --winner a|b|both --reason TEXT | conflict list PROJECT_ID
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--source REF] [--preview [--principal ID]|--confirm TOKEN] | --finish
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
@@ -6793,6 +6794,124 @@ conflict_pair_marked() {
   [ -n "$graph" ] && [ -f "$graph" ] && awk -F '\t' -v a="$a" -v b="$b" '$2 == "conflicts_with" && $1 == a && $3 == b { f=1 } END { exit !f }' "$graph"
 }
 
+# #8 (2 Nov): read-only snapshots of a host's own memory files (Claude Code,
+# Codex, Hermes) into source custody, so what the host knew is kept as
+# evidence and changes can be diffed.  Host files are only read.  Each file
+# goes through capture_source (secret scan, sha256 custody); a row per file
+# per snapshot is appended to host-memory/snapshots.tsv.
+host_memory_files() { # host home project_root -> label<TAB>path
+  local host="$1" home="$2" root="$3" f slug_root
+  case "$host" in
+    claude-code)
+      printf 'user/CLAUDE.md\t%s\n' "$home/.claude/CLAUDE.md"
+      if [ -n "$root" ]; then
+        printf 'project/CLAUDE.md\t%s\n' "$root/CLAUDE.md"
+        printf 'project/CLAUDE.local.md\t%s\n' "$root/CLAUDE.local.md"
+        slug_root="$(printf '%s' "$root" | sed 's#[^A-Za-z0-9]#-#g')"
+        for f in "$home/.claude/projects/$slug_root/memory"/*.md; do
+          [ -f "$f" ] && printf 'auto-memory/%s\t%s\n' "$(basename "$f")" "$f"
+        done
+      fi
+      ;;
+    codex)
+      printf 'user/AGENTS.md\t%s\n' "${CODEX_HOME:-$home/.codex}/AGENTS.md"
+      for f in "${CODEX_HOME:-$home/.codex}/memories"/*.md; do
+        [ -f "$f" ] && printf 'memories/%s\t%s\n' "$(basename "$f")" "$f"
+      done
+      [ -z "$root" ] || printf 'project/AGENTS.md\t%s\n' "$root/AGENTS.md"
+      ;;
+    hermes)
+      printf 'MEMORY.md\t%s\n' "${HERMES_HOME:-$home/.hermes}/memories/MEMORY.md"
+      printf 'USER.md\t%s\n' "${HERMES_HOME:-$home/.hermes}/memories/USER.md"
+      ;;
+    *) return 64 ;;
+  esac
+  return 0
+}
+
+cmd_host_memory() {
+  local action="${1:-}" project_id="${2:-}"; shift 2 || die 64 "host-memory requires snapshot|diff|list PROJECT_ID"
+  local host="" session="" home="$HOME" root="" label="" dir manifest at label_path path hash prev status ref out rc rows=0 changed=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host="${2:-}"; shift 2 ;;
+      --session) session="${2:-}"; shift 2 ;;
+      --home) home="${2:-}"; shift 2 ;;
+      --project-root) root="${2:-}"; shift 2 ;;
+      --label) label="${2:-}"; shift 2 ;;
+      *) die 64 "unknown host-memory option: $1" ;;
+    esac
+  done
+  case "$host" in claude-code|codex|hermes) ;; '') [ "$action" = list ] || die 64 "--host must be claude-code, codex or hermes" ;; *) die 64 "--host must be claude-code, codex or hermes" ;; esac
+  validate_scalar "$session" || die 65 "--session must be a single line"
+  case "$session" in *$'\t'*) die 65 "--session cannot contain a tab" ;; esac
+  if [ "$project_id" = auto ]; then
+    resolve_source_identity "$CWD"; project_id="$(project_from_identity)"
+  fi
+  require_project "$project_id" dir
+  manifest="$dir/host-memory/snapshots.tsv"
+  [ -z "$root" ] || root="$(canonical_path "$root")" || die 66 "project root missing"
+  case "$action" in
+    snapshot)
+      at="$(now_utc)"
+      mkdir -p "$dir/host-memory"
+      [ -f "$manifest" ] || printf 'snapshot_at\thost\tsession\tlabel\tsha256\tsource_ref\tstatus\n' >"$manifest"
+      while IFS=$'\t' read -r label_path path; do
+        [ -n "$label_path" ] || continue
+        prev="$(awk -F '\t' -v h="$host" -v l="$label_path" 'NR > 1 && $2 == h && $4 == l { last=$5 } END { print last }' "$manifest")"
+        if [ ! -f "$path" ]; then
+          [ -n "$prev" ] && [ "$prev" != removed ] || continue
+          printf '%s\t%s\t%s\t%s\tremoved\t-\tremoved\n' "$at" "$host" "${session:--}" "$label_path" >>"$manifest"
+          rows=$((rows + 1)); changed=$((changed + 1)); continue
+        fi
+        rc=0; out="$(capture_source "$project_id" "$path" 2>/dev/null)" || rc=$?
+        if [ "$rc" = 2 ]; then
+          hash=blocked; ref=-; status=blocked-secret
+        elif [ "$rc" != 0 ]; then
+          hash=unreadable; ref=-; status=skipped
+        else
+          hash="$(sed -n 's/.*source_hash=\([0-9a-f]*\).*/\1/p' <<<"$out")"
+          ref="sources/${hash}-$(slug "$(basename "$path")").md"
+          if [ -z "$prev" ]; then status=new; elif [ "$prev" = "$hash" ]; then status=unchanged; else status=changed; fi
+        fi
+        [ "$status" = unchanged ] || changed=$((changed + 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$at" "$host" "${session:--}" "$label_path" "$hash" "$ref" "$status" >>"$manifest"
+        rows=$((rows + 1))
+      done < <(host_memory_files "$host" "$home" "$root")
+      audit_v2 "$dir" "host-memory-snapshot" "$host" "" "${session:--}" "" "files=$rows changed=$changed"
+      printf 'host_memory=snapshot host=%s session=%s files=%s changed=%s\n' "$host" "${session:--}" "$rows" "$changed"
+      ;;
+    list)
+      [ -f "$manifest" ] || { printf 'snapshot_at\thost\tsession\tlabel\tsha256\tsource_ref\tstatus\n'; return 0; }
+      awk -F '\t' -v h="$host" -v l="$label" 'NR == 1 || ((h == "" || $2 == h) && (l == "" || $4 == l))' "$manifest"
+      ;;
+    diff)
+      [ -f "$manifest" ] || die 66 "no host-memory snapshots for $project_id"
+      local labels a_hash a_ref a_at b_hash b_ref b_at any=0
+      labels="$(awk -F '\t' -v h="$host" -v l="$label" 'NR > 1 && $2 == h && (l == "" || $4 == l) && !s[$4]++ { print $4 }' "$manifest")"
+      while IFS= read -r label_path; do
+        [ -n "$label_path" ] || continue
+        # The last two distinct versions of this file.
+        IFS=$'\t' read -r b_at b_hash b_ref a_at a_hash a_ref <<<"$(awk -F '\t' -v h="$host" -v l="$label_path" '
+          NR > 1 && $2 == h && $4 == l && $5 != last { pa=ca; ph=ch; pr=cr; ca=$1; ch=$5; cr=$6; last=$5 }
+          END { print pa "\t" ph "\t" pr "\t" ca "\t" ch "\t" cr }' "$manifest")"
+        [ -n "$b_hash" ] || continue
+        any=1
+        printf '## %s:%s — %s (%s) -> %s (%s)\n' "$host" "$label_path" "${b_hash:0:12}" "$b_at" "${a_hash:0:12}" "$a_at"
+        case "$a_hash|$b_hash" in
+          *blocked*) printf 'One version matched the secret scanner and was not copied; no diff is shown.\n' ;;
+          removed\|*) printf 'File removed by the host.\n' ;;
+          *\|removed) printf 'File re-created by the host.\n'; cat "$dir/$a_ref" ;;
+          *) diff -u --label "before" --label "after" "$dir/$b_ref" "$dir/$a_ref" || true ;;
+        esac
+        printf '\n'
+      done <<<"$labels"
+      [ "$any" = 1 ] || printf 'No changes recorded for %s.\n' "$host"
+      ;;
+    *) die 64 "host-memory requires snapshot, list or diff" ;;
+  esac
+}
+
 cmd_conflict() {
   local action="${1:-}" project_id="${2:-}"; shift 2 || die 64 "conflict requires decide|list PROJECT_ID"
   local dir a="" b="" winner="" reason="" side_a side_b id file tmp status why decision
@@ -12352,6 +12471,7 @@ main() {
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;
     conflict) cmd_conflict "$@" ;;
+    host-memory) cmd_host_memory "$@" ;;
     index) cmd_index "$@" ;;
     search) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; SEARCH_MARK_SCOPE=1 cmd_search "$@" ;;
     pack) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; cmd_pack "$@" ;;

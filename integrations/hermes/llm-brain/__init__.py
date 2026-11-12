@@ -114,6 +114,10 @@ OPTIONAL_CONFIG_DEFAULTS: Dict[str, Any] = {
     # Prefetch answers inside Hermes' external-prefetch timeout (8 s); a
     # slower recall falls back to the context warmed after the last turn.
     "prefetch_deadline_seconds": 6.5,
+    # Opt-in: at the start of each new primary session, snapshot Hermes'
+    # always-on memories/MEMORY.md and USER.md into source custody (read-only;
+    # `llm-brain host-memory diff PROJECT --host hermes` shows what changed).
+    "snapshot_host_memory": False,
 }
 POST_COMPACTION_SKIP_KINDS = {"prune_tool_results"}
 _POST_COMPACTION_LOCK = threading.Lock()
@@ -199,6 +203,8 @@ def _normalise_optional_config(config: Dict[str, Any]) -> None:
         config["post_compaction_reinject"] = config["post_compaction_reinject"] is not False
     if "raw_secret_custody" in config:
         config["raw_secret_custody"] = config["raw_secret_custody"] is True
+    if "snapshot_host_memory" in config:
+        config["snapshot_host_memory"] = config["snapshot_host_memory"] is True
     if "prefetch_deadline_seconds" in config:
         try:
             seconds = float(config["prefetch_deadline_seconds"])
@@ -1047,6 +1053,26 @@ def _apply_laya_selection(
     return payload
 
 
+def _snapshot_host_memory(config: Dict[str, Any], hermes_home: Path, source_root: Path, session_id: str) -> bool:
+    """Read-only snapshot of Hermes' MEMORY.md / USER.md into custody (opt-in)."""
+    cli = _find_cli(config)
+    if not cli or not config.get("vault_root"):
+        return False
+    command = [cli, "--root", str(config["vault_root"]), "host-memory", "snapshot", "auto",
+               "--host", "hermes", "--home", str(Path.home())]
+    if session_id and "\t" not in session_id and "\n" not in session_id:
+        command += ["--session", session_id]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env.setdefault("LLM_BRAIN_LOCK_WAIT_SECONDS", "2")
+    try:
+        done = subprocess.run(command, cwd=str(source_root), env=env, text=True, capture_output=True,
+                              timeout=int(config.get("timeout_seconds", DEFAULT_TIMEOUT)))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
 def _bridge_call(config: Dict[str, Any], source_root: Path, args: List[str]) -> Optional[Dict[str, Any]]:
     cli = _find_cli(config)
     if not cli:
@@ -1315,6 +1341,12 @@ class LLMBrainMemoryProvider(MemoryProvider):
             # A continued session writes nothing new at start-up; it only
             # finishes captures the previous process left pending or claimed.
             self._start_drain()
+        elif self._agent_context in {"", "primary"} and _option(self._config, "snapshot_host_memory") is True:
+            # Off the start-up path: a slow vault never delays the session.
+            spawn_context_thread(
+                lambda: _snapshot_host_memory(self._config, self._hermes_home, self._source_root, self._session_id),
+                name="llm-brain-host-memory", daemon=True,
+            ).start()
 
     def on_turn_start(self, turn_number: int, message: str = "", **kwargs: Any) -> None:
         """Hermes >= 0.23 per-turn tick: keep the model, and after a resume

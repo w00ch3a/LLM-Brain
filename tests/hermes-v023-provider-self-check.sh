@@ -2,7 +2,8 @@
 # Hermes >= 0.23 memory-provider contract, against a real Hermes checkout:
 # initialize(resumed, message_count), on_turn_start(previous_message, model),
 # the prefetch deadline, a subagent fork's required checkpoint under
-# compression.checkpoint_required, and owner-only raw secret custody.
+# compression.checkpoint_required, owner-only raw secret custody, and the
+# opt-in MEMORY.md / USER.md snapshot (#8).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -210,6 +211,32 @@ assert "brain_sensitivity: restricted" in body or "brain_owner_only: true" in bo
 assert '"egress_restored": 1' in body
 Path(sys.argv[4], "raw-episode.txt").write_text(str(raw[0].relative_to(vault / "projects" / project_id)), encoding="utf-8")
 print("raw_secret_custody_owner_only=ok")
+
+# 6. Opt-in: a new primary session snapshots Hermes' MEMORY.md / USER.md (read-only).
+mem_dir = home / "memories"
+mem_dir.mkdir(parents=True, exist_ok=True)
+(mem_dir / "MEMORY.md").write_text("User keeps tide tables in metric.\n", encoding="utf-8")
+(mem_dir / "USER.md").write_text("Name: fixture user.\n", encoding="utf-8")
+mem_before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in mem_dir.iterdir()}
+manifest = vault / "projects" / project_id / "host-memory" / "snapshots.tsv"
+rows = lambda: manifest.read_text(encoding="utf-8").splitlines()[1:] if manifest.exists() else []
+manager_for(load_memory_provider("llm-brain"), "s-snap-off", agent_context="primary", resumed=False, message_count=1)
+time.sleep(1.5)
+assert rows() == [], "snapshot ran without the opt-in"
+config["snapshot_host_memory"] = True
+(home / "llm-brain.json").write_text(json.dumps(config), encoding="utf-8")
+manager_for(load_memory_provider("llm-brain"), "s-snap", agent_context="primary", resumed=False, message_count=1)
+deadline = time.time() + 20
+while time.time() < deadline and len(rows()) < 2:
+    time.sleep(0.2)
+got = sorted((r.split("\t")[2], r.split("\t")[3], r.split("\t")[6]) for r in rows())
+assert got == [("s-snap", "MEMORY.md", "new"), ("s-snap", "USER.md", "new")], got
+manager_for(load_memory_provider("llm-brain"), "child-snap", agent_context="subagent", parent_session_id="s-snap")
+manager_for(load_memory_provider("llm-brain"), "s-old", agent_context="primary", **old_kwargs)
+time.sleep(2)
+assert len(rows()) == 2, "subagent or resumed session snapshotted again"
+assert {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in mem_dir.iterdir()} == mem_before, "host memory files were modified"
+print("host_memory_snapshot_opt_in=ok")
 PY
 
 # Recall as the owner principal: the scrubbed internal record renders, the restricted raw one never does.
