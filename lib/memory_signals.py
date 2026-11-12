@@ -1609,6 +1609,64 @@ def command_feedback_attribute(args: argparse.Namespace) -> int:
     return 0
 
 
+def already_visible(record_text: str, visible: str) -> bool:
+    """#15: was this record's content already in the agent's context?  Same
+    rule as attribution: half of its answer-bearing tokens (or longer words)."""
+    return bool(visible) and supported_answer(record_text, visible)
+
+
+def judge_refs(vault: Vault, refs: list[str], visible: str, later: str) -> list[dict[str, Any]]:
+    rows = []
+    for ref in refs:
+        path = vault.resolver.canonical_ref(ref)
+        if path is None or not vault.resolver.visible(path, strict_principal=True):
+            continue
+        text = vault.title(path) + "\n" + vault.body(path)
+        novel = not already_visible(text, visible)
+        used = bool(later) and supported_answer(text, later)
+        rows.append({"ref": vault.rel(path), "novel": novel, "used": used})
+    return rows
+
+
+def judge_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    novel = sum(1 for row in rows if row["novel"])
+    used = sum(1 for row in rows if row["used"])
+    novel_used = sum(1 for row in rows if row["novel"] and row["used"])
+    if not rows:
+        verdict = "empty"
+    elif novel_used:
+        verdict = "used"
+    elif novel == 0:
+        verdict = "redundant"
+    else:
+        verdict = "unused"
+    return {"delivered": len(rows), "novel": novel, "redundant": len(rows) - novel, "used": used, "novel_used": novel_used, "verdict": verdict}
+
+
+def command_pack_judge(args: argparse.Namespace) -> int:
+    """#15 judge a pack at the point of use: per delivered record, was it new
+    to the agent (not already visible) and did a later action use it."""
+    vault = Vault(args.project_dir, args.principal)
+    if args.pack:
+        pack = vault.root / args.pack
+        raw = hashlib.sha256(pack.read_bytes()).hexdigest() if pack.is_file() else ""
+        refs = pack_refs(vault.root, args.pack, raw)
+    else:
+        refs = [line.strip() for line in Path(args.refs).read_text(encoding="utf-8").replace(",", "\n").splitlines() if line.strip()]
+    read = lambda name: Path(name).read_text(encoding="utf-8", errors="replace") if name else ""
+    rows = judge_refs(vault, refs, read(args.visible), read(args.later))
+    summary = judge_summary(rows)
+    if args.json:
+        print(json.dumps({"status": "ok", "records": rows, **summary}, separators=(",", ":")))
+        return 0
+    if not args.summary_only:
+        print("ref\tnovel\tused")
+        for row in rows:
+            print(f"{row['ref']}\t{'novel' if row['novel'] else 'already-visible'}\t{'used' if row['used'] else 'unused'}")
+    print("\t".join(f"{key}={value}" for key, value in summary.items()))
+    return 0
+
+
 def preservation_screen(vault: Vault, merged_text: str, targets: list[Path], extra: list[str]) -> list[tuple[str, list[str]]]:
     """For each original, the answer-bearing tokens the merged text lost."""
     low = (merged_text or "").lower()
@@ -3083,6 +3141,14 @@ def parser() -> argparse.ArgumentParser:
     attribute = base("feedback-attribute", command_feedback_attribute)
     attribute.add_argument("--pack", required=True)
     attribute.add_argument("--answer", required=True)
+
+    judge = base("pack-judge", command_pack_judge)
+    judge.add_argument("--pack", default="")
+    judge.add_argument("--refs", default="")
+    judge.add_argument("--visible", default="")
+    judge.add_argument("--later", default="")
+    judge.add_argument("--json", action="store_true")
+    judge.add_argument("--summary-only", action="store_true")
 
     merge_screen = base("merge-screen", command_merge_screen)
     merge_screen.add_argument("--review", required=True)

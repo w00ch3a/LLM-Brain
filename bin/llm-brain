@@ -114,6 +114,7 @@ Commands:
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--fusion rrf|zscore] [--fusion-alpha A] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
   pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label L]... [--without-label L]... [--turn N] [--session ID] [--state-index] [--sufficiency] [--host NAME] [--task-type TYPE] [--action-risk low|medium|high]
+  pack judge PROJECT_ID --pack REF [--visible FILE] [--later FILE] [--record] [--json]   Point-of-use: new vs already-visible, used later or not
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
   work enqueue PROJECT_ID reflect EPISODE_FILE --provider EXECUTABLE
@@ -7509,7 +7510,7 @@ eval_history_hash() {
 
 cmd_eval() {
   local raw_baseline=0 raw_embedder="" raw_status
-  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash vector_index answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome case_count=0
+  local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash vector_index answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome delivered_novel novel_used judged case_count=0
   shift 2 || true
   [ "$action" = "run" ] || die 64 "eval requires run"
   [ -n "$project_id" ] || die 64 "eval run requires PROJECT_ID"
@@ -7560,7 +7561,7 @@ cmd_eval() {
   mkdir "$stage"
   ensure_dir "$stage/answers"
   trace="$stage/trace.tsv"
-  printf 'case_id\trequested_strategy\tactual_strategy\tdegraded\tquery\tcandidate_paths\tcandidate_ranks\tevidence_refs\thit\tcontext_bytes\ttoken_estimate\tprovider_calls\tmemory_write_cost\telapsed_seconds\toutcome\n' >"$trace"
+  printf 'case_id\trequested_strategy\tactual_strategy\tdegraded\tquery\tcandidate_paths\tcandidate_ranks\tevidence_refs\thit\tcontext_bytes\ttoken_estimate\tprovider_calls\tmemory_write_cost\telapsed_seconds\toutcome\tdelivered_novel\tnovel_used\n' >"$trace"
   while IFS=$'\t' read -r case_id query expected task; do
     [ -n "$case_id" ] || continue
     [ "$case_id" = "case_id" ] && continue
@@ -7620,6 +7621,7 @@ cmd_eval() {
       if eval_case_hit "$expected" "$ranked"; then hit=true; else hit=false; fi
       context_bytes="$(eval_context_bytes "$dir" "$ranked")"
       token_estimate=$(( (context_bytes + 3) / 4 ))
+      delivered_novel=-; novel_used=-
       if [ -n "$answer_runner" ]; then
         answer_request="$stage/answers/${case_id}.${strategy}.request.md"; answer_output="$stage/answers/${case_id}.${strategy}.out"
         {
@@ -7636,9 +7638,21 @@ cmd_eval() {
         else
           provider_calls=1; outcome=error
         fi
+        # #15 point of use: of the delivered candidates, which were new
+        # relative to what the case already shows (query + task), and which
+        # did the answer actually use?  Task success alone hides this.
+        if [ -n "$candidate_paths" ] && [ -f "$answer_output" ]; then
+          printf '%s\n%s\n' "$query" "$task" >"$stage/answers/${case_id}.${strategy}.visible"
+          printf '%s\n' "$candidate_paths" >"$stage/answers/${case_id}.${strategy}.refs"
+          judged="$(memory_signals pack-judge --project-dir "$dir" --refs "$stage/answers/${case_id}.${strategy}.refs" --visible "$stage/answers/${case_id}.${strategy}.visible" --later "$answer_output" --summary-only 2>/dev/null | tail -n 1)" || judged=""
+          delivered_novel="$(tr '\t' '\n' <<<"$judged" | sed -n 's/^novel=//p')"; [ -n "$delivered_novel" ] || delivered_novel=-
+          novel_used="$(tr '\t' '\n' <<<"$judged" | sed -n 's/^novel_used=//p')"; [ -n "$novel_used" ] || novel_used=-
+        elif [ -z "$candidate_paths" ]; then
+          delivered_novel=0; novel_used=0
+        fi
       fi
       elapsed=$(( $(date +%s) - started ))
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$case_id" "$strategy" "${actual:-unknown}" "$degraded" "$query" "$candidate_paths" "$candidate_ranks" "$evidence_refs" "$hit" "$context_bytes" "$token_estimate" "$provider_calls" "$memory_write_cost" "$elapsed" "$outcome" >>"$trace"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$case_id" "$strategy" "${actual:-unknown}" "$degraded" "$query" "$candidate_paths" "$candidate_ranks" "$evidence_refs" "$hit" "$context_bytes" "$token_estimate" "$provider_calls" "$memory_write_cost" "$elapsed" "$outcome" "$delivered_novel" "$novel_used" >>"$trace"
     done
   done <"$cases"
   deterministic_hash="$(cut -f1-13,15 "$trace" | sha256_file /dev/stdin)"
@@ -7674,6 +7688,12 @@ cmd_eval() {
             printf "%s\t%d\t%d\t%d\t%d\t%s\n", arm[i], hits[i], best, bytes[i], best_bytes, verdict
           }
         }' < <(sort "$summary")
+    fi
+    if [ -n "$answer_runner" ]; then
+      printf '\n## Point of use\n\n'
+      printf 'Per strategy: answers, successes, successes whose answer used no delivered record that was new to the case (success-without-memory-use), delivered records that were new, and new records the answer used.\n\n'
+      printf 'strategy\tanswers\tsuccesses\tsuccess_without_memory_use\tdelivered_novel\tnovel_used\n'
+      awk -F '\t' 'NR > 1 && $16 != "-" { s = $2; n[s]++; if ($15 == "success") { ok[s]++; if ($17 == 0) idle[s]++ } nov[s] += $16; use[s] += $17 } END { for (s in n) printf "%s\t%d\t%d\t%d\t%d\t%d\n", s, n[s], ok[s] + 0, idle[s] + 0, nov[s], use[s] }' "$trace" | sort
     fi
     printf '\n## Artefacts\n\n* Trace: `trace.tsv`\n* Cases hash: `%s`\n* Requested strategies: `%s`\n' "$cases_hash" "$strategies"
   } >"$report"
@@ -7768,9 +7788,50 @@ pack_index_freshness() {
   ' "$audit"
 }
 
+pack_judge() {
+  # #15: judge a delivered pack at the point of use.  Read-only unless
+  # --record, which files retrieval feedback crediting only the records that
+  # were both new to the agent and used later (#14 credit after use).
+  local project_id="$1" pack_ref="" visible="" later="" record=0 json=0 dir verdict novel_used_refs
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pack) pack_ref="${2:-}"; shift 2 ;;
+      --visible) visible="${2:-}"; shift 2 ;;
+      --later) later="${2:-}"; shift 2 ;;
+      --record) record=1; shift ;;
+      --json) json=1; shift ;;
+      *) die 64 "unknown pack judge option: $1" ;;
+    esac
+  done
+  [ -n "$pack_ref" ] || die 64 "pack judge requires --pack REF"
+  case "$pack_ref" in /*|*..*|*$'\n'*) die 65 "pack reference must stay inside the project" ;; esac
+  require_project "$project_id" dir
+  [ -f "$dir/$pack_ref" ] || die 66 "pack missing: $pack_ref"
+  [ -z "$visible" ] || [ -f "$visible" ] || die 66 "visible-context file missing: $visible"
+  [ -z "$later" ] || [ -f "$later" ] || die 66 "later-action file missing: $later"
+  local -a judge_args=(pack-judge --project-dir "$dir" --pack "$pack_ref" --visible "$visible" --later "$later")
+  if [ "$json" = 1 ] && [ "$record" = 0 ]; then memory_signals "${judge_args[@]}" --json; return; fi
+  local judged; judged="$(memory_signals "${judge_args[@]}")" || die 70 "pack judge failed"
+  printf '%s\n' "$judged"
+  [ "$record" = 1 ] || return 0
+  [ -n "$later" ] || die 64 "pack judge --record needs --later FILE (what the agent did next)"
+  verdict="$(tail -n 1 <<<"$judged" | tr '\t' '\n' | sed -n 's/^verdict=//p')"
+  novel_used_refs="$(awk -F '\t' 'NR > 1 && $2 == "novel" && $3 == "used" { print $1 }' <<<"$judged")"
+  local -a feedback_args=(--pack "$pack_ref" --notes "pack judge: $verdict")
+  if [ "$verdict" = used ]; then
+    feedback_args+=(--usefulness useful)
+    while IFS= read -r used_ref; do [ -z "$used_ref" ] || feedback_args+=(--used "$used_ref"); done <<<"$novel_used_refs"
+  else
+    feedback_args+=(--usefulness not-useful)
+  fi
+  feedback_record "$project_id" "${feedback_args[@]}"
+}
+
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
-  [ "$action" = "build" ] || die 64 "pack requires build"
+  if [ "$action" = judge ]; then pack_judge "$project_id" "$@"; return; fi
+  [ "$action" = "build" ] || die 64 "pack requires build or judge"
   local history_file="" history_hash="" history_line="" sufficiency_file="" historical_sufficiency="none" hidden_future=0
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
