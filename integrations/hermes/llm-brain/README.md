@@ -125,6 +125,14 @@ By default pre-compression observation is best-effort and non-blocking. The outb
 
 This setting is not needed for ordinary use. Hermes documents that required checkpoints disable server-native compaction, micro-compaction and `codex_app_server` compaction paths; verify the host's desired compression behaviour before enabling it. No Memthena selector configuration change is required.
 
+### Hermes 0.23 provider contract
+
+- **Resume.** `initialize()` reads `resumed` and `message_count` (older Hermes omits them). A fresh session writes nothing at start-up. A resumed one also writes nothing new: it only finishes captures a previous process left pending or claimed in the outbox.
+- **Turn start.** `on_turn_start()` keeps the turn's `model`. After a resume, `previous_message` re-warms the recall the old process would have queued, so the first turn has context to fall back on.
+- **Prefetch deadline.** Hermes abandons an external prefetch after 8 seconds. `prefetch()` answers within `prefetch_deadline_seconds` (default 6.5, max 7.5); a slower recall returns the context warmed after the previous turn, labelled as such, instead of nothing.
+- **Subagent forks.** Hermes gives a fork a provider only for the required checkpoint and does not gate it. The checkpoint is saved for every context (forks are labelled `agent_context: subagent` with their `parent_session_id`), list content keeps its text parts, and a window with no direct messages is an empty, complete checkpoint. Nothing here raises just because the caller is a fork, so a fork's compaction is never blocked by context alone. Fork turn writes and recall stay off.
+- **Secrets.** Hermes scrubs recognised secrets before every provider hand-off, even with `security.redact_secrets: false`, so the provider sees `sk-pro...abcd`, not the value. By default such a capture is kept as handed over and labelled `egress_scrubbed` so it is never mistaken for the original. With `raw_secret_custody: true` the provider restores each scrubbed message from Hermes' own local session store (read-only, exact match after re-running Hermes' scrub, nothing guessed), and the capture is stored byte for byte as `brain_sensitivity: restricted`, `brain_owner_only: true`, file mode 0600. Restricted records never render in recall, packs or exports. The core keeps such a record only when the bridge runs with `LLM_BRAIN_SECRET_CUSTODY=owner-only`, which the provider sets when the option is on; otherwise the secret scanner blocks it as before.
+
 ## Host-neutral bridge
 
 Other local agents can use the same JSON transport:

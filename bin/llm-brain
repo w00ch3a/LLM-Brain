@@ -2783,10 +2783,19 @@ capture_source() {
   source_dir="$dir/sources"
   staging="$source_dir/.incoming.$$"
   cp "$source" "$staging"
+  local owner_only_custody=0
   if secret_scan_file "$staging"; then
     :
+  elif [ "$?" = 2 ] && [ "${LLM_BRAIN_SECRET_CUSTODY:-}" = owner-only ] \
+    && [ "$(frontmatter_field "$staging" brain_owner_only)" = true ] \
+    && [ "$(frontmatter_field "$staging" brain_sensitivity)" = restricted ]; then
+    # Opt-in owner-only custody: a capture that declares itself owner-only
+    # and restricted is kept byte for byte (0600) instead of being blocked.
+    # Restricted records never render in recall, packs or exports.
+    owner_only_custody=1
+    chmod 600 "$staging"
   else
-    local status=$?
+    secret_scan_file "$staging" >/dev/null 2>&1 && status=0 || status=$?
     rm -f "$staging"
     if [ "$status" = "2" ]; then
       local blocked_id
@@ -2845,7 +2854,7 @@ brain_scope: project
 brain_source_ref: $(yaml_quote "sources/$(basename "$dest")")
 brain_source_hash_sha256: $hash
 brain_review_state: captured
-brain_sensitivity: internal
+brain_sensitivity: $([ "$owner_only_custody" = 1 ] && printf 'restricted\nbrain_owner_only: true' || printf internal)
 brain_schema_version: $SCHEMA_VERSION${speaker_fields:+
 $speaker_fields}
 timestamp: $(yaml_quote "$(now_utc)")
@@ -2858,7 +2867,7 @@ EOF
   fi
   if [ ! -f "$review_file" ]; then
     created=1
-    write_review_item "$dir" "$review_id" "source-ingest" "Review source $(basename "$source")" "$(custody_review_state)" "0.0" "medium" "internal" "source" "" "episode://$episode_id" "Extract durable candidates only when useful; raw custody is not semantic memory." >/dev/null
+    write_review_item "$dir" "$review_id" "source-ingest" "Review source $(basename "$source")" "$(custody_review_state)" "0.0" "medium" "$([ "$owner_only_custody" = 1 ] && printf restricted || printf internal)" "source" "" "episode://$episode_id" "Extract durable candidates only when useful; raw custody is not semantic memory." >/dev/null
   fi
   if [ "$created" = 0 ]; then idempotent=true; else audit_v2 "$dir" "ingest-capture" "$episode_id" "" "captured" "$hash" "source_ref=sources/$(basename "$dest")"; fi
   release_lock

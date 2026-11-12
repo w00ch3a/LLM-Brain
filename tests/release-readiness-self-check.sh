@@ -118,6 +118,7 @@ compatibility_checks() {
     bash "$repo_root/tests/compatibility-self-check.sh" -- \
     bash "$repo_root/tests/hermes-plugin-options-self-check.sh" -- \
     bash "$repo_root/tests/hermes-integration-self-check.sh" -- \
+    bash "$repo_root/tests/hermes-v023-provider-self-check.sh" -- \
     bash "$repo_root/tests/hermes-neural-expansion-self-check.sh"
 }
 

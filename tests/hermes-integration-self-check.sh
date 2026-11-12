@@ -618,8 +618,11 @@ provider.save_config({
 provider.initialize("native-session", hermes_home=str(native_home), agent_workspace=str(vault.parent / "workspace"), agent_context="primary")
 assert provider.on_pre_compress([{"role": "user", "content": "native checkpoint evidence"}], require_checkpoint=True) == ""
 assert any("brain_bridge_receipt_sha256:" in path.read_text(encoding="utf-8") for path in (native_home / "llm-brain/outbox/committed").glob("*.md"))
-manager = object.__new__(MemoryManager)
-manager._providers = [provider]
+import os
+os.environ["HERMES_HOME"] = str(native_home)  # the profile the manager is bound to
+manager = MemoryManager()
+manager.add_provider(provider)
+manager.initialize_all(session_id="native-session", hermes_home=str(native_home), agent_workspace=str(vault.parent / "workspace"), agent_context="primary")
 assert manager.supports_pre_compress_checkpoint()
 assert manager.on_pre_compress([], evidence_messages=[{"role": "user", "content": "native dispatcher evidence"}], require_checkpoint=True) == ""
 engine = module.LLMBrainContextEngine(config={

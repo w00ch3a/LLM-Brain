@@ -106,6 +106,14 @@ OPTIONAL_CONFIG_DEFAULTS: Dict[str, Any] = {
     # once on the next turn after a compaction.  No-op on older Hermes.
     "post_compaction_reinject": True,
     "post_compaction_budget_tokens": 625,
+    # Hermes >= 0.23 scrubs recognised secrets before every provider
+    # hand-off (even with redact_secrets: false).  Opt-in: restore the exact
+    # original text from Hermes' own local session store and keep it
+    # owner-only (brain_sensitivity: restricted), byte for byte.
+    "raw_secret_custody": False,
+    # Prefetch answers inside Hermes' external-prefetch timeout (8 s); a
+    # slower recall falls back to the context warmed after the last turn.
+    "prefetch_deadline_seconds": 6.5,
 }
 POST_COMPACTION_SKIP_KINDS = {"prune_tool_results"}
 _POST_COMPACTION_LOCK = threading.Lock()
@@ -189,6 +197,16 @@ def _normalise_optional_config(config: Dict[str, Any]) -> None:
         config["neural_expansion_export"] = config["neural_expansion_export"] is True
     if "post_compaction_reinject" in config:
         config["post_compaction_reinject"] = config["post_compaction_reinject"] is not False
+    if "raw_secret_custody" in config:
+        config["raw_secret_custody"] = config["raw_secret_custody"] is True
+    if "prefetch_deadline_seconds" in config:
+        try:
+            seconds = float(config["prefetch_deadline_seconds"])
+        except (TypeError, ValueError):
+            seconds = OPTIONAL_CONFIG_DEFAULTS["prefetch_deadline_seconds"]
+        if not math.isfinite(seconds) or seconds <= 0:
+            seconds = OPTIONAL_CONFIG_DEFAULTS["prefetch_deadline_seconds"]
+        config["prefetch_deadline_seconds"] = min(seconds, 7.5)
     if "post_compaction_budget_tokens" in config:
         try:
             tokens = int(config["post_compaction_budget_tokens"])
@@ -692,12 +710,16 @@ def _turn_record(
     messages: List[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
     turns: Optional[List[tuple]] = None,
+    raw: bool = False,
 ) -> str:
+    """One capture record.  raw=True keeps every text byte for byte (no
+    whole-message redaction) and marks the record restricted / owner-only."""
     metadata = _safe_metadata(metadata or {})
+    keep = (lambda value: value) if raw else _safe_text
     from datetime import datetime, timezone
     observed = metadata.get("observed_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    safe_user = _safe_text(user)
-    safe_assistant = _safe_text(assistant)
+    safe_user = keep(user)
+    safe_assistant = keep(assistant)
     shown_user, escaped_user = _escape_role_labels(safe_user)
     shown_assistant, escaped_assistant = _escape_role_labels(safe_assistant)
     escaped = escaped_user + escaped_assistant
@@ -711,7 +733,7 @@ def _turn_record(
         body.extend(("", "## Speaker turns", ""))
         for index, (role, text) in enumerate(turns, 1):
             speaker = role if role in SPEAKER_ROLES else "unknown"
-            shown, count = _escape_role_labels(_safe_text(text))
+            shown, count = _escape_role_labels(keep(text))
             escaped += count
             body.extend((f"### {index}. speaker: {speaker}", "", shown or "[empty]", ""))
         body.pop()
@@ -733,7 +755,9 @@ def _turn_record(
     ]
     if escaped:
         fields.append(f"brain_role_labels_escaped: {escaped}")
-    fields.extend(("brain_sensitivity: internal", "brain_schema_version: 3", "---", ""))
+    if raw:
+        fields.append("brain_owner_only: true")
+    fields.extend((f"brain_sensitivity: {'restricted' if raw else 'internal'}", "brain_schema_version: 3", "---", ""))
     return "\n".join(fields + body) + "\n"
 
 
@@ -1036,6 +1060,10 @@ def _bridge_call(config: Dict[str, Any], source_root: Path, args: List[str]) -> 
     # 26 Oct: records scoped with brain_applies_when "host=..." match Hermes.
     # Passed by environment so an older CLI simply ignores it.
     env["LLM_BRAIN_HOST"] = "hermes"
+    if _option(config, "raw_secret_custody") is True:
+        # Core keeps a record marked brain_owner_only byte for byte (0600,
+        # restricted) instead of blocking it at the secret scanner.
+        env["LLM_BRAIN_SECRET_CUSTODY"] = "owner-only"
     result = None
     try:
         result = subprocess.Popen(
@@ -1146,6 +1174,92 @@ def _recall(
                 pass
 
 
+# Shapes Hermes' egress scrub leaves behind ("sk-pro...abcd", "Bearer [redacted]").
+EGRESS_SCRUB_RE = re.compile(r"\b[A-Za-z0-9_-]{2,12}\.\.\.[A-Za-z0-9_-]{4}\b|\[redacted\]|\[REDACTED[^\]]*\]")
+
+
+def _flatten_content(content: Any) -> Optional[str]:
+    """Plain text for a direct message; list content keeps its text parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, dict):
+                parts.append(f"[{part.get('type') or 'non-text'} part not checkpointed]")
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    return None
+
+
+def _raw_session_texts(hermes_home: Path, session_id: str) -> List[str]:
+    """Unscrubbed user/assistant texts Hermes keeps in its own local session store.
+
+    Read-only; returns [] on any Hermes without the store or API.  Never
+    leaves the machine: it is only used to restore a scrubbed capture.
+    """
+    if not session_id:
+        return []
+    try:
+        from hermes_state import SessionDB  # type: ignore
+    except Exception:
+        return []
+    db_path = hermes_home / "state.db"
+    if not db_path.is_file():
+        return []
+    try:
+        db = SessionDB(db_path=db_path, read_only=True)
+        rows = db.get_messages(session_id, include_ancestors=True)
+    except Exception:
+        return []
+    texts = []
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("role") in {"user", "assistant"}:
+            text = _flatten_content(row.get("content"))
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _egress_scrub(text: str) -> Optional[str]:
+    try:
+        from agent.redact import redact_for_egress  # type: ignore
+    except Exception:
+        return None
+    try:
+        return redact_for_egress(text)
+    except Exception:
+        return None
+
+
+def _restore_scrubbed(texts: List[str], raw: List[str]) -> tuple:
+    """Swap each scrubbed text for the raw original that scrubs to exactly it.
+
+    Returns (texts, restored_count, unresolved_count).  A match must be exact
+    after re-running Hermes' own scrub, so nothing is guessed.
+    """
+    if not raw:
+        return texts, 0, sum(1 for t in texts if EGRESS_SCRUB_RE.search(t or ""))
+    scrubbed_raw: Dict[str, str] = {}
+    for original in raw:
+        scrubbed = _egress_scrub(original)
+        if scrubbed is not None and scrubbed != original:
+            scrubbed_raw.setdefault(scrubbed, original)
+    out, restored, unresolved = [], 0, 0
+    for text in texts:
+        if text in scrubbed_raw:
+            out.append(scrubbed_raw[text])
+            restored += 1
+        else:
+            if EGRESS_SCRUB_RE.search(text or ""):
+                unresolved += 1
+            out.append(text)
+    return out, restored, unresolved
+
+
 class LLMBrainMemoryProvider(MemoryProvider):
     """Hermes persistent-memory provider backed by the LLM-Brain CLI."""
     pre_compress_checkpoint_api_version = 2
@@ -1163,6 +1277,13 @@ class LLMBrainMemoryProvider(MemoryProvider):
         self._platform = "cli"
         self._agent_identity = "default"
         self._agent_context = "primary"
+        self._parent_session_id = ""
+        self._resumed = False
+        self._message_count = 0
+        self._model = ""
+        self._turn_number = 0
+        self._warm: Dict[str, tuple] = {}
+        self._warm_lock = threading.Lock()
         self._drain_thread: Optional[threading.Thread] = None
         self._drain_lock = threading.Lock()
 
@@ -1180,9 +1301,55 @@ class LLMBrainMemoryProvider(MemoryProvider):
         self._agent_identity = str(kwargs.get("agent_identity") or "default")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._principal = _principal(self._config, kwargs, self._agent_identity)
+        self._parent_session_id = str(kwargs.get("parent_session_id") or "")
+        # Hermes >= 0.23: resumed / message_count (older Hermes omits both).
+        self._resumed = kwargs.get("resumed") is True
+        try:
+            self._message_count = max(0, int(kwargs.get("message_count") or 0))
+        except (TypeError, ValueError):
+            self._message_count = 0
         _ACTIVE_PROVIDERS["latest"] = self
         if self._session_id:
             _ACTIVE_PROVIDERS[self._session_id] = self
+        if self._resumed and self._agent_context in {"", "primary"}:
+            # A continued session writes nothing new at start-up; it only
+            # finishes captures the previous process left pending or claimed.
+            self._start_drain()
+
+    def on_turn_start(self, turn_number: int, message: str = "", **kwargs: Any) -> None:
+        """Hermes >= 0.23 per-turn tick: keep the model, and after a resume
+        re-warm the recall the dead process would have queued for its last turn."""
+        try:
+            self._turn_number = int(turn_number)
+        except (TypeError, ValueError):
+            pass
+        self._model = str(kwargs.get("model") or self._model or "")
+        if self._agent_context not in {"", "primary"} or _context_engine_selected():
+            return
+        previous = str(kwargs.get("previous_message") or "").strip()
+        key = self._session_id or "default"
+        with self._warm_lock:
+            warm = key in self._warm
+        if previous and not warm:
+            self.queue_prefetch(previous, session_id=self._session_id)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        if self._agent_context not in {"", "primary"} or _context_engine_selected() or not str(query or "").strip():
+            return
+        key = session_id or self._session_id or "default"
+
+        def warm() -> None:
+            payload = _recall(self._config, self._hermes_home, self._source_root, self._principal, str(query))
+            context = payload.get("context_markdown") if payload else ""
+            if isinstance(context, str) and context.strip():
+                with self._warm_lock:
+                    self._warm[key] = (str(query), context)
+                    while len(self._warm) > 32:
+                        self._warm.pop(next(iter(self._warm)))
+
+        thread = spawn_context_thread(warm, name="llm-brain-warm", daemon=True)
+        thread.start()
+        self._warm_thread = thread
 
     def post_compaction_context(self, session_id: str, user_message: Any, history: Any, info: Dict[str, Any]) -> str:
         """A size-capped recall for the turn after a compaction, or ""."""
@@ -1253,9 +1420,33 @@ class LLMBrainMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if _context_engine_selected():
             return ""
-        payload = _recall(self._config, self._hermes_home, self._source_root, self._principal, query)
-        context = payload.get("context_markdown") if payload else ""
-        return context if isinstance(context, str) else ""
+        try:
+            deadline = float(_option(self._config, "prefetch_deadline_seconds"))
+        except (TypeError, ValueError):
+            deadline = OPTIONAL_CONFIG_DEFAULTS["prefetch_deadline_seconds"]
+        box: Dict[str, Any] = {}
+
+        def run() -> None:
+            box["payload"] = _recall(self._config, self._hermes_home, self._source_root, self._principal, query)
+
+        thread = spawn_context_thread(run, name="llm-brain-prefetch", daemon=True)
+        thread.start()
+        thread.join(max(0.1, deadline))
+        if not thread.is_alive():
+            payload = box.get("payload")
+            context = payload.get("context_markdown") if payload else ""
+            if isinstance(context, str) and context.strip():
+                with self._warm_lock:
+                    self._warm[session_id or self._session_id or "default"] = (str(query), context)
+                return context
+        with self._warm_lock:
+            warm = self._warm.get(session_id or self._session_id or "default")
+        if not warm:
+            return ""
+        return (
+            "LLM-Brain recall for this turn is still running; context recalled for the "
+            "previous turn follows.\n" + warm[1]
+        )
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None, observed_at: str = "") -> None:
         if self._agent_context not in {"", "primary"}:
@@ -1268,10 +1459,14 @@ class LLMBrainMemoryProvider(MemoryProvider):
             f"{session}|turn|{self._platform}|{self._agent_identity}|"
             f"{user_content}|{assistant_content}|{serialised}"
         )[:24]
+        (pair, custody) = self._custody([("user", user_content), ("assistant", assistant_content)])
+        user_content, assistant_content = pair[0][1], pair[1][1]
+        meta: Dict[str, Any] = {"observed_at": observed_at} if observed_at else {}
+        meta.update(custody)
         record = _turn_record(
             request_id, self._source_root, session, self._principal, self._platform,
             self._agent_identity, "turn", user_content, assistant_content, messages,
-            {"observed_at": observed_at} if observed_at else None,
+            meta or None, raw=bool(custody.get("raw_secret_custody")),
         )
         _atomic_write(self._hermes_home / "llm-brain" / "outbox" / f"{request_id}.md", record)
         self._start_drain()
@@ -1286,16 +1481,17 @@ class LLMBrainMemoryProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]], *, require_checkpoint: bool = False) -> str:
         if require_checkpoint:
-            if self._agent_context not in {"", "primary"}:
-                raise RuntimeError("LLM-Brain checkpoint is unavailable outside the primary context")
+            # Hermes >= 0.23 hands a fork (subagent) a provider only for this
+            # checkpoint and does not gate it: a raise here blocks the fork's
+            # compaction, so every context saves its own checkpoint.
             direct = []
             turns = []
             for message in messages:
                 if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
                     continue
-                content = message.get("content")
-                if not isinstance(content, str):
-                    raise RuntimeError("LLM-Brain checkpoint requires plain-text direct messages")
+                content = _flatten_content(message.get("content"))
+                if content is None:
+                    raise RuntimeError("LLM-Brain checkpoint requires text direct messages")
                 if not content.strip():
                     continue
                 # The id keeps its historical input; the record keeps roles as
@@ -1303,15 +1499,27 @@ class LLMBrainMemoryProvider(MemoryProvider):
                 direct.append(f"[{message['role']}] {content}")
                 turns.append((str(message["role"]), content))
             if not direct:
-                raise RuntimeError("LLM-Brain checkpoint has no direct messages")
+                # Nothing direct to keep (tool-only fork window): an empty
+                # checkpoint is complete, and must not block compaction.
+                return ""
             transcript = "\n\n".join(direct)
-            request_id = _sha(f"{self._source_root}|{self._principal}|{self._session_id}|checkpoint|{transcript}")[:24]
+            context = self._agent_context or "primary"
+            id_context = "" if context == "primary" else f"|{context}"
+            request_id = _sha(f"{self._source_root}|{self._principal}|{self._session_id}|checkpoint{id_context}|{transcript}")[:24]
+            metadata: Dict[str, Any] = {"message_count": len(direct)}
+            if context != "primary":
+                metadata["agent_context"] = context
+                if self._parent_session_id:
+                    metadata["parent_session_id"] = self._parent_session_id
+            turns, custody = self._custody(turns)
+            metadata.update(custody)
             user_text = "\n\n".join(text for role, text in turns if role == "user")
             assistant_text = "\n\n".join(text for role, text in turns if role == "assistant")
             record = _turn_record(
                 request_id, self._source_root, self._session_id, self._principal,
                 self._platform, self._agent_identity, "pre-compress-checkpoint",
-                user_text, assistant_text, [], {"message_count": len(direct)}, turns=turns,
+                user_text, assistant_text, [], metadata, turns=turns,
+                raw=bool(custody.get("raw_secret_custody")),
             )
             self._checkpoint_capture(request_id, record)
             return ""
@@ -1326,6 +1534,29 @@ class LLMBrainMemoryProvider(MemoryProvider):
             _atomic_write(self._hermes_home / "llm-brain" / "outbox" / f"{request_id}.md", record)
             self._start_drain()
         return ""
+
+    def _custody(self, turns: List[tuple]) -> tuple:
+        """Restore Hermes-scrubbed secrets from the local session store (opt-in).
+
+        Returns (turns, metadata).  With raw_secret_custody off nothing changes
+        except that a scrubbed capture is labelled lossy, so nobody mistakes
+        "sk-pro...abcd" for the stored value.
+        """
+        texts = [text for _, text in turns]
+        scrubbed = sum(1 for text in texts if EGRESS_SCRUB_RE.search(text or ""))
+        if not scrubbed:
+            return turns, {}
+        if _option(self._config, "raw_secret_custody") is not True:
+            return turns, {"egress_scrubbed": scrubbed}
+        restored_texts, restored, unresolved = _restore_scrubbed(
+            texts, _raw_session_texts(self._hermes_home, self._session_id),
+        )
+        meta: Dict[str, Any] = {"egress_scrubbed": scrubbed, "egress_restored": restored}
+        if unresolved:
+            meta["egress_unresolved"] = unresolved
+        if restored:
+            meta["raw_secret_custody"] = True
+        return [(role, text) for (role, _), text in zip(turns, restored_texts)], meta
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if self._agent_context not in {"", "primary"}:
