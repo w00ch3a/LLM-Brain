@@ -1586,6 +1586,61 @@ def command_history_states(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------- #1 (2 Nov) no re-promotion of old versions
+
+def _content_set(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(token) > 2 and token not in STOP}
+
+
+def superseded_match(vault: Vault, review: Path, now: dt.datetime) -> dict[str, str]:
+    """Does this candidate repeat a version that has already been replaced
+    (explicitly superseded, revised, retracted, or an older value of its state
+    key)?  A candidate that itself supersedes the replacement is a deliberate
+    rollback and is left to the belief check."""
+    meta, body = okf.split_frontmatter(review)
+    text = clean(meta.get("title")) + "\n" + body
+    terms = _content_set(text)
+    tokens = {t.lower() for t in ms.answer_tokens(text)}
+    if not terms:
+        return {"verdict": "ok"}
+    targets = {vault.resolver.canonical_ref(ref) for field in ("brain_supersedes", "brain_version_of") for ref in ref_list(meta.get(field))}
+    derived = derived_labels(vault)
+    best: tuple[float, Path, str] | None = None
+    for path in vault.semantic_files():
+        if not vault.resolver.visible(path, strict_principal=True):
+            continue
+        state, label = history_state(vault, path, now, derived)
+        if state not in ("historical", "older-value", "retracted", "expired"):
+            continue
+        other = vault.title(path) + "\n" + vault.body(path)
+        other_terms = _content_set(other)
+        if not other_terms:
+            continue
+        jaccard = len(terms & other_terms) / len(terms | other_terms)
+        if jaccard < 0.8 or tokens != {t.lower() for t in ms.answer_tokens(other)}:
+            continue
+        if best is None or jaccard > best[0]:
+            best = (jaccard, path, label)
+    if best is None:
+        return {"verdict": "ok"}
+    replacement = ""
+    for label, target, _ in derived.get(vault.rel(best[1]), []):
+        if label in ("superseded-by", "revised") and target:
+            replacement = target
+    if replacement:
+        rpath = vault.resolver.canonical_ref(replacement)
+        if rpath is not None and rpath in targets:
+            return {"verdict": "ok"}
+    return {"verdict": "hold", "matches": vault.rel(best[1]), "label": best[2], "similarity": f"{best[0]:.2f}"}
+
+
+def command_superseded_match(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    row = superseded_match(vault, Path(args.review), now_from(args.now))
+    print("\t".join([row["verdict"], row.get("matches", ""), row.get("label", ""), row.get("similarity", "")]))
+    return 0
+
+
 # ---------------------------------------- #13 historical sufficiency (13 Nov)
 
 def historical_sufficiency(vault: Vault, refs: list[str], now: dt.datetime, task: str = "") -> list[dict[str, str]]:
@@ -2810,6 +2865,8 @@ def parser() -> argparse.ArgumentParser:
     st.set_defaults(func=command_speaker_turns)
     hs = base("history-states", command_history_states)
     hs.add_argument("--selected", required=True)
+    smatch = base("superseded-match", command_superseded_match)
+    smatch.add_argument("--review", required=True)
     hsuf = base("historical-sufficiency", command_historical_sufficiency)
     hsuf.add_argument("--selected", required=True)
     hsuf.add_argument("--task", default="")

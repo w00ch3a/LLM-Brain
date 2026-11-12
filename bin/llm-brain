@@ -105,6 +105,7 @@ Commands:
   decide-serve [bundled|MODEL_SPEC] [--port N]   Memthena System One on localhost for Hermes (opt-in; kind/triage advisory)
   models status | models install system-one-32m [--archive FILE [--sha256 HEX]] | models remove system-one-32m   optional 32m System One (per machine)
                                               --overrule-belief lets one source replace a better-supported fact
+                                              --restore-superseded promotes a candidate that repeats an already-replaced version
                                               --accept-merge-loss promotes a merge/compression that drops answer-bearing content
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
@@ -3215,6 +3216,21 @@ promote_review_locked() {
       return 3
     fi
   fi
+  # #1 (2 Nov): a candidate whose content repeats a version that has already
+  # been replaced (a stale capture, a replayed episode) must not roll the old
+  # fact back over its replacement.  It is deferred for review instead.
+  if [ ! -f "$dest" ] && [ "${RESTORE_SUPERSEDED:-0}" != 1 ]; then
+    local old_verdict old_match old_label old_similarity
+    IFS=$'\t' read -r old_verdict old_match old_label old_similarity <<<"$(memory_lineage superseded-match --project-dir "$dir" --review "$review" 2>/dev/null || printf 'ok\n')"
+    if [ "$old_verdict" = hold ]; then
+      set_frontmatter_field "$review" brain_review_state needs-validation
+      set_frontmatter_field "$review" brain_review_reason superseded-version
+      set_frontmatter_field "$review" brain_matches_superseded "$old_match"
+      audit_v2 "$dir" "superseded-repeat-hold" "$review_id" "$state" needs-validation "$(sha256_file "$review")" "matches=$(slug "$old_match") similarity=$old_similarity"
+      printf 'promotion=held review_id=%s reason=superseded-version matches=%s state=%s\n' "$review_id" "$old_match" "$old_label"
+      return 3
+    fi
+  fi
   # #14/#15 preservation screen: a consolidation merge (brain_merge_of, or
   # brain_supersedes naming two or more records) or a compression
   # (brain_compressed_from) is held unless the new text still carries the
@@ -4955,7 +4971,7 @@ cmd_review() {
     decide)
       local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       case "$state" in proposed|needs-validation|approved|rejected|superseded) ;; *) die 64 "invalid review state" ;; esac
       local dir file old
@@ -4999,10 +5015,12 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
         fi
+        [ "${RESTORE_SUPERSEDED:-0}" != 1 ] || audit_v2 "$dir" "superseded-restore" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         [ "${MERGE_ACCEPT_LOSS:-0}" != 1 ] || audit_v2 "$dir" "merge-loss-accepted" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         [ "${BELIEF_OVERRULE:-0}" != 1 ] || audit_v2 "$dir" "belief-overrule" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         if promote_review_locked "$project_id" "$id" "$actor" "$reason"; then :; else promotion_status=$?; fi
         release_lock
+        [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != superseded-version ] || die 75 "review $id held: it repeats $(frontmatter_field "$file" brain_matches_superseded), a version that has already been replaced; use --restore-superseded only to bring the old version back on purpose"
         [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != merge-preservation-failed ] || die 75 "review $id held: the merged text loses answer-bearing content of an original ($(frontmatter_field "$file" brain_merge_missing)); add it, or use --accept-merge-loss"
         [ "$promotion_status" != 3 ] || die 75 "review $id held: it contradicts a better-supported fact (see the belief_ conflict review); add corroborating sources or use --overrule-belief"
         return "$promotion_status"
