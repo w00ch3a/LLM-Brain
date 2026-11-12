@@ -167,8 +167,8 @@ make_evidence_fixture "$fixture/rebuild-trigger.md" "Rebuild trigger" hermes_reb
 LLM_BRAIN_EMBEDDER="$fixture/embedder.sh" LLM_BRAIN_EMBEDDER_VERSION=fixture "$cli" --root "$vault" bridge capture --source-root "$workspace" --project-id "$project_id" --record "$fixture/rebuild-trigger.md" >/dev/null
 expected_evidence_header="$(printf 'path\thash\tview_version\tview_hash\tview_path\tmodel\tdimensions\tprincipal\tobserved_at\ttitle\tvector\tclaims_version')"
 printf '%s\n' "$(head -1 "$legacy_index")" | grep -Fqx -- "$expected_evidence_header" || { printf 'stale evidence index was not rebuilt\n' >&2; exit 1; }
-claims_projection="$(find "$project/indexes/evidence-claims" -maxdepth 1 -type f -name '*-claims-v2.txt' -print -quit)"
-[ -n "$claims_projection" ] && grep -Fqx -- 'derived=claim-projection-v2' "$claims_projection"
+claims_projection="$(find "$project/indexes/evidence-claims" -maxdepth 1 -type f -name '*-claims-v3.txt' -print -quit)"
+[ -n "$claims_projection" ] && grep -Fqx -- 'derived=claim-projection-v3' "$claims_projection"
 
 if [ ! -d "$hermes_root" ]; then
   run_loaded_index_check

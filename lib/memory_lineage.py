@@ -1641,6 +1641,76 @@ def command_superseded_match(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------- #2 (2 Nov) current packs drop replaced versions
+
+def current_filter(vault: Vault, refs: list[str], now: dt.datetime, window_days: int, min_uses: int) -> tuple[list[tuple[str, str]], list[str]]:
+    """(drops, notices) for a current (not historical, not as-of) pack.
+    Drops: selected records that are an older value of their state key, or
+    superseded/revised/retracted (search already drops explicit ones).
+    Notices: for a selected current record that replaced a well-used version
+    within ``window_days``, one line "changed on DATE: was X, now Y"."""
+    derived = derived_labels(vault)
+    drops: list[tuple[str, str]] = []
+    notices: list[str] = []
+    kept: list[Path] = []
+    for ref in refs:
+        path = vault.resolver.canonical_ref(ref)
+        if path is None:
+            continue
+        state, label = history_state(vault, path, now, derived)
+        if state in ("historical", "older-value", "retracted"):
+            drops.append((ref, label))
+        else:
+            kept.append(path)
+    try:
+        table, _ = ms.usage_table(vault)
+    except Exception:
+        table = {}
+    lead = lambda p: _one(ms.lead_sentences(vault.body(p), 120), 120)
+    for path in kept:
+        created = _created(vault, path)
+        if created is None or created > now or (now - created).days > window_days:
+            continue
+        meta = vault.meta(path)
+        predecessors: list[Path] = []
+        for field in ("brain_supersedes", "brain_version_of"):
+            for ref in ref_list(meta.get(field)):
+                target = vault.resolver.canonical_ref(ref)
+                if target is not None and target != path:
+                    predecessors.append(target)
+        key = clean(meta.get("brain_state_key"))
+        if key and not predecessors:
+            older = []
+            for other in vault.semantic_files():
+                if other == path or clean(vault.meta(other).get("brain_state_key")) != key:
+                    continue
+                when = _created(vault, other)
+                if when is not None and when < created and vault.resolver.effective(other):
+                    older.append((when, other))
+            if older:
+                predecessors.append(sorted(older)[-1][1])
+        for old in predecessors:
+            if not vault.resolver.visible(old, strict_principal=True):
+                continue
+            entry = table.get(vault.rel(old)) or {}
+            uses = int(entry.get("uses", 0)) + int(entry.get("useful", 0)) + int(entry.get("partial", 0))
+            if uses < min_uses:
+                continue
+            notices.append(f"Changed on {created.date().isoformat()}: was \"{lead(old)}\" (`{vault.rel(old)}`), now \"{lead(path)}\" (`{vault.rel(path)}`).")
+    return drops, notices
+
+
+def command_current_filter(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    refs = [line.strip() for line in Path(args.selected).read_text(encoding="utf-8").splitlines() if line.strip()]
+    drops, notices = current_filter(vault, refs, now_from(args.now), args.window_days, args.min_uses)
+    for ref, label in drops:
+        print(f"drop\t{ref}\t{label}")
+    for line in notices:
+        print(f"notice\t{line}")
+    return 0
+
+
 # ---------------------------------------- #13 historical sufficiency (13 Nov)
 
 def historical_sufficiency(vault: Vault, refs: list[str], now: dt.datetime, task: str = "") -> list[dict[str, str]]:
@@ -2865,6 +2935,10 @@ def parser() -> argparse.ArgumentParser:
     st.set_defaults(func=command_speaker_turns)
     hs = base("history-states", command_history_states)
     hs.add_argument("--selected", required=True)
+    cfilter = base("current-filter", command_current_filter)
+    cfilter.add_argument("--selected", required=True)
+    cfilter.add_argument("--window-days", type=int, default=int(os.environ.get("LLM_BRAIN_CHANGE_NOTICE_DAYS", "30") or 30))
+    cfilter.add_argument("--min-uses", type=int, default=int(os.environ.get("LLM_BRAIN_CHANGE_NOTICE_MIN_USES", "1") or 1))
     smatch = base("superseded-match", command_superseded_match)
     smatch.add_argument("--review", required=True)
     hsuf = base("historical-sufficiency", command_historical_sufficiency)

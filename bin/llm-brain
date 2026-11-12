@@ -82,7 +82,66 @@ UPGRADE_PACKAGE_BACKUP=none
 UPGRADE_HOST=standalone
 UPGRADE_MARKETPLACE=none
 EVIDENCE_VIEW_VERSION="user-content-v1"
-CLAIM_PROJECTION_VERSION="claims-v2"
+CLAIM_PROJECTION_VERSION="claims-v3"
+# #3 (2 Nov): text the user quoted, forwarded or pasted (email quotes,
+# forwarded blocks, "Name:" lines, nested role-labelled chat, tool turns) is
+# reported speech.  It is split out before first-person extraction so another
+# person's preference is kept as "reported by SOURCE", never as the user's.
+# Prepended to the inline Python helpers that need it.
+REPORTED_SPEECH_PY="$(cat <<'PY'
+import re as _rs_re
+_RS_FORWARD = _rs_re.compile(r"^\s*(?:-{2,}\s*forwarded message\s*-{2,}|begin forwarded message:?|-{2,}\s*original message\s*-{2,}|fwd?:.*)\s*$", _rs_re.I)
+_RS_WROTE = _rs_re.compile(r"^\s*On\b.{0,160}?([A-Z][\w.'-]*(?:\s+[A-Z][\w.'-]*){0,2})\s*(?:<[^>]*>)?\s*wrote:\s*$")
+_RS_FROM = _rs_re.compile(r"^\s*From:\s*\"?([^<\"\n]+?)\"?\s*(?:<[^>]*>)?\s*$", _rs_re.I)
+_RS_SPEAKER = _rs_re.compile(r"^###\s+\d+\.\s+speaker:\s*([\w-]+)\s*$", _rs_re.I)
+_RS_ROLE = _rs_re.compile(r"^[ \t>]*(?:\(quoted\)\s*)?(?:\[(?:user|human|assistant|ai|system|developer|tool)\]|(?:user|human|assistant|ai|system|developer|tool))[ \t]*:", _rs_re.I)
+_RS_NAMED = _rs_re.compile(r"^[ \t>]*([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+)?)[ \t]*:[ \t]+(?=\S)")
+_RS_NOT_NAMES = {"note", "notes", "re", "subject", "from", "to", "date", "cc", "bcc", "todo", "update", "ps", "summary", "question", "answer", "edit", "reminder", "important"}
+
+def split_reported(text):
+    """(own_text, [(source, line)]): the user's own words vs reported speech."""
+    own, reported = [], []
+    forward_source = None
+    speaker_source = None
+    quote_source = "quoted text"
+    for line in (text or "").splitlines():
+        match = _RS_SPEAKER.match(line)
+        if match:
+            role = match.group(1).lower()
+            speaker_source = None if role == "user" else ("tool output" if role.startswith("tool") else role)
+            continue
+        if forward_source is None and _RS_FORWARD.match(line):
+            forward_source = "forwarded message"
+            continue
+        if forward_source is not None:
+            sender = _RS_FROM.match(line)
+            if sender and forward_source == "forwarded message":
+                forward_source = sender.group(1).strip()
+                continue
+            reported.append((forward_source, line))
+            continue
+        wrote = _RS_WROTE.match(line)
+        if wrote:
+            quote_source = wrote.group(1).strip()
+            continue
+        if speaker_source:
+            reported.append((speaker_source, line))
+            continue
+        if line.lstrip().startswith(">"):
+            reported.append((quote_source, line.lstrip("> \t")))
+            continue
+        role = _RS_ROLE.match(line)
+        if role:
+            reported.append(("quoted conversation", line[role.end():]))
+            continue
+        named = _RS_NAMED.match(line)
+        if named and named.group(1).lower() not in _RS_NOT_NAMES:
+            reported.append((named.group(1), line[named.end():]))
+            continue
+        own.append(line)
+    return "\n".join(own), reported
+PY
+)"
 EVIDENCE_INDEX_HEADER="$(printf 'path\thash\tview_version\tview_hash\tview_path\tmodel\tdimensions\tprincipal\tobserved_at\ttitle\tvector\tclaims_version')"
 EVIDENCE_LEXICAL_HEADER="$(printf 'path\tview_base64\tclaims_base64')"
 
@@ -443,7 +502,7 @@ bridge_claim_projection() {
   local view="$1" output="$2" py
   py="$(bridge_python)"
   [ -n "$py" ] && [ -x "$py" ] || return 69
-  "$py" - "$view" "$output" <<'PY'
+  { printf '%s\n' "$REPORTED_SPEECH_PY"; cat <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -451,6 +510,8 @@ from pathlib import Path
 view, output = sys.argv[1:]
 text = Path(view).read_text(encoding="utf-8")
 claims = []
+full_text = text
+text, reported = split_reported(full_text)
 
 def add(value):
     value = re.sub(r"\s+", " ", value).strip()
@@ -487,6 +548,17 @@ if first_person:
         if item and len(item.split()) <= 7:
             add(f"subject user relation preference value {item.lower()}")
 
+# Reported speech: bound to its source, never to the user.
+text = full_text
+by_source = {}
+for source, line in reported:
+    by_source.setdefault(source, []).append(line)
+for source, lines in by_source.items():
+    for item in re.findall(r"\b(?:prefer|prefers|like|likes|enjoy|enjoys|love|loves|play|plays|watch|watches|pick\s+up)\s+([A-Za-z][A-Za-z -]{1,40}?)(?=\s+(?:when|while|during|on|in|for|to)\b|[.,!?]|$)", "\n".join(lines), re.I | re.M):
+        item = item.strip()
+        if item and len(item.split()) <= 7:
+            add(f"subject reported-by {source} relation preference value {item.lower()}")
+
 for match in re.finditer(r"\b([A-Z][a-z]{2,})\b[^.?!\n]{0,80}\b(?:likes|enjoys|loves|prefers)\s+([^.,!?\n]{2,80})", text):
     subject, preference = match.groups()
     add(f"subject {subject} relation preference value {preference.lower()}")
@@ -495,8 +567,9 @@ for match in re.finditer(r"\b([A-Z][a-z]{2,})\b[^.?!\n]{0,100}\b(basketball|socc
     subject, item = match.groups()
     add(f"subject {subject} relation preference value {item.lower()}")
 
-Path(output).write_text("derived=claim-projection-v2\n" + "\n".join(claims) + ("\n" if claims else ""), encoding="utf-8")
+Path(output).write_text("derived=claim-projection-v3\n" + "\n".join(claims) + ("\n" if claims else ""), encoding="utf-8")
 PY
+  } | "$py" - "$view" "$output"
 }
 
 bridge_evidence_artifacts() {
@@ -766,7 +839,7 @@ bridge_rerank_evidence() {
   local dir="$1" query="$2" mode="$3" sources_meta="$4" final="$5" output="$6" py
   py="$(bridge_python)"
   [ -n "$py" ] && [ -x "$py" ] || die 69 "Python 3 is unavailable for evidence reranking"
-  "$py" - "$dir" "$query" "$mode" "$sources_meta" "$final" "$output" <<'PY'
+  { printf '%s\n' "$REPORTED_SPEECH_PY"; cat <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -804,7 +877,7 @@ def user_text(path, view):
 
 def claim_text(path):
     source_hash = path.rsplit("/", 1)[-1].split("-", 1)[0]
-    candidate = root / "indexes" / "evidence-claims" / f"{source_hash}-claims-v2.txt"
+    candidate = root / "indexes" / "evidence-claims" / f"{source_hash}-claims-v3.txt"
     try:
         return candidate.read_text(encoding="utf-8")
     except OSError:
@@ -893,7 +966,10 @@ for order, line in enumerate(Path(final_path).read_text(encoding="utf-8").splitl
     third_party = bool(re.search(r"\b(friend|colleague|neighbou?r|jackson|maya|he|she|they)\b", lower))
     if condition_query and re.search(r"\b(child|son|daughter|children)\b", lower):
         third_party = True
-    first_person = bool(re.search(r"\b(i|i'm|i am|my|me|mine|we|our)\b", lower)) and not third_party
+    # #3: first person counts only in the user's own words, not in text
+    # they quoted, forwarded or pasted.
+    own_text, _reported = split_reported(text)
+    first_person = bool(re.search(r"\b(i|i'm|i am|my|me|mine|we|our)\b", (own_text + "\n" + claims).lower())) and not third_party
     condition = bool(re.search(r"\b(when|while|during|after|before|on|for)\b", lower))
     topic_score = sum(bool(re.search(pattern, lower)) for pattern in topic_patterns)
     focus_score = sum(bool(re.search(pattern, lower)) for pattern in focus_patterns)
@@ -1005,6 +1081,7 @@ if mode == "dynamic" and prefix_count:
 
 Path(output_path).write_text("".join(f"{row['path']}\t{row['score']:.12f}\t{row['observed']}\t{row['title']}\n" for row in selected), encoding="utf-8")
 PY
+  } | "$py" - "$dir" "$query" "$mode" "$sources_meta" "$final" "$output"
 }
 
 bridge_lexical_scores() {
@@ -5744,8 +5821,17 @@ graph_target_matches() {
   [ "$target" = "$rel" ] || [ "$target" = "$rel.md" ] || [ "$target" = "$basename" ] || [ "$target" = "$title" ]
 }
 
+# A reference field holds one ref or a flow list (["a", "b"]); one per line.
+ref_value_items() {
+  local value="$1"
+  case "$value" in
+    \[*) value="${value#[}"; value="${value%]}"; printf '%s\n' "$value" | tr ',' '\n' | sed -E 's/^[[:space:]]*["'"'"']?//; s/["'"'"']?[[:space:]]*$//' | awk 'NF' ;;
+    *) [ -z "$value" ] || printf '%s\n' "$value" ;;
+  esac
+}
+
 file_superseded_by_current_memory() {
-  local dir="$1" target_file="$2" candidate supersedes
+  local dir="$1" target_file="$2" candidate supersedes supersedes_item
   if [ -n "$SEARCH_SUPERSESSION_MAP" ] && [ -f "$SEARCH_SUPERSESSION_MAP" ]; then
     local target_rel target_base target_title
     [ -s "$SEARCH_SUPERSESSION_MAP" ] || return 1
@@ -5760,7 +5846,10 @@ file_superseded_by_current_memory() {
     canonical_file_effective "$dir" "$candidate" || continue
     supersedes="$(frontmatter_field "$candidate" brain_supersedes)"
     [ -n "$supersedes" ] || continue
-    graph_target_matches "$dir" "$target_file" "$supersedes" && return 0
+    # #2: a list value (["okf/claims/a.md"]) names each superseded record.
+    while IFS= read -r supersedes_item; do
+      graph_target_matches "$dir" "$target_file" "$supersedes_item" && return 0
+    done < <(ref_value_items "$supersedes")
   done < <(canonical_files "$dir")
   return 1
 }
@@ -5773,7 +5862,7 @@ build_supersession_map() {
     fm_get supersedes "$file" brain_supersedes
     [ -n "$supersedes" ] || continue
     rel="${file#"$dir"/}"
-    printf '%s\t%s\n' "$supersedes" "$rel" >>"$map"
+    ref_value_items "$supersedes" | while IFS= read -r supersedes; do printf '%s\t%s\n' "$supersedes" "$rel"; done >>"$map"
   done < <(canonical_files "$dir")
 }
 
@@ -7850,7 +7939,7 @@ cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   if [ "$action" = judge ]; then pack_judge "$project_id" "$@"; return; fi
   [ "$action" = "build" ] || die 64 "pack requires build or judge"
-  local history_file="" history_hash="" history_line="" sufficiency_file="" historical_sufficiency="none" hidden_future=0
+  local current_file="" current_hash="" superseded_omitted=0 history_file="" history_hash="" history_line="" sufficiency_file="" historical_sufficiency="none" hidden_future=0
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
@@ -8041,6 +8130,25 @@ cmd_pack() {
     fi
     rm -f "${history_file}.in"
   fi
+  # #2 (2 Nov): a current pack shows only current versions.  An older value
+  # of a state key (or any replaced version search let through) is dropped;
+  # it stays available with --historical / --as-of.  A well-used record that
+  # changed recently gets a one-line "changed on DATE: was X, now Y" notice.
+  if [ "$historical" != 1 ] && [ -z "$as_of" ] && [ -n "$render_order" ] && [ "${LLM_BRAIN_PACK_CURRENT_ONLY:-1}" = 1 ]; then
+    current_file="$(mktemp "$dir/context-packs/.current.XXXXXX")"
+    printf '%s\n' "$render_order" >"${current_file}.in"
+    local -a current_args=(current-filter --project-dir "$dir" --selected "${current_file}.in")
+    [ -z "$principal" ] || current_args+=(--principal "$principal")
+    memory_lineage "${current_args[@]}" >"$current_file" 2>/dev/null || : >"$current_file"
+    rm -f "${current_file}.in"
+    if [ -s "$current_file" ]; then
+      superseded_omitted="$(awk -F '\t' '$1 == "drop"' "$current_file" | wc -l | tr -d ' ')"
+      if [ "$superseded_omitted" -gt 0 ]; then
+        render_order="$(printf '%s\n' "$render_order" | awk -F '\t' 'NR == FNR { if ($1 == "drop") gone[$2] = 1; next } !($1 in gone)' "$current_file" -)"
+      fi
+      current_hash="$(sha256_file "$current_file")"
+    fi
+  fi
   if [ "$intent" = current_state ]; then
     awk -F '\t' 'NR > 1 && $4 != "current" { print $9 "\t" $1 "\t" $4 ":" $16 }' "$results" >"$warnings"
   fi
@@ -8057,17 +8165,18 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
     printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_intentions_due: %s\nbrain_historical_sufficiency: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$intentions_due" "$historical_sufficiency" "$SCHEMA_VERSION"
     [ -z "$freshness_hash" ] || printf 'brain_index_audit_seq: %s\nbrain_unindexed_captures: %s\n' "$index_seq" "$unindexed_captures"
+    [ "$superseded_omitted" = 0 ] || printf 'brain_superseded_omitted: %s\n' "$superseded_omitted"
     [ "$scope_hidden_count" = 0 ] || printf 'brain_applies_when_hidden: %s\n' "$scope_hidden_count"
     [ "$action_risk" != high ] || printf 'brain_action_risk: high\n'
     printf '%s\n\n' '---'
@@ -8123,6 +8232,12 @@ cmd_pack() {
         printf '%s — `%s` (%s)\n' "$warning_title" "$warning_path" "$warning_state"
       done <"$warnings"
       printf '\n'
+    fi
+    if [ -n "$current_file" ] && awk -F '\t' '$1 == "notice" { f=1 } END { exit !f }' "$current_file"; then
+      printf '## Changed recently\n\n'
+      awk -F '\t' '$1 == "notice" { print "- " $2 }' "$current_file"
+      printf '\n'
+      bytes=$((bytes + $(awk -F '\t' '$1 == "notice"' "$current_file" | wc -c | tr -d ' ')))
     fi
     if [ -n "$sufficiency_file" ] && { [ -s "$sufficiency_file" ] || [ "$hidden_future" -gt 0 ]; }; then
       printf '## Historical Sufficiency — as of %s\n\n' "$as_of"
@@ -8220,7 +8335,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

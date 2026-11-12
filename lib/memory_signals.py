@@ -957,6 +957,22 @@ def _basename_md(rel: bytes) -> bytes:
     return name
 
 
+def _ref_items(value: bytes) -> list[bytes]:
+    if not value:
+        return []
+    if value.startswith(b"["):
+        inner = value[1:]
+        if inner.endswith(b"]"):
+            inner = inner[:-1]
+        items = []
+        for part in inner.split(b","):
+            part = part.strip().strip(b"\"'").strip()
+            if part:
+                items.append(part)
+        return items
+    return [value]
+
+
 def _eligible(project: bytes, record: _Record, valid: bool, options: dict[str, Any], supersession: list[bytes]) -> bool:
     if not valid or _retracted(project, record.path):
         return False
@@ -1367,9 +1383,11 @@ def command_search_prepare(args: argparse.Namespace) -> int:
                 rel = path[len(prefix):] if path.startswith(prefix) else path
                 signature.append(rel + b"\t" + hashlib.sha256(raw).hexdigest().encode("ascii"))
                 supersedes = record.field(b"brain_supersedes")
-                if supersedes:
-                    supersession_lines.append(supersedes + b"\t" + rel)
-                    supersession.append(supersedes)
+                # #2: a flow list (["okf/claims/a.md"]) names each superseded
+                # record; mirrors ref_value_items in the CLI.
+                for item in _ref_items(supersedes):
+                    supersession_lines.append(item + b"\t" + rel)
+                    supersession.append(item)
     except (OSError, _Unsure):
         return 3
     verdicts: list[bytes] = []

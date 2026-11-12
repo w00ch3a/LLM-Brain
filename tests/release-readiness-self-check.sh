@@ -117,6 +117,8 @@ core_checks() {
     bash "$repo_root/tests/memory-credit-merge-self-check.sh" -- \
     bash "$repo_root/tests/pack-point-of-use-self-check.sh" -- \
     bash "$repo_root/tests/superseded-repromote-self-check.sh" -- \
+    bash "$repo_root/tests/current-pack-superseded-self-check.sh" -- \
+    bash "$repo_root/tests/reported-preference-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 
