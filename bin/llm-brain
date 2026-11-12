@@ -7040,7 +7040,7 @@ cmd_search() {
   local usage_boost="${LLM_BRAIN_USAGE_BOOST:-0}" diversity_reserve="${LLM_BRAIN_DIVERSITY_RESERVE:-2}" diversity_reserved=0 path_matched=0 lexical_scorer="${LLM_BRAIN_LEXICAL_SCORER:-bm25f}"
   local -a path_hints=() with_labels=() without_labels=()
   local lexical_profile="${LLM_BRAIN_LEXICAL_PROFILE:-v2}"
-  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.2}" fusion="${LLM_BRAIN_FUSION:-zscore}" fusion_alpha="${LLM_BRAIN_FUSION_ALPHA:-0.4}" vector_gate_skip=0 lexical_margin=""
+  local recency_boost="${LLM_BRAIN_RECENCY_BOOST:-0}" matched_count=0 label_filtered=0 vector_weight="${LLM_BRAIN_VECTOR_WEIGHT:-1}" vector_gate="${LLM_BRAIN_VECTOR_GATE:-0.2}" fusion="${LLM_BRAIN_FUSION:-zscore}" fusion_alpha="${LLM_BRAIN_FUSION_ALPHA:-0.4}" vector_gate_skip=0 lexical_margin=""
   local dir file rel score term title state sensitivity docs_state graph_state vectors_state manifest_hash graph_file="" vector_index="" index_generation="" rebuild_state_file=""
   local tmp_dir lexical_raw lexical_rank semantic_raw semantic_rank union base_records graph_records final_ranked seen_titles selected_evidence selected_paths independence_map lifecycle_bundle_roots_file lifecycle_bundle_json_file
   local semantic_ok=0 degraded=0 graph_candidate_count=0 mode="lexical" query_input query_vector query_model query_dimensions vector_model vector_dimensions
@@ -7396,6 +7396,7 @@ cmd_search() {
       rm -f "$final_ranked.labels"; degraded=1
     fi
   fi
+  matched_count="$(wc -l <"$final_ranked" | tr -d ' ')"
   head -n "$limit" "$final_ranked" | cut -f1 >"$selected_paths"
   lifecycle_bundle_record_count=0
   if [ "$intent" = current_state ] || [ "$intent" = evidence ]; then
@@ -7553,6 +7554,7 @@ cmd_search() {
       [ -z "$lexical_margin" ] || printf 'lexical_margin=%s\n' "$lexical_margin" >>"$metadata_file"
     fi
     { [ "${#with_labels[@]}" -eq 0 ] && [ "${#without_labels[@]}" -eq 0 ]; } || printf 'label_filtered_count=%s\n' "$label_filtered" >>"$metadata_file"
+    printf 'matched_count=%s\n' "$matched_count" >>"$metadata_file"
     if [ ! -s "$selected_paths" ]; then
       # Named-gate abstention: say which gate refused instead of a bare miss.
       memory_lineage gates --project-dir "$dir" --principal "$principal" --query "$query" --metadata >>"$metadata_file" 2>/dev/null || printf 'abstain_gate=unknown\n' >>"$metadata_file"
@@ -7943,7 +7945,7 @@ cmd_pack() {
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
-  local record_sources=0 record_voices=0
+  local record_sources=0 record_voices=0 records_rendered=0 state_skipped=0
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local pack_host="" pack_task_type="${LLM_BRAIN_TASK_TYPE:-}" scope_hidden="" scope_hidden_count=0 index_seq="" unindexed_captures=0 freshness_hash=""
@@ -8271,6 +8273,7 @@ cmd_pack() {
       lifecycle_bundle="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 21 ? $22 : ""); exit }' "$results")"
       if [ "$intent" = "current_state" ] && [ "$state" != "current" ]; then
         state_reason="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 15 ? $16 : "unresolved"); exit }' "$results")"
+        state_skipped=$((state_skipped + 1))
         continue
       fi
       excerpt="$(body_after_frontmatter "$source" | head -c 800)"
@@ -8303,6 +8306,7 @@ cmd_pack() {
       fi
       bytes=$((bytes + evidence_bytes))
       rendered_refs="${rendered_refs}${rendered_refs:+,}${rel}"
+      records_rendered=$((records_rendered + 1))
     done <<<"$render_order"
     if [ "$require_evidence" = "1" ] && [ "$evidence_refs" != "none" ]; then
       printf '## Supporting Evidence\n\n'
@@ -8325,6 +8329,13 @@ cmd_pack() {
     [ "$evidence_refs" = none ] || [ "$evidence_opened" = true ] || evidence_incomplete=true
     [ "$context_truncated" != true ] || printf 'Context truncated: the budget omitted selected or supporting material.\n\n'
     [ "$evidence_incomplete" != true ] || printf 'Evidence incomplete: missing, hidden, changed, unverified or budget-omitted custody is not evidence of absence.\n\n'
+    # #5 (2 Nov): say what was left out, so the agent knows when to ask.
+    local footer_matched footer_labels footer_lower footer_scope
+    footer_matched="$(awk -F= '$1 == "matched_count" { print $2; exit }' "$metadata")"; case "$footer_matched" in ''|*[!0-9]*) footer_matched="$(printf '%s\n' "$selected" | awk 'NF' | wc -l | tr -d ' ')" ;; esac
+    footer_labels="$(awk -F= '$1 == "label_filtered_count" { print $2; exit }' "$metadata")"; case "$footer_labels" in ''|*[!0-9]*) footer_labels=0 ;; esac
+    footer_lower=$((footer_matched - records_rendered - superseded_omitted - hidden_future - state_skipped)); [ "$footer_lower" -ge 0 ] || footer_lower=0
+    footer_scope=$((scope_hidden_count + footer_labels + superseded_omitted + hidden_future + state_skipped))
+    printf 'Returned %s of %s matching records, about %s tokens; %s lower-ranked and %s out of scope omitted.%s\n\n' "$records_rendered" "$((footer_matched + scope_hidden_count + footer_labels))" "$(( (bytes + 3) / 4 ))" "$footer_lower" "$footer_scope" "$([ "$footer_lower" = 0 ] || printf ' Ask for more with a larger --budget-tokens or a narrower task.')"
     printf 'Actual bytes: %s\n' "$bytes"
   } >"${pack}.tmp.$$"
   mv "${pack}.tmp.$$" "$pack"
