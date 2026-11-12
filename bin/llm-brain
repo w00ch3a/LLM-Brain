@@ -7943,6 +7943,7 @@ cmd_pack() {
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
+  local record_sources=0 record_voices=0
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local pack_host="" pack_task_type="${LLM_BRAIN_TASK_TYPE:-}" scope_hidden="" scope_hidden_count=0 index_seq="" unindexed_captures=0 freshness_hash=""
@@ -8261,8 +8262,11 @@ cmd_pack() {
       local source="$dir/$rel" excerpt facts type title status trust freshness generated_at stale_after source_count runtime
       state="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print $4; exit }' "$results")"
       evidence_group="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 17 ? $18 : "unknown"); exit }' "$results")"; [ -n "$evidence_group" ] || evidence_group=unknown
-      independent_roots="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 18 ? $19 : "0"); exit }' "$results")"; [ -n "$independent_roots" ] || independent_roots=0
-      correlated_records="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 19 ? $20 : "0"); exit }' "$results")"; [ -n "$correlated_records" ] || correlated_records=0
+      # #4 (2 Nov): per record, not per pack.  Independent sources are this
+      # record's distinct evidence roots; correlated records are the other
+      # selected records that share one of them (the same origin repeated).
+      independent_roots="$(awk -v g="$evidence_group" 'BEGIN { n=split(g, r, ","); c=0; for (i=1; i<=n; i++) if (r[i] != "" && r[i] != "unknown" && !(r[i] in s)) { s[r[i]]=1; c++ } print c }')"
+      correlated_records="$(awk -F '\t' -v path="$rel" -v g="$evidence_group" 'BEGIN { n=split(g, r, ","); for (i=1; i<=n; i++) if (r[i] != "" && r[i] != "unknown") mine[r[i]]=1 } NR > 1 && $1 != path && NF > 17 { m=split($18, o, ","); for (j=1; j<=m; j++) if (o[j] in mine) { c++; break } } END { print c + 0 }' "$results")"
       provenance_state="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 20 ? $21 : "unknown"); exit }' "$results")"; [ -n "$provenance_state" ] || provenance_state=unknown
       lifecycle_bundle="$(awk -F '\t' -v path="$rel" 'NR > 1 && $1 == path { print (NF > 21 ? $22 : ""); exit }' "$results")"
       if [ "$intent" = "current_state" ] && [ "$state" != "current" ]; then
@@ -8282,11 +8286,18 @@ cmd_pack() {
         [ -z "$history_line" ] || printf 'Resolver: %s\n\n' "$history_line"
       fi
       printf 'Evidence group: <code>%s</code>  \nIndependent roots: <code>%s</code>  \nCorrelated records: <code>%s</code>  \nProvenance: <code>%s</code>\n\n' "$evidence_group" "$independent_roots" "$correlated_records" "$provenance_state"
+      if [ "$action_risk" = high ] || [ "${LLM_BRAIN_PACK_SOURCE_COUNT:-0}" = 1 ]; then
+        IFS=$'\t' read -r record_sources record_voices <<<"$(memory_signals independent-sources --file "$source" 2>/dev/null || printf '0\t0\n')"
+        case "$record_sources" in ''|*[!0-9]*) record_sources=0 ;; esac
+        case "$independent_roots" in ''|*[!0-9]*) ;; *) [ "$independent_roots" -le "$record_sources" ] || record_sources="$independent_roots" ;; esac
+        printf 'Independent sources: <code>%s</code>%s\n\n' "$record_sources" "$([ "${record_voices:-0}" -le 1 ] || printf ' (%s agent/session mentions count as one)' "$record_voices")"
+      fi
       if [ "$action_risk" = high ]; then
         risk_reasons=""
         case "$freshness" in stale|invalid) risk_reasons="$freshness" ;; esac
-        case "$source_count" in ''|*[!0-9]*) risk_sources=0 ;; *) risk_sources="$source_count" ;; esac
-        case "$independent_roots" in ''|*[!0-9]*) ;; *) [ "$independent_roots" -le "$risk_sources" ] || risk_sources="$independent_roots" ;; esac
+        # Independent original sources, not the length of `sources:` (five
+        # sessions repeating one claim are one source).
+        risk_sources="$record_sources"
         [ "$risk_sources" -gt 1 ] || risk_reasons="${risk_reasons}${risk_reasons:+, }single-source"
         [ -z "$risk_reasons" ] || printf 'Action risk: <code>re-verify before acting</code> (%s)\n\n' "$risk_reasons"
       fi

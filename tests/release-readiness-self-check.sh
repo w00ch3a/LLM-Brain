@@ -119,6 +119,7 @@ core_checks() {
     bash "$repo_root/tests/superseded-repromote-self-check.sh" -- \
     bash "$repo_root/tests/current-pack-superseded-self-check.sh" -- \
     bash "$repo_root/tests/reported-preference-self-check.sh" -- \
+    bash "$repo_root/tests/independent-sources-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

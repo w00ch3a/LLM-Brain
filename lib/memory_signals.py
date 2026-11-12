@@ -1685,6 +1685,39 @@ def command_pack_judge(args: argparse.Namespace) -> int:
     return 0
 
 
+# #4 (2 Nov): count independent original sources, not voices.  Mentions by
+# agents, sessions, episodes or chat turns are one conversation, however many
+# of them repeat the claim; the same document cited twice is one source.
+VOICE_RE = re.compile(r"^(?:episode|session|agent|hermes|codex|claude|chat|conversation|bot|assistant|turn|subagent)s?(?::|://|/|$)", re.I)
+
+
+def independent_sources(metadata: dict[str, Any]) -> tuple[int, int]:
+    """(independent original sources, voice mentions) for one record."""
+    resources: set[str] = set()
+    voices = 0
+    raw = metadata.get("sources")
+    items = raw if isinstance(raw, list) else []
+    values = [item.get("resource") if isinstance(item, dict) else item for item in items]
+    values.append(metadata.get("brain_source_ref"))
+    for value in values:
+        text = clean(value).strip().lower().rstrip("/")
+        if not text:
+            continue
+        text = text.split("#", 1)[0]
+        if VOICE_RE.match(text):
+            voices += 1
+            continue
+        resources.add(text)
+    return len(resources) + (1 if voices else 0), voices
+
+
+def command_independent_sources(args: argparse.Namespace) -> int:
+    metadata, _ = okf.split_frontmatter(Path(args.file))
+    count, voices = independent_sources(metadata)
+    print(f"{count}\t{voices}")
+    return 0
+
+
 def preservation_screen(vault: Vault, merged_text: str, targets: list[Path], extra: list[str]) -> list[tuple[str, list[str]]]:
     """For each original, the answer-bearing tokens the merged text lost."""
     low = (merged_text or "").lower()
@@ -3159,6 +3192,10 @@ def parser() -> argparse.ArgumentParser:
     attribute = base("feedback-attribute", command_feedback_attribute)
     attribute.add_argument("--pack", required=True)
     attribute.add_argument("--answer", required=True)
+
+    indep = commands.add_parser("independent-sources")
+    indep.add_argument("--file", required=True)
+    indep.set_defaults(func=command_independent_sources)
 
     judge = base("pack-judge", command_pack_judge)
     judge.add_argument("--pack", default="")
