@@ -105,6 +105,7 @@ Commands:
   decide-serve [bundled|MODEL_SPEC] [--port N]   Memthena System One on localhost for Hermes (opt-in; kind/triage advisory)
   models status | models install system-one-32m [--archive FILE [--sha256 HEX]] | models remove system-one-32m   optional 32m System One (per machine)
                                               --overrule-belief lets one source replace a better-supported fact
+                                              --accept-merge-loss promotes a merge/compression that drops answer-bearing content
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
                                               Tiered backlog clean-up; dry-run prints counts only
@@ -166,7 +167,7 @@ Commands:
   association propose PROJECT_ID [--min-count N] [--write-review]
   association retract PROJECT_ID ASSOCIATION_ID --reason TEXT
   association status PROJECT_ID
-  feedback record PROJECT_ID --pack REF --usefulness useful|not-useful|partial [--principal ID] [--notes TEXT]
+  feedback record PROJECT_ID --pack REF --usefulness useful|not-useful|partial [--principal ID] [--notes TEXT] [--used REF]... [--answer FILE]   --used/--answer credit only the records that supported the answer
   feedback status PROJECT_ID
   experiment status PROJECT_ID
   experiment record PROJECT_ID NAME --status negative|blocked|enabled --reason TEXT [--evidence REF]
@@ -3213,6 +3214,22 @@ promote_review_locked() {
       return 3
     fi
   fi
+  # #14/#15 preservation screen: a consolidation merge (brain_merge_of, or
+  # brain_supersedes naming two or more records) or a compression
+  # (brain_compressed_from) is held unless the new text still carries the
+  # answer-bearing content of every original.  Originals are never edited.
+  if [ ! -f "$dest" ] && [ "${MERGE_ACCEPT_LOSS:-0}" != 1 ]; then
+    local merge_verdict merge_detail
+    IFS=$'\t' read -r merge_verdict merge_detail <<<"$(memory_signals merge-screen --project-dir "$dir" --review "$review" 2>/dev/null || printf 'ok\tscreen-unavailable\n')"
+    if [ "$merge_verdict" = hold ]; then
+      set_frontmatter_field "$review" brain_review_state needs-validation
+      set_frontmatter_field "$review" brain_review_reason merge-preservation-failed
+      set_frontmatter_field "$review" brain_merge_missing "$merge_detail"
+      audit_v2 "$dir" "merge-hold" "$review_id" "$state" needs-validation "$(sha256_file "$review")" "missing=$(slug "$merge_detail" | cut -c1-120)"
+      printf 'promotion=held review_id=%s reason=merge-preservation missing=%s\n' "$review_id" "$merge_detail"
+      return 3
+    fi
+  fi
   if [ -f "$dest" ]; then
     if grep -Fq "review://$review_id" "$dest"; then printf 'promotion=idempotent review_id=%s canonical=%s\n' "$review_id" "$dest"; return 0; fi
     local conflict
@@ -3266,7 +3283,7 @@ promote_review_locked() {
     printf 'brain_provider_id: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")"
     printf 'brain_provider_version: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")"
     printf 'brain_candidate_hash_sha256: %s\n' "$(sha256_file "$review")"
-    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_conflicts brain_supports brain_contrasts brain_required_bindings brain_applicability brain_applies_when brain_prerequisites brain_verification; do
+    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_merge_of brain_compressed_from brain_conflicts brain_supports brain_contrasts brain_required_bindings brain_applicability brain_applies_when brain_prerequisites brain_verification; do
       field_value="$(frontmatter_field "$review" "$field")"
       [ -z "$field_value" ] || printf '%s: %s\n' "$field" "$(yaml_quote "$field_value")"
     done
@@ -4578,10 +4595,13 @@ cmd_association() {
 
 feedback_record() {
   local project_id="$1" pack_ref="" usefulness="" principal="" notes="" dir pack pack_hash feedback_id feedback_file
+  local answer_file="" used_given=0 used_refs="" used_line="" used_ref attributed
   shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
       --pack) pack_ref="${2:-}"; shift 2 ;;
+      --used) used_given=1; used_refs="${used_refs}${2:-}"$'\n'; shift 2 ;;
+      --answer) answer_file="${2:-}"; used_given=1; shift 2 ;;
       --usefulness) usefulness="${2:-}"; shift 2 ;;
       --principal) principal="${2:-}"; shift 2 ;;
       --notes) notes="${2:-}"; shift 2 ;;
@@ -4597,13 +4617,37 @@ feedback_record() {
   require_project "$project_id" dir
   pack="$dir/$pack_ref"; [ -f "$pack" ] || die 66 "pack missing: $pack_ref"
   pack_hash="$(sha256_file "$pack")"
-  feedback_id="feedback_$(sha256_text "$project_id|$pack_ref|$pack_hash|$usefulness|$principal|$notes" | cut -c1-16)"
+  if [ "$used_given" = 1 ]; then
+    # #14 credit after use: name the records that supported the answer
+    # (--used), or let the answer text decide (--answer FILE).  Only those
+    # get the useful credit; the rest of the pack gets none.
+    if [ -n "$answer_file" ]; then
+      [ -f "$answer_file" ] || die 66 "answer file missing: $answer_file"
+      local -a attribute_args=(feedback-attribute --project-dir "$dir" --pack "$pack_ref" --answer "$answer_file")
+      [ -z "$principal" ] || attribute_args+=(--principal "$principal")
+      attributed="$(memory_signals "${attribute_args[@]}")" || die 70 "feedback attribution failed"
+      [ -z "$attributed" ] || used_refs="${used_refs}${attributed}"$'\n'
+    fi
+    used_line="["
+    while IFS= read -r used_ref; do
+      [ -n "$used_ref" ] || continue
+      case "$used_ref" in okf/*) ;; *) die 65 "feedback --used must be an okf/ record reference" ;; esac
+      case "$used_ref" in *..*|*'"'*|*$'\r'*) die 65 "feedback --used reference is invalid" ;; esac
+      grep -Fq "Expansion: <code>$used_ref</code>" "$pack" || die 65 "feedback --used $used_ref was not in the pack"
+      case "$used_line" in *"\"$used_ref\""*) continue ;; esac
+      [ "$used_line" = "[" ] || used_line="$used_line, "
+      used_line="$used_line\"$used_ref\""
+    done <<<"$used_refs"
+    used_line="$used_line]"
+  fi
+  feedback_id="feedback_$(sha256_text "$project_id|$pack_ref|$pack_hash|$usefulness|$principal|$notes${used_line:+|used:$used_line}" | cut -c1-16)"
   feedback_file="$dir/feedback/$feedback_id.md"
   acquire_lock "project-$project_id"
   if [ ! -f "$feedback_file" ]; then
     {
       printf '%s\n' '---'
       printf 'type: RetrievalFeedback\ntitle: %s\nbrain_project_id: %s\nbrain_feedback_id: %s\nbrain_pack_ref: %s\nbrain_pack_hash_sha256: %s\nbrain_usefulness: %s\nbrain_principal: %s\nbrain_notes: %s\nbrain_artifact_state: derived\nbrain_recorded_at: %s\nbrain_schema_version: %s\n' "$(yaml_quote "Feedback $pack_ref")" "$project_id" "$feedback_id" "$(yaml_quote "$pack_ref")" "$pack_hash" "$usefulness" "$(yaml_quote "${principal:-none}")" "$(yaml_quote "${notes:-none}")" "$(yaml_quote "$(now_utc)")" "$SCHEMA_VERSION"
+      [ -z "$used_line" ] || printf 'brain_used_refs: %s\n' "$used_line"
       printf '%s\n' '---'
       printf '# Retrieval feedback\n\nPack: `%s`  \nPack hash: `%s`  \nUsefulness: `%s`  \nPrincipal: `%s`\n\n%s\n' "$pack_ref" "$pack_hash" "$usefulness" "${principal:-none}" "${notes:-No notes recorded.}"
     } >"${feedback_file}.tmp.$$"
@@ -4611,7 +4655,7 @@ feedback_record() {
     audit_v2 "$dir" "retrieval-feedback" "$feedback_id" "" "$usefulness" "$(sha256_file "$feedback_file")" "pack=$(slug "$pack_ref")"
   fi
   release_lock
-  printf 'feedback=ok project_id=%s feedback_id=%s file=%s usefulness=%s\n' "$project_id" "$feedback_id" "$feedback_file" "$usefulness"
+  printf 'feedback=ok project_id=%s feedback_id=%s file=%s usefulness=%s%s\n' "$project_id" "$feedback_id" "$feedback_file" "$usefulness" "${used_line:+ used=$used_line}"
 }
 
 cmd_feedback() {
@@ -4910,7 +4954,7 @@ cmd_review() {
     decide)
       local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       case "$state" in proposed|needs-validation|approved|rejected|superseded) ;; *) die 64 "invalid review state" ;; esac
       local dir file old
@@ -4954,9 +4998,11 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
         fi
+        [ "${MERGE_ACCEPT_LOSS:-0}" != 1 ] || audit_v2 "$dir" "merge-loss-accepted" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         [ "${BELIEF_OVERRULE:-0}" != 1 ] || audit_v2 "$dir" "belief-overrule" "$id" "$old" approved "$(sha256_file "$file")" "reason=$(slug "$reason")"
         if promote_review_locked "$project_id" "$id" "$actor" "$reason"; then :; else promotion_status=$?; fi
         release_lock
+        [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != merge-preservation-failed ] || die 75 "review $id held: the merged text loses answer-bearing content of an original ($(frontmatter_field "$file" brain_merge_missing)); add it, or use --accept-merge-loss"
         [ "$promotion_status" != 3 ] || die 75 "review $id held: it contradicts a better-supported fact (see the belief_ conflict review); add corroborating sources or use --overrule-belief"
         return "$promotion_status"
       fi

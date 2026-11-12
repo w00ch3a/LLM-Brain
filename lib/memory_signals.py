@@ -1509,7 +1509,7 @@ def feedback_rows(vault: Vault) -> list[tuple[str, str, list[str], dt.datetime |
 
 def usage_table(vault: Vault) -> tuple[dict[str, dict[str, Any]], int]:
     table: dict[str, dict[str, Any]] = defaultdict(lambda: {
-        "uses": 0, "rendered": 0, "useful": 0, "partial": 0, "not_useful": 0, "last_used": None,
+        "uses": 0, "rendered": 0, "useful": 0, "partial": 0, "not_useful": 0, "supported": 0, "last_used": None,
     })
     receipts = read_receipts(vault.root)
     for receipt in receipts:
@@ -1526,16 +1526,129 @@ def usage_table(vault: Vault) -> tuple[dict[str, dict[str, Any]], int]:
         for ref in sorted(set(rendered)):
             if ref.startswith("okf/"):
                 table[ref]["rendered"] += 1
-    for _, usefulness, refs, when in feedback_rows(vault):
+    used_by_feedback = feedback_used_refs(vault)
+    for name, usefulness, refs, when in feedback_rows(vault):
         key = {"useful": "useful", "partial": "partial", "not-useful": "not_useful"}.get(usefulness)
         if not key:
             continue
+        used = used_by_feedback.get(name)
+        if used is not None and key != "not_useful":
+            # #14 credit after use: a useful pack credits only the records that
+            # actually supported the answer, not everything that was rendered.
+            for ref in refs:
+                if ref in used:
+                    table[ref]["supported"] += 1
+            refs = [ref for ref in refs if ref in used]
         for ref in refs:
             entry = table[ref]
             entry[key] += 1
             if when and (entry["last_used"] is None or when > entry["last_used"]):
                 entry["last_used"] = when
     return table, len(receipts)
+
+
+def feedback_used_refs(vault: Vault) -> dict[str, set[str]]:
+    """Feedback file name -> refs recorded as having supported the answer.
+    Feedback written before #14 (no ``brain_used_refs``) is absent."""
+    out: dict[str, set[str]] = {}
+    for path, metadata, _ in vault.frontmatter_dir("feedback"):
+        if metadata.get("type") != "RetrievalFeedback" or "brain_used_refs" not in metadata:
+            continue
+        out[path.name] = set(ref_list(metadata.get("brain_used_refs")))
+    return out
+
+
+# #14/#15: answer-bearing content -- the tokens a later question is most
+# likely to need verbatim: numbers, dates, versions, code spans, identifiers
+# and proper names.  Used for attribution after use and for merge screens.
+ANSWER_TOKEN_RE = re.compile(r"`([^`\n]{1,80})`|(?<![\w.])(\d[\d.,:/%-]*\d%?|\d%?)(?![\w])|\b([A-Za-z][\w-]*\d[\w.-]*|[a-z]+[_./][\w./-]+)\b|(?<=[a-z,;:] )([A-Z][a-zA-Z]{2,})\b")
+
+
+def answer_tokens(text: str) -> list[str]:
+    seen: list[str] = []
+    for match in ANSWER_TOKEN_RE.finditer(text or ""):
+        token = next(group for group in match.groups() if group)
+        token = token.strip().rstrip(".,;:")
+        if token and token.lower() not in (t.lower() for t in seen):
+            seen.append(token)
+    return seen
+
+
+def _content_terms(text: str) -> list[str]:
+    out: list[str] = []
+    for token in re.findall(r"[a-z][a-z0-9]+", (text or "").lower()):
+        if len(token) > 4 and token not in out:
+            out.append(token)
+    return out
+
+
+def supported_answer(record_text: str, answer: str) -> bool:
+    """Did this record's content make it into the answer?  At least half of
+    its answer-bearing tokens (or, without any, of its longer content words)."""
+    low = (answer or "").lower()
+    tokens = answer_tokens(record_text)
+    if tokens:
+        hits = sum(1 for token in tokens if token.lower() in low)
+        return hits >= max(1, math.ceil(len(tokens) / 2))
+    terms = sorted(_content_terms(record_text), key=len, reverse=True)[:8]
+    words = set(re.findall(r"[a-z][a-z0-9]+", low))
+    return bool(terms) and sum(1 for term in terms if term in words) >= max(1, math.ceil(len(terms) / 2))
+
+
+def command_feedback_attribute(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    answer = Path(args.answer).read_text(encoding="utf-8", errors="replace")
+    pack = vault.root / args.pack
+    raw = hashlib.sha256(pack.read_bytes()).hexdigest() if pack.is_file() else ""
+    for ref in pack_refs(vault.root, args.pack, raw):
+        path = vault.resolver.canonical_ref(ref)
+        if path is None or not vault.resolver.visible(path, strict_principal=True):
+            continue
+        if supported_answer(vault.title(path) + "\n" + vault.body(path), answer):
+            print(ref)
+    return 0
+
+
+def preservation_screen(vault: Vault, merged_text: str, targets: list[Path], extra: list[str]) -> list[tuple[str, list[str]]]:
+    """For each original, the answer-bearing tokens the merged text lost."""
+    low = (merged_text or "").lower()
+    out = []
+    for path in targets:
+        missing = [token for token in answer_tokens(vault.title(path) + "\n" + vault.body(path)) if token.lower() not in low]
+        out.append((vault.rel(path), missing))
+    lost_extra = [term for term in extra if term and term.lower() not in low]
+    if lost_extra:
+        out.append(("brain_preserve_terms", lost_extra))
+    return out
+
+
+def command_merge_screen(args: argparse.Namespace) -> int:
+    """#14/#15: refuse a consolidation merge or compression unless the merged
+    text still carries the answer-bearing content of every original.  Prints
+    ``ok`` or ``hold<TAB>ref=missing,...;...``; read-only."""
+    vault = Vault(args.project_dir, args.principal)
+    review = Path(args.review)
+    meta, body = okf.split_frontmatter(review)
+    supersedes = ref_list(meta.get("brain_supersedes"))
+    refs = ref_list(meta.get("brain_merge_of")) + ref_list(meta.get("brain_compressed_from"))
+    if len(supersedes) >= 2:
+        refs += supersedes
+    targets: list[Path] = []
+    for ref in refs:
+        path = vault.resolver.canonical_ref(ref)
+        if path is not None and path not in targets:
+            targets.append(path)
+    if not targets:
+        print("ok\tnot-a-merge")
+        return 0
+    merged = clean(meta.get("title")) + "\n" + body
+    rows = preservation_screen(vault, merged, targets, ref_list(meta.get("brain_preserve_terms")))
+    lost = [(ref, missing) for ref, missing in rows if missing]
+    if not lost:
+        print(f"ok\t{len(targets)} original(s) preserved")
+        return 0
+    print("hold\t" + "; ".join(f"{ref}: {', '.join(missing[:8])}" for ref, missing in lost))
+    return 0
 
 
 def record_created(metadata: dict[str, Any]) -> dt.datetime | None:
@@ -1561,7 +1674,7 @@ def command_usage(args: argparse.Namespace) -> int:
         if not vault.resolver.effective(path) or not vault.resolver.visible(path, strict_principal=True):
             continue
         rel = vault.rel(path)
-        entry = table.get(rel, {"uses": 0, "rendered": 0, "useful": 0, "partial": 0, "not_useful": 0, "last_used": None})
+        entry = table.get(rel, {"uses": 0, "rendered": 0, "useful": 0, "partial": 0, "not_useful": 0, "supported": 0, "last_used": None})
         rows.append((rel, entry, vault.title(path), record_created(vault.meta(path))))
     if args.json:
         print(json.dumps({
@@ -1569,7 +1682,7 @@ def command_usage(args: argparse.Namespace) -> int:
             "records": [
                 {"ref": rel, "title": title, "uses": entry["uses"], "rendered": entry["rendered"],
                  "useful": entry["useful"], "partial": entry["partial"], "not_useful": entry["not_useful"],
-                 "last_used": iso(entry["last_used"]) or None}
+                 "supported": entry.get("supported", 0), "last_used": iso(entry["last_used"]) or None}
                 for rel, entry, title, _ in rows
             ],
         }, ensure_ascii=False, separators=(",", ":")))
@@ -2493,9 +2606,15 @@ def command_rerank(args: argparse.Namespace) -> int:
         uses = entry["uses"] + entry["rendered"] if entry else 0
         useful = entry["useful"] + 0.5 * entry["partial"] if entry else 0
         not_useful = entry["not_useful"] if entry else 0
-        multiplier = 1.0 + 0.1 * math.log1p(uses) + 0.25 * math.log1p(useful) - 0.15 * math.log1p(not_useful)
+        supported = entry["supported"] if entry else 0
+        multiplier = 1.0 + 0.1 * math.log1p(uses) + 0.25 * math.log1p(useful) + 0.15 * math.log1p(supported) - 0.15 * math.log1p(not_useful)
         multiplier = max(multiplier, 0.5)
-        rows.append({"fields": fields, "score": score * multiplier, "rare": (uses + useful + not_useful) == 0, "boosted": multiplier != 1.0})
+        # #14 exploration: "rare" is rarely retrieved (at most --explore-max
+        # retrievals) and never credited, not only never retrieved, so a
+        # record that surfaced once is not crowded out by frequent hits.
+        retrieved = entry["uses"] if entry else 0
+        rare = retrieved <= args.explore_max and (useful + not_useful) == 0
+        rows.append({"fields": fields, "score": score * multiplier, "rare": rare, "boosted": multiplier != 1.0})
     rows.sort(key=lambda row: (-row["score"], row["fields"][0]))
     limit = max(args.limit, 1)
     reserve = min(max(args.reserve, 0), limit)
@@ -2959,6 +3078,14 @@ def parser() -> argparse.ArgumentParser:
     rerank.add_argument("--ranked", required=True)
     rerank.add_argument("--limit", type=int, default=20)
     rerank.add_argument("--reserve", type=int, default=2)
+    rerank.add_argument("--explore-max", type=int, default=int(os.environ.get("LLM_BRAIN_EXPLORE_MAX_USES", "1") or 1))
+
+    attribute = base("feedback-attribute", command_feedback_attribute)
+    attribute.add_argument("--pack", required=True)
+    attribute.add_argument("--answer", required=True)
+
+    merge_screen = base("merge-screen", command_merge_screen)
+    merge_screen.add_argument("--review", required=True)
 
     maintenance = base("maintenance", command_maintenance)
     maintenance.add_argument("--source-root", default="")
