@@ -113,6 +113,7 @@ core_checks() {
     bash "$repo_root/tests/stale-write-self-check.sh" -- \
     bash "$repo_root/tests/counterfactual-invalidation-self-check.sh" -- \
     bash "$repo_root/tests/intention-assess-self-check.sh" -- \
+    bash "$repo_root/tests/historical-abstain-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

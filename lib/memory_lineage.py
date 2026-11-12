@@ -1523,6 +1523,11 @@ def history_state(vault: Vault, path: Path, now: dt.datetime, derived: dict) -> 
     """(state, one-line label) for a record as of ``now``; deterministic and small."""
     rel = vault.rel(path)
     entries = derived.get(rel, [])
+    recorded = _created(vault, path)
+    if recorded is not None and recorded > now:
+        # #13: a record written after the as-of date is not visible evidence
+        # for that date, however well it matches.
+        return "future", f"RECORDED AFTER the as-of date ({recorded.date().isoformat()}); not evidence as of {now.date().isoformat()}"
     for label, target, stamp in entries:
         when = parse_time(stamp)
         if label == "retracted" and (when is None or when <= now):
@@ -1578,6 +1583,72 @@ def command_history_states(args: argparse.Namespace) -> int:
     for created, _, ref, label, state in sorted(rows, key=lambda row: (row[0], row[1])):
         observed = "" if created.year == dt.MAXYEAR else iso(created)
         print(f"{ref}\t{observed}\t{state}\t{label}")
+    return 0
+
+
+# ---------------------------------------- #13 historical sufficiency (13 Nov)
+
+def historical_sufficiency(vault: Vault, refs: list[str], now: dt.datetime, task: str = "") -> list[dict[str, str]]:
+    """Per state key touched by the selection: does the evidence visible as of
+    ``now`` determine one value?  Only records recorded by ``now`` count; a
+    matching later record is never used to fill the gap."""
+    derived = derived_labels(vault)
+    keys: list[str] = []
+    for ref in refs:
+        path = vault.resolver.canonical_ref(ref)
+        if path is None:
+            continue
+        key = clean(vault.meta(path).get("brain_state_key"))
+        if key and key not in keys:
+            keys.append(key)
+    # A record that had expired by the date is not selected at all, yet the
+    # question may be about its key: a key every word of which is in the task
+    # is checked too, so the gap is reported instead of silently skipped.
+    task_terms = set(_terms(task))
+    if task_terms:
+        for path in vault.semantic_files():
+            key = clean(vault.meta(path).get("brain_state_key"))
+            words = [w for w in re.findall(r"[a-z0-9]+", key.lower()) if len(w) > 2]
+            if key and key not in keys and words and all(w in task_terms for w in words) \
+                    and vault.resolver.visible(path, strict_principal=True):
+                keys.append(key)
+    rows = []
+    for key in keys:
+        holders = []
+        for path in vault.semantic_files():
+            if clean(vault.meta(path).get("brain_state_key")) != key:
+                continue
+            if not vault.resolver.visible(path, strict_principal=True):
+                continue
+            holders.append(path)
+        visible = [p for p in holders if (_created(vault, p) or now) <= now]
+        later = len(holders) - len(visible)
+        current = []
+        for path in visible:
+            state, _ = history_state(vault, path, now, derived)
+            if state == "current":
+                current.append(vault.rel(path))
+        if len(current) == 1:
+            rows.append({"key": key, "status": "determined", "ref": current[0],
+                         "reason": f"one value is in force as of {now.date().isoformat()}"})
+            continue
+        if not visible:
+            reason = "nothing about it was recorded by this date"
+        elif not current:
+            reason = "every value recorded by this date had been superseded, retracted or had expired"
+        else:
+            reason = f"{len(current)} competing values were in force"
+        if later:
+            reason += f"; {later} later record(s) exist but are not evidence for this date"
+        rows.append({"key": key, "status": "insufficient", "ref": ",".join(sorted(current)) or "-", "reason": reason})
+    return rows
+
+
+def command_historical_sufficiency(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    refs = [line.strip() for line in Path(args.selected).read_text(encoding="utf-8").splitlines() if line.strip()]
+    for row in historical_sufficiency(vault, refs, now_from(args.now), args.task):
+        print(f"{row['key']}\t{row['status']}\t{row['ref']}\t{row['reason']}")
     return 0
 
 
@@ -2739,6 +2810,9 @@ def parser() -> argparse.ArgumentParser:
     st.set_defaults(func=command_speaker_turns)
     hs = base("history-states", command_history_states)
     hs.add_argument("--selected", required=True)
+    hsuf = base("historical-sufficiency", command_historical_sufficiency)
+    hsuf.add_argument("--selected", required=True)
+    hsuf.add_argument("--task", default="")
     return result
 
 

@@ -2188,6 +2188,10 @@ def lifecycle_notices(vault: Vault, now: dt.datetime, task: str = "", limit: int
         if not targets:
             continue
         when = parse_time(metadata.get("brain_observed_at")) or record_created(metadata)
+        if when is not None and when > now:
+            # #13: a correction written after the as-of date did not exist
+            # yet (retractions below already follow this rule).
+            continue
         replaced = []
         for target in targets:
             target_meta = vault.meta(target)

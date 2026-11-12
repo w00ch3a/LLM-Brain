@@ -7725,7 +7725,7 @@ pack_index_freshness() {
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   [ "$action" = "build" ] || die 64 "pack requires build"
-  local history_file="" history_hash="" history_line=""
+  local history_file="" history_hash="" history_line="" sufficiency_file="" historical_sufficiency="none" hidden_future=0
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
@@ -7896,6 +7896,21 @@ cmd_pack() {
     if [ -n "$render_order" ] && memory_lineage "${history_args[@]}" >"$history_file" 2>/dev/null && [ -s "$history_file" ]; then
       render_order="$(cut -f1 "$history_file")"
       history_hash="$(sha256_file "$history_file")"
+      if [ -n "$as_of" ]; then
+        # #13: only what was recorded by the as-of date is evidence for it.
+        # Later records are dropped from the pack, and each state key the
+        # selection touches is checked for a uniquely determined value.
+        hidden_future="$(awk -F '\t' '$3 == "future"' "$history_file" | wc -l | tr -d ' ')"
+        sufficiency_file="$(mktemp "$dir/context-packs/.sufficiency.XXXXXX")"
+        local -a sufficiency_args=(historical-sufficiency --project-dir "$dir" --selected "${history_file}.in" --now "$as_of" --task "$task")
+        [ -z "$principal" ] || sufficiency_args+=(--principal "$principal")
+        memory_lineage "${sufficiency_args[@]}" >"$sufficiency_file" 2>/dev/null || : >"$sufficiency_file"
+        if [ -s "$sufficiency_file" ]; then
+          if awk -F '\t' '$2 == "insufficient" { f=1 } END { exit !f }' "$sufficiency_file"; then historical_sufficiency=insufficient; else historical_sufficiency=determined; fi
+          history_hash="$(sha256_text "$history_hash|$(sha256_file "$sufficiency_file")")"
+        fi
+        render_order="$(awk -F '\t' '$3 != "future" { print $1 }' "$history_file")"
+      fi
     else
       : >"$history_file"
     fi
@@ -7922,11 +7937,11 @@ cmd_pack() {
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
-    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_intentions_due: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$intentions_due" "$SCHEMA_VERSION"
+    printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_intentions_due: %s\nbrain_historical_sufficiency: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$intentions_due" "$historical_sufficiency" "$SCHEMA_VERSION"
     [ -z "$freshness_hash" ] || printf 'brain_index_audit_seq: %s\nbrain_unindexed_captures: %s\n' "$index_seq" "$unindexed_captures"
     [ "$scope_hidden_count" = 0 ] || printf 'brain_applies_when_hidden: %s\n' "$scope_hidden_count"
     [ "$action_risk" != high ] || printf 'brain_action_risk: high\n'
@@ -7982,6 +7997,22 @@ cmd_pack() {
       while IFS=$'\t' read -r warning_title warning_path warning_state; do
         printf '%s — `%s` (%s)\n' "$warning_title" "$warning_path" "$warning_state"
       done <"$warnings"
+      printf '\n'
+    fi
+    if [ -n "$sufficiency_file" ] && { [ -s "$sufficiency_file" ] || [ "$hidden_future" -gt 0 ]; }; then
+      printf '## Historical Sufficiency — as of %s\n\n' "$as_of"
+      printf 'Only records written by this date count as evidence for it. Answer from them alone; where they do not settle a value, say so instead of guessing (a later record is not evidence for this date).\n\n'
+      while IFS=$'\t' read -r sufficiency_key sufficiency_status sufficiency_ref sufficiency_reason; do
+        [ -n "$sufficiency_key" ] || continue
+        if [ "$sufficiency_status" = determined ]; then
+          line="- State \`${sufficiency_key}\`: determined by \`${sufficiency_ref}\` (${sufficiency_reason})."
+        else
+          line="- State \`${sufficiency_key}\`: NOT determined by the visible records (${sufficiency_reason}). Abstain: the records up to this date do not settle it."
+        fi
+        printf '%s\n' "$line"
+        bytes=$((bytes + $(printf '%s' "$line" | wc -c | tr -d ' ')))
+      done <"$sufficiency_file"
+      [ "$hidden_future" = 0 ] || printf -- '- %s matching record(s) written after this date were left out.\n' "$hidden_future"
       printf '\n'
     fi
     printf '## Selected Memory\n\n'
@@ -8064,7 +8095,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 
