@@ -473,6 +473,49 @@ def invalidation_plan(vault: Vault, trigger_ref: str, max_depth: int = 3) -> lis
                 killed.setdefault(rel, f"implicit: state {tkey}")
             elif when is None or tdate is None:
                 put(rel, "UNKNOWN", f"shares state {tkey}; dates unknown", 0)
+    # Counterfactual check (StateGraph): before a dependent is marked STALE,
+    # ask whether it would still hold without the invalidated premise.  An
+    # alternative support path is an effective record that supports it
+    # (incoming brain_supports) or a premise it lists in
+    # brain_also_supported_by, which is not itself being invalidated.  A
+    # declared weak dependence (brain_dependence: weak) is UNKNOWN, not STALE.
+    counterfactual = os.environ.get("LLM_BRAIN_COUNTERFACTUAL", "1") != "0"
+    incoming: dict[str, set[str]] = {}
+    effective_rel: dict[str, bool] = {}
+    deps: dict[str, set[str]] = {}
+    for path in vault.semantic_files():
+        if not resolver.visible(path, strict_principal=True):
+            continue
+        rel = vault.rel(path)
+        effective_rel[rel] = bool(resolver.effective(path))
+        for raw in ref_list(vault.meta(path).get("brain_supports")):
+            target = resolver.canonical_ref(raw)
+            if target is not None:
+                incoming.setdefault(vault.rel(target), set()).add(rel)
+        deps[rel] = {vault.rel(t) for field in ("brain_depends_on", "brain_derived_from") for raw in ref_list(vault.meta(path).get(field)) for t in [resolver.canonical_ref(raw)] if t is not None}
+    # Records downstream of an invalidated record by pure topology are not
+    # independent witnesses, whatever order they are visited in.
+    tainted = set(killed)
+    grew = True
+    while grew:
+        grew = False
+        for rel, needs in deps.items():
+            if rel not in tainted and needs & tainted:
+                tainted.add(rel)
+                grew = True
+
+    def surviving_paths(rel: str, meta: dict[str, Any], gone: set[str]) -> list[str]:
+        also = {vault.rel(t) for raw in ref_list(meta.get("brain_also_supported_by")) for t in [resolver.canonical_ref(raw)] if t is not None}
+        out = []
+        for ref in sorted(incoming.get(rel, set()) | also):
+            row = plan.get(ref)
+            if ref in gone or ref in tainted or ref == trel or not effective_rel.get(ref, False):
+                continue
+            if row is not None and row["outcome"] in {"STALE", "REPLACE"}:
+                continue
+            out.append(ref)
+        return out
+
     # Propagate along dependency topology.
     frontier = set(killed)
     for depth in range(1, max_depth + 1):
@@ -485,7 +528,16 @@ def invalidation_plan(vault: Vault, trigger_ref: str, max_depth: int = 3) -> lis
             refs_by_field = {field: {vault.rel(t) for raw in ref_list(meta.get(field)) for t in [resolver.canonical_ref(raw)] if t is not None} for field in ("brain_depends_on", "brain_derived_from", "brain_supports", "brain_conflicts")}
             hit_dep = (refs_by_field["brain_depends_on"] | refs_by_field["brain_derived_from"]) & frontier
             if hit_dep:
-                put(rel, "STALE", f"depends on invalidated {sorted(hit_dep)[0]}", depth)
+                premise = sorted(hit_dep)[0]
+                if counterfactual:
+                    alive = surviving_paths(rel, meta, set(killed) | frontier)
+                    if alive:
+                        put(rel, "KEEP", f"counterfactual: still holds without {premise} via {alive[0]}", depth)
+                        continue
+                    if clean(meta.get("brain_dependence")).lower() == "weak":
+                        put(rel, "UNKNOWN", f"weak dependence on invalidated {premise}; uncertain, not stale", depth)
+                        continue
+                put(rel, "STALE", f"depends on invalidated {premise}", depth)
                 nxt.add(rel)
                 continue
             if refs_by_field["brain_supports"] & frontier:

@@ -111,6 +111,7 @@ core_checks() {
     bash "$repo_root/tests/research-recall-self-check.sh" -- \
     bash "$repo_root/tests/doctor-okf-index-self-check.sh" -- \
     bash "$repo_root/tests/stale-write-self-check.sh" -- \
+    bash "$repo_root/tests/counterfactual-invalidation-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 
