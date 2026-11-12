@@ -2055,11 +2055,66 @@ body_after_frontmatter() {
   awk 'NR == 1 && $0 == "---" { header=1; next } header && $0 == "---" { header=0; next } !header { print }' "$1"
 }
 
+# Stale-overwrite guard (shared vaults).  A command that reads a record and
+# later rewrites it calls record_loaded when it reads; every frontmatter
+# rewrite then refuses (exit 75) if the file changed since that read, or
+# since the rewrite itself started, and keeps the refused version at a
+# unique fork path beside the record (never .md, so it is not loaded as
+# memory, and never reused, so a later writer cannot clobber it).
+LOADED_FILES=()
+LOADED_BODIES=()
+
+loaded_index() {
+  local file="$1" i=0
+  while [ "$i" -lt "${#LOADED_FILES[@]}" ]; do
+    [ "${LOADED_FILES[$i]}" = "$file" ] && { printf '%s\n' "$i"; return 0; }
+    i=$((i + 1))
+  done
+  return 1
+}
+
+record_loaded() {
+  local file="$1" i
+  [ -f "$file" ] || return 0
+  if i="$(loaded_index "$file")"; then
+    LOADED_BODIES[$i]="$(<"$file")"
+  else
+    LOADED_FILES+=("$file")
+    LOADED_BODIES+=("$(<"$file")")
+  fi
+}
+
+conflict_fork_path() {
+  local file="$1" stamp fork n=0
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  while :; do
+    fork="${file}.conflict-${stamp}-$$-${RANDOM}${RANDOM}"
+    # noclobber create: two writers can never share a fork path.
+    if ( set -C; : >"$fork" ) 2>/dev/null; then printf '%s\n' "$fork"; return 0; fi
+    n=$((n + 1)); [ "$n" -lt 50 ] || return 1
+  done
+}
+
+guarded_replace() {
+  local file="$1" tmp="$2" started="$3" expected i="" now fork
+  if i="$(loaded_index "$file")"; then expected="${LOADED_BODIES[$i]}"; else i=""; expected="$started"; fi
+  case "${LLM_BRAIN_DEBUG_WRITE_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$LLM_BRAIN_DEBUG_WRITE_DELAY" ;; esac
+  now=""; [ -f "$file" ] && now="$(<"$file")"
+  if [ "$now" != "$expected" ]; then
+    fork="$(conflict_fork_path "$file")" || { rm -f "$tmp"; die 75 "stale write refused: $file changed since it was loaded"; }
+    cat "$tmp" >"$fork"; rm -f "$tmp"
+    die 75 "stale write refused: $file changed since it was loaded; this writer's version is kept at $fork"
+  fi
+  mv "$tmp" "$file"
+  [ -z "$i" ] || LOADED_BODIES[$i]="$(<"$file")"
+}
+
 set_frontmatter_field() {
-  local file="$1" key="$2" value="$3" tmp
+  local file="$1" key="$2" value="$3" tmp started
   validate_scalar "$value" || die 65 "invalid scalar value"
   [ "$(sed -n '1p' "$file")" = "---" ] || die 65 "missing frontmatter: $file"
   tmp="${file}.tmp.$$"
+  started="$(<"$file")"
   awk -v key="$key" -v value="$value" '
     NR == 1 { print; in_header=1; next }
     in_header && $0 == "---" {
@@ -2069,20 +2124,21 @@ set_frontmatter_field() {
     in_header && $0 ~ "^" key ":" { print key ": " value; seen=1; next }
     { print }
   ' "$file" >"$tmp"
-  mv "$tmp" "$file"
+  guarded_replace "$file" "$tmp" "$started"
 }
 
 remove_frontmatter_field() {
-  local file="$1" key="$2" tmp
+  local file="$1" key="$2" tmp started
   [ "$(sed -n '1p' "$file")" = "---" ] || die 65 "missing frontmatter: $file"
   tmp="${file}.tmp.$$"
+  started="$(<"$file")"
   awk -v key="$key" '
     NR == 1 { print; in_header=1; next }
     in_header && $0 == "---" { print; in_header=0; next }
     in_header && $0 ~ "^" key ":" { next }
     { print }
   ' "$file" >"$tmp"
-  mv "$tmp" "$file"
+  guarded_replace "$file" "$tmp" "$started"
 }
 
 ensure_dir() { [ -d "$1" ] || mkdir -p "$1"; }
@@ -4860,6 +4916,7 @@ cmd_review() {
       local dir file old
       require_project "$project_id" dir
       file="$dir/review/$id.md"; [ -f "$file" ] || die 66 "review missing: $id"
+      record_loaded "$file"
       old="$(frontmatter_field "$file" brain_review_state review_state)"
       kind="$(frontmatter_field "$file" brain_review_kind)"
       acquire_lock "project-$project_id"
@@ -4938,6 +4995,7 @@ cmd_validate_source() {
   done
   [ -n "$canonical" ] || die 66 "canonical item missing: $canonical_id"
   canonical_file_effective "$dir" "$canonical" || die 65 "canonical item is not effective approved memory: $canonical_id"
+  record_loaded "$canonical"
   hash="$(sha256_file "$source")"
   dest="$dir/sources/${hash}-$(slug "$(basename "$source")").md"
   old_provenance="$(frontmatter_field "$canonical" brain_provenance source_episode)"
