@@ -155,7 +155,7 @@ Usage:
 Commands:
   root list|ensure|disable PATH
   detect
-  project ensure [SOURCE_ROOT] [--id ID] [--alias ALIAS]
+  project ensure [SOURCE_ROOT] [--id ID] [--alias ALIAS] [--nested] [--inherits PARENT_ID]...
   topic add PROJECT_ID TITLE [--id ID] [--sensitivity LEVEL]
   ingest FILE [--topic ID] [--capture-only|--manual-only] [--provider EXECUTABLE]
   ingest-source PROJECT_ID FILE [ROOT]                 Compatibility custody command
@@ -2563,6 +2563,20 @@ resolve_source_identity() {
   else
     fingerprint="path:$git_root"
   fi
+  # #6: a folder registered with `project ensure --nested` is its own project
+  # even inside a parent repository.  The deepest registered nested root
+  # between the working directory and the repository root wins; unregistered
+  # subfolders still resolve to the repository as before.
+  if [ "$source_root" != "$git_root" ] && [ -f "$ROOT/registry/projects.tsv" ]; then
+    local nested_dir="$source_root"
+    while [ -n "$nested_dir" ] && [ "$nested_dir" != "$git_root" ] && [ "$nested_dir" != / ]; do
+      if awk -F '\t' -v fp="nested:$nested_dir" 'NR > 1 && $4 == fp { f=1 } END { exit !f }' "$ROOT/registry/projects.tsv"; then
+        git_root="$nested_dir"; remote=""; fingerprint="nested:$nested_dir"
+        break
+      fi
+      nested_dir="$(dirname "$nested_dir")"
+    done
+  fi
   slug_name="$(slug "$(basename "$git_root")")"
   short="$(sha256_text "$fingerprint" | cut -c1-12)"
   SOURCE_ROOT="$git_root"
@@ -2780,15 +2794,31 @@ cmd_detect() {
 }
 
 cmd_project_ensure() {
-  local source_root="$CWD" id_override="" alias_override=""
+  local source_root="$CWD" id_override="" alias_override="" nested=0 inherits="" parent_id
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id_override="${2:-}"; shift 2 ;;
       --alias) alias_override="${2:-}"; shift 2 ;;
+      --nested) nested=1; shift ;;
+      --inherits) [ -n "${2:-}" ] || die 64 "--inherits requires PROJECT_ID"; validate_id "$2" || die 64 "invalid project id: $2"; inherits="${inherits}${inherits:+,}$2"; shift 2 ;;
       *) source_root="$1"; shift ;;
     esac
   done
   resolve_source_identity "$source_root"
+  if [ "$nested" = 1 ]; then
+    # #6: register this folder as its own project boundary inside a parent
+    # repository.  Nothing from the parent flows in unless --inherits says so.
+    SOURCE_ROOT="$(canonical_path "$source_root")"
+    SOURCE_REMOTE=""
+    SOURCE_FINGERPRINT="nested:$SOURCE_ROOT"
+    SOURCE_ALIAS="$(slug "$(basename "$SOURCE_ROOT")")"
+    SOURCE_PROJECT_ID="proj_${SOURCE_ALIAS}_$(sha256_text "$SOURCE_FINGERPRINT" | cut -c1-12)"
+  fi
+  if [ -n "$inherits" ]; then
+    for parent_id in $(printf '%s' "$inherits" | tr ',' ' '); do
+      [ -d "$(project_dir "$parent_id")" ] || die 66 "inherited project not found: $parent_id"
+    done
+  fi
   acquire_lock registry
   ensure_registry
   local id dir existing changed=0
@@ -2808,9 +2838,17 @@ cmd_project_ensure() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\tactive\t%s\n' "$SCHEMA_VERSION" "$id" "$SOURCE_ALIAS" "$SOURCE_FINGERPRINT" "$SOURCE_ROOT" "$SOURCE_REMOTE" "$(now_utc)" >>"$(registry_projects)"
     changed=1
   fi
+  if [ -n "$inherits" ]; then
+    case ",$inherits," in *",$id,"*) die 64 "a project cannot inherit from itself" ;; esac
+    if [ "$(frontmatter_field "$dir/okf/index.md" brain_inherits 2>/dev/null)" != "$inherits" ]; then
+      set_frontmatter_field "$dir/okf/index.md" brain_inherits "$inherits"
+      audit_v2 "$dir" "project-inherits" "$id" "" "$inherits" "" "declared"
+      changed=1
+    fi
+  fi
   audit_v2 "$dir" "project-ensure" "$id" "" "active" "" "changed=$changed"
   release_lock
-  printf 'project=ok project_id=%s path=%s changed=%s\n' "$id" "$dir" "$changed"
+  printf 'project=ok project_id=%s path=%s changed=%s%s\n' "$id" "$dir" "$changed" "${inherits:+ inherits=$inherits}"
 }
 
 cmd_topic_add() {
@@ -7946,6 +7984,7 @@ cmd_pack() {
   local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
   local -a pack_label_args=()
   local record_sources=0 record_voices=0 records_rendered=0 state_skipped=0
+  local inherits="" inherited_file="" inherited_hash="" inherited_count=0 parent_id parent_dir
   local usage_boost=0 notices_file="" notices_hash="" intentions_file="" intentions_hash="" intentions_due=0 intention_id intention_status intention_due intention_reason intention_trigger intention_action intention_path
   local -a pack_path_hints=()
   local pack_host="" pack_task_type="${LLM_BRAIN_TASK_TYPE:-}" scope_hidden="" scope_hidden_count=0 index_seq="" unindexed_captures=0 freshness_hash=""
@@ -8155,6 +8194,29 @@ cmd_pack() {
   if [ "$intent" = current_state ]; then
     awk -F '\t' 'NR > 1 && $4 != "current" { print $9 "\t" $1 "\t" $4 ":" $16 }' "$results" >"$warnings"
   fi
+  # #6: a nested project sees parent memory only when it declared
+  # `brain_inherits` (project ensure --inherits).  Each declared parent is
+  # searched with the same task and principal; its top records are rendered
+  # in their own labelled section, never mixed into this project's.
+  inherits="$(frontmatter_field "$dir/okf/index.md" brain_inherits 2>/dev/null || true)"
+  if [ -n "$inherits" ] && [ "$inherits" != none ]; then
+    inherited_file="$(mktemp "$dir/context-packs/.inherited.XXXXXX")"
+    for parent_id in $(printf '%s' "$inherits" | tr ',' ' '); do
+      validate_id "$parent_id" || continue
+      parent_dir="$(project_dir "$parent_id")"
+      [ -d "$parent_dir" ] || continue
+      (
+        local -a parent_args=("$parent_id" "$task" --limit "${LLM_BRAIN_INHERIT_LIMIT:-3}")
+        [ -z "$principal" ] || parent_args+=(--principal "$principal")
+        [ "$historical" = 0 ] || parent_args+=(--historical)
+        [ -z "$as_of" ] || parent_args+=(--as-of "$as_of")
+        cmd_search "${parent_args[@]}" 2>/dev/null
+      ) | awk -F '\t' -v p="$parent_id" 'NR > 1 && $1 != "" { print p "\t" $1 }' >>"$inherited_file" || true
+    done
+    if [ -s "$inherited_file" ]; then
+      inherited_hash="$(while IFS=$'\t' read -r parent_id rel; do printf '%s\t%s\t%s\n' "$parent_id" "$rel" "$(sha256_file "$(project_dir "$parent_id")/$rel")"; done <"$inherited_file" | sha256_file /dev/stdin)"
+    fi
+  fi
   if [ "$intent" = evidence ] || [ "$intent" = current_state ] || [ "$require_evidence" = 1 ]; then
     source_snapshot_hash="$(
       { printf '%s\n' "$selected"; printf '%s\n' "$evidence_refs" | tr ',' '\n'; } |
@@ -8168,18 +8230,19 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
     printf 'type: ContextPack\nbrain_project_id: %s\nbrain_agent: %s\nbrain_task: %s\nbrain_budget_tokens_approx: %s\nbrain_budget_basis: conservative_utf8_bytes_div4\nbrain_topic_id: %s\nbrain_include_proposed: %s\nbrain_include_cold: %s\nbrain_strategy: %s\nbrain_expand_graph: %s\nbrain_historical: %s\nbrain_as_of: %s\nbrain_intent: %s\nbrain_principal: %s\nbrain_require_evidence: %s\nbrain_exploratory: %s\nbrain_planner: %s\nbrain_evidence_refs: %s\nbrain_retrieval: %s\nbrain_retrieval_degraded: %s\nbrain_index_manifest_hash: %s\nbrain_selection_hash: %s\nbrain_state_resolution: %s\nbrain_state_unresolved_count: %s\nbrain_independent_source_count: %s\nbrain_correlated_record_count: %s\nbrain_lifecycle_bundle_resolution: %s\nbrain_lifecycle_bundle_record_count: %s\nbrain_intentions_due: %s\nbrain_historical_sufficiency: %s\nbrain_schema_version: %s\n' "$project_id" "$agent" "$(yaml_quote "$task")" "$budget" "$(yaml_quote "$topic")" "$include_proposed" "$include_cold" "$strategy" "$expand_graph" "$historical" "$(yaml_quote "${as_of:-none}")" "$intent" "$(yaml_quote "${principal:-none}")" "$([ "$require_evidence" = "1" ] && printf true || printf false)" "$([ "$exploratory" = "1" ] && printf true || printf false)" "$planner" "$(yaml_quote "$evidence_refs")" "$retrieval_mode" "$retrieval_degraded" "${manifest_hash:-none}" "$hash" "$state_resolution" "$state_unresolved_count" "$independent_source_count" "$correlated_record_count" "$lifecycle_bundle_resolution" "$lifecycle_bundle_record_count" "$intentions_due" "$historical_sufficiency" "$SCHEMA_VERSION"
     [ -z "$freshness_hash" ] || printf 'brain_index_audit_seq: %s\nbrain_unindexed_captures: %s\n' "$index_seq" "$unindexed_captures"
     [ "$superseded_omitted" = 0 ] || printf 'brain_superseded_omitted: %s\n' "$superseded_omitted"
+    [ -z "$inherited_hash" ] || printf 'brain_inherits: %s\n' "$inherits"
     [ "$scope_hidden_count" = 0 ] || printf 'brain_applies_when_hidden: %s\n' "$scope_hidden_count"
     [ "$action_risk" != high ] || printf 'brain_action_risk: high\n'
     printf '%s\n\n' '---'
@@ -8308,6 +8371,22 @@ cmd_pack() {
       rendered_refs="${rendered_refs}${rendered_refs:+,}${rel}"
       records_rendered=$((records_rendered + 1))
     done <<<"$render_order"
+    if [ -n "$inherited_file" ] && [ -s "$inherited_file" ]; then
+      for parent_id in $(cut -f1 "$inherited_file" | awk '!s[$0]++'); do
+        printf '## Inherited from `%s` (declared with inherits)\n\n' "$parent_id"
+        printf "Parent-project memory this project opted into. It describes the parent, not this project: where it disagrees with this project's own records above, this project's records win.\n\n"
+        while IFS=$'\t' read -r line rel; do
+          [ "$line" = "$parent_id" ] || continue
+          parent_dir="$(project_dir "$parent_id")"
+          excerpt="$(body_after_frontmatter "$parent_dir/$rel" | head -c 400)"
+          evidence_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
+          [ $((bytes + evidence_bytes)) -le $((budget * 4)) ] || { context_truncated=true; break; }
+          printf '### %s\n\n%s\n\nExpansion: <code>%s:%s</code>\n\n' "$(okf facts "$parent_dir/$rel" | cut -f2)" "$excerpt" "$parent_id" "$rel"
+          bytes=$((bytes + evidence_bytes))
+          inherited_count=$((inherited_count + 1))
+        done <"$inherited_file"
+      done
+    fi
     if [ "$require_evidence" = "1" ] && [ "$evidence_refs" != "none" ]; then
       printf '## Supporting Evidence\n\n'
       while IFS= read -r evidence_ref; do
@@ -8357,7 +8436,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 
