@@ -8,6 +8,29 @@
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
 
+## 0.13.0 - 2026-11-13
+
+- Hermes 0.23 provider contract: resume-aware `initialize`, `on_turn_start`,
+  a prefetch deadline, and non-blocking subagent checkpoints. Opt-in
+  `raw_secret_custody` and `snapshot_host_memory` (both off by default).
+- Stale writes are refused (exit 75) and the refused version is kept as a
+  unique conflict copy.
+- Counterfactual check before cascading invalidation.
+- Fired intentions are assessed as ACT or WAIT.
+- As-of packs abstain when the records don't settle a value.
+- Credit goes only to records that were used; rarely retrieved records get
+  exploration; lossy merges are held.
+- New `pack judge` and an eval "Point of use" table.
+- Replaced versions are not promoted again.
+- Current packs carry only current versions, with change notices.
+- Quoted or forwarded preferences bind to their source (`claims-v3`).
+- Sources are counted, not voices.
+- The pack footer reports what was omitted.
+- Nested projects, with `inherits:`.
+- Conflict decisions re-open when either side changes.
+- `host-memory snapshot|list|diff`.
+- No vault migration. See docs/releases/v0.13.0.md.
+
 ## 0.12.1 - 2026-10-26
 
 - `doctor` no longer reports the per-folder OKF `index.md` pages written by

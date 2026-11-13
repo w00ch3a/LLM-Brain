@@ -45,6 +45,11 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## What's new in 0.13
+
+Fifteen memory-quality and safety changes, and support for Hermes 0.23. No
+vault migration. See the [v0.13.0 notes](releases/v0.13.0.md).
+
 ## What's new in 0.12 (Memthena)
 
 LLM-Brain is now Memthena. No vault migration. See the

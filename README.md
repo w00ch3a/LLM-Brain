@@ -171,6 +171,18 @@ Labels also show in Neural Expansion's detail panel:
 UNKNOWN, and search and packs accept `--label` / `--without-label`. See the
 [v0.9.0 notes](docs/releases/v0.9.0.md).
 
+## What's new in 0.13
+
+Fifteen memory-quality and safety changes, and support for Hermes 0.23. Stale
+writes on shared vaults are refused, and current packs carry only current
+versions. As-of packs abstain when the records don't settle a value. Replaced
+versions are not promoted again, and conflict decisions re-open when the
+evidence changes. Nested projects inherit parent memory only when they declare
+it. Host-native memory files can be snapshotted read-only and diffed. Two new
+Hermes options (`raw_secret_custody`, `snapshot_host_memory`) are off by
+default. No vault migration. Details:
+[v0.13.0 notes](docs/releases/v0.13.0.md).
+
 ## What's new in 0.12
 
 LLM-Brain is now Memthena: same project, same brain, nothing renamed on disk
