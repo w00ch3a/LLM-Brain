@@ -168,6 +168,7 @@ Commands:
                                               --accept-merge-loss promotes a merge/compression that drops answer-bearing content
                                               --applies-when 'task=TYPE' scopes it first (required for a memory that relaxes a safeguard)
                                               --share-scope this-agent|this-owner|all-agents [--share-owner ID] [--share-agent NAME] who may see the lesson
+                                              --source-outcome success|failure|unknown how the task it was learnt from ended
   share audit PROJECT_ID --as PRINCIPAL... [--agent NAME]   Read-only probe: no owner-only or agent-only lesson reaches another principal
   custody verify PROJECT_ID   Read-only: stored sources still match their recorded hash; lists every transform applied at ingest
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
@@ -1503,7 +1504,7 @@ query_embed() {
 
 bridge_render_context() {
   local project_id="$1" results="$2" metadata="$3" budget="$4" output="$5" dir max_bytes used_bytes evidence_payload_bytes=0 path score type state status trust freshness sensitivity title lexical_rank semantic_rank graph_source graph_relation authority index_status excerpt claims claims_file evidence_refs evidence_file excerpt_bytes next_payload warning_bytes evidence_started=0 observed observed_line resolution_mode view_tmp final_resolution_note="" intent principal state_reason effective_ref evidence_group independent_count correlated_count provenance_state lifecycle_bundle lifecycle_warnings state_warnings raw_line visible_results visible_evidence_refs visible_evidence_ref first_visible
-  local header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$" BRIDGE_UTF8_SCRATCH="${output}.utf8.$$"
+  local flag_line="" header="${output}.header.$$" block="${output}.block.$$" footer="${output}.footer.$$" BRIDGE_UTF8_SCRATCH="${output}.utf8.$$"
   local block_bytes=0 context_bytes context_selected_count=0 context_rendered_count=0 context_truncated=false bounded_context render_results rendered_refs="" evidence_opened=false evidence_incomplete=false verified_hash evidence_rendered_count=0 evidence_visible_count=0 warning_line
   require_project "$project_id" dir
   max_bytes=$((budget * 4))
@@ -1635,6 +1636,7 @@ bridge_render_context() {
       printf '### %s\n\n%s\n\nReference: `%s`\nHash: `%s`\n%bLifecycle: `%s`; trust: `%s`; freshness: `%s`.\n\n' \
         "$title" "$excerpt" "$path" "$(sha256_file "$dir/$path")" "$observed_line" "$status" "$trust" "$freshness"
       printf 'Evidence group: `%s`; independent roots: `%s`; correlated records: `%s`; provenance: `%s`.\n\n' "${evidence_group:-unknown}" "${independent_count:-0}" "${correlated_count:-0}" "${provenance_state:-unknown}"
+      case "$path" in okf/*) flag_line="$(lesson_evidence_flag "$dir/$path" "$state")"; [ -z "$flag_line" ] || printf '%s\n\n' "$flag_line" ;; esac
       [ -z "$claims" ] || printf 'Derived non-canonical claims (not canonical truth):\n%s\n\n' "$claims"
     } >"$block"
     next_payload=$((evidence_payload_bytes + excerpt_bytes))
@@ -2954,6 +2956,61 @@ EOF
   printf '%s\n' "$file"
 }
 
+# 17 Nov #5: success | failure | unknown.  "partial" counts as failure: a
+# lesson from a task that only half worked should be checked too.
+normalise_outcome() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    success|succeeded|passed|pass|ok|done) printf 'success' ;;
+    failure|failed|fail|error|errored|partial|aborted|reverted) printf 'failure' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# The outcome of the task a review item was learnt from, and the evidence
+# path: "OUTCOME<TAB>REF".  Explicit brain_source_outcome wins; then a run
+# outcome (brain_outcome_ref / brain_run_ref); then the provenance episode's
+# brain_task_outcome.
+review_source_outcome() {
+  local dir="$1" review="$2" outcome ref="" run episode provenance
+  outcome="$(frontmatter_field "$review" brain_source_outcome)"
+  ref="$(frontmatter_field "$review" brain_source_evidence)"
+  if [ -z "$outcome" ]; then
+    ref="$(frontmatter_field "$review" brain_outcome_ref)"
+    if [ -z "$ref" ] && run="$(frontmatter_field "$review" brain_run_ref)" && [ -n "$run" ] && [ -f "$dir/$run" ]; then
+      ref="$(frontmatter_field "$dir/$run" brain_last_outcome_ref)"
+    fi
+    case "$ref" in runs/outcomes/*.md) [ -f "$dir/$ref" ] && outcome="$(frontmatter_field "$dir/$ref" brain_outcome_status)" ;; *) ref="" ;; esac
+  fi
+  provenance="$(frontmatter_field "$review" brain_provenance)"
+  if [ -z "$outcome" ] || [ -z "$ref" ]; then
+    case "$provenance" in
+      episode://*)
+        episode="$(grep -rl --include='*.md' "^brain_episode_id: ${provenance#episode://}$" "$dir/episodes" 2>/dev/null | head -n 1)"
+        if [ -n "$episode" ]; then
+          [ -n "$ref" ] || ref="${episode#"$dir"/}"
+          [ -n "$outcome" ] || outcome="$(frontmatter_field "$episode" brain_task_outcome)"
+        fi
+        ;;
+    esac
+  fi
+  [ -n "$ref" ] || ref="$(frontmatter_field "$review" brain_source_ref)"
+  printf '%s\t%s\n' "$(normalise_outcome "$outcome")" "${ref:-none}"
+}
+
+# Pack/recall line for a lesson the agent should not act on blindly: learnt
+# from a failed task, or conflicting with another record.  Empty otherwise.
+lesson_evidence_flag() {
+  local file="$1" state="$2" outcome evidence why=""
+  [ "${LLM_BRAIN_PACK_EVIDENCE_FLAGS:-1}" != 0 ] || return 0
+  fm_get outcome "$file" brain_source_outcome
+  [ "$outcome" != failure ] || why="it was learnt from a task that failed"
+  case "$state" in *conflicted) why="${why}${why:+, and }it conflicts with another record" ;; esac
+  [ -n "$why" ] || return 0
+  fm_get evidence "$file" brain_source_evidence
+  [ -n "$evidence" ] && [ "$evidence" != none ] || fm_get evidence "$file" brain_source_ref
+  printf 'Check evidence before acting: %s. Evidence: `%s`.' "$why" "${evidence:-none recorded}"
+}
+
 capture_source() {
   local project_id="$1" source="$2" topic_id="${3:-}" dir source_dir staging hash short name dest episode_id episode_file review_id review_file day created=0 idempotent=false
   require_project "$project_id" dir
@@ -3002,6 +3059,9 @@ capture_source() {
     source_identical=false; source_transforms='["input-changed-during-copy"]'
   fi
   upstream_transforms="$(frontmatter_field "$staging" brain_transforms 2>/dev/null || true)"
+  # 17 Nov #5: an adapter may say how the task in this record ended.
+  local task_outcome=""
+  task_outcome="$(normalise_outcome "$(frontmatter_field "$staging" brain_task_outcome 2>/dev/null || true)")"; [ "$task_outcome" != unknown ] || task_outcome=""
   short="${hash:0:12}"
   name="$(slug "$(basename "$source")")"
   dest="$source_dir/${hash}-${name}.md"
@@ -3044,7 +3104,8 @@ brain_source_ref: $(yaml_quote "sources/$(basename "$dest")")
 brain_source_hash_sha256: $hash
 brain_source_transforms: $source_transforms
 brain_source_bytes_identical: $source_identical${upstream_transforms:+
-brain_upstream_transforms: $(yaml_quote "$upstream_transforms")}
+brain_upstream_transforms: $(yaml_quote "$upstream_transforms")}${task_outcome:+
+brain_task_outcome: $task_outcome}
 brain_review_state: captured
 brain_sensitivity: $([ "$owner_only_custody" = 1 ] && printf 'restricted\nbrain_owner_only: true' || printf internal)
 brain_schema_version: $SCHEMA_VERSION${speaker_fields:+
@@ -3442,6 +3503,8 @@ promote_review_locked() {
       ;;
     *) say_error "review $review_id: brain_share_scope must be this-agent, this-owner or all-agents"; return 65 ;;
   esac
+  local source_outcome source_evidence
+  IFS=$'\t' read -r source_outcome source_evidence <<<"$(review_source_outcome "$dir" "$review")"
   if [ -n "$share_scope" ]; then
     share_lines="brain_share_scope: $share_scope"
     [ -z "$share_owner" ] || share_lines="$share_lines"$'\n'"brain_share_owner: $(yaml_quote "$share_owner")"
@@ -3478,6 +3541,8 @@ promote_review_locked() {
     [ -z "$principal_line" ] || printf '%s\n' "$principal_line"
     [ -z "$audience_line" ] || printf '%s\n' "$audience_line"
     [ -z "$share_lines" ] || printf '%s\n' "$share_lines"
+    printf 'brain_source_outcome: %s\n' "${source_outcome:-unknown}"
+    [ -z "$source_evidence" ] || [ "$source_evidence" = none ] || printf 'brain_source_evidence: %s\n' "$(yaml_quote "$source_evidence")"
     printf 'brain_provenance: %s\n' "$(yaml_quote "review://$review_id")"
     printf 'brain_provider_id: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")"
     printf 'brain_provider_version: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")"
@@ -5154,9 +5219,9 @@ cmd_review() {
       cat "$dir/review/$id.md" 2>/dev/null || die 66 "review missing: $id"
       ;;
     decide)
-      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set="" share_scope_set="" share_owner_set="" share_agent_set=""
+      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set="" share_scope_set="" share_owner_set="" share_agent_set="" source_outcome_set=""
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; --share-scope) share_scope_set="${2:-}"; shift 2 ;; --share-owner) share_owner_set="${2:-}"; shift 2 ;; --share-agent) share_agent_set="${2:-}"; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; --share-scope) share_scope_set="${2:-}"; shift 2 ;; --share-owner) share_owner_set="${2:-}"; shift 2 ;; --share-agent) share_agent_set="${2:-}"; shift 2 ;; --source-outcome) source_outcome_set="${2:-}"; case "$source_outcome_set" in success|failure|unknown) ;; *) die 64 "--source-outcome must be success, failure or unknown" ;; esac; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       [ -z "$applies_when_set" ] || validate_scalar "$applies_when_set" || die 65 "--applies-when must be a single line"
       case "$share_scope_set" in ''|this-agent|this-owner|all-agents) ;; *) die 64 "--share-scope must be this-agent, this-owner or all-agents" ;; esac
@@ -5202,6 +5267,10 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag fact
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
+        fi
+        if [ -n "$source_outcome_set" ]; then
+          set_frontmatter_field "$file" brain_source_outcome "$source_outcome_set"
+          audit_v2 "$dir" "source-outcome-set" "$id" "$old" "$old" "$(sha256_file "$file")" "outcome=$source_outcome_set reason=$(slug "$reason")"
         fi
         if [ -n "$share_scope_set" ]; then
           set_frontmatter_field "$file" brain_share_scope "$share_scope_set"
@@ -8941,6 +9010,8 @@ cmd_pack() {
         history_line="$(awk -F '\t' -v path="$rel" '$1 == path { print $4; exit }' "$history_file")"
         [ -z "$history_line" ] || printf 'Resolver: %s\n\n' "$history_line"
       fi
+      line="$(lesson_evidence_flag "$source" "$state")"
+      [ -z "$line" ] || printf '%s\n\n' "$line"
       if [ -n "$conflict_set" ] && [ "${is_conflict:-0}" = 1 ]; then
         printf 'Open conflict: <code>%s</code> conflicts with <code>%s</code>. Both sides are shown; do not pick one silently (settle it with <code>conflict decide</code>).\n\n' "$rel" "$(frontmatter_field "$source" brain_conflicts | tr -d '[]"')"
       fi

@@ -28,6 +28,13 @@
   20%) for open conflicts touching the task and show both sides together,
   so a tight budget can't cut them first. Packs without an open conflict
   are unchanged; `=0` turns it off.
+- Lessons record how the task they came from ended (`brain_source_outcome:
+  success | failure | unknown`, from a run outcome, the episode's
+  `brain_task_outcome`, or `review decide ... --source-outcome`; partial
+  counts as failure) and the evidence path (`brain_source_evidence`). Packs
+  and recall mark failure-derived or conflicting lessons "Check evidence
+  before acting" with that path. `LLM_BRAIN_PACK_EVIDENCE_FLAGS=0` hides the
+  marks.
 
 ## 0.13.0 - 2026-11-13
 
