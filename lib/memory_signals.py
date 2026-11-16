@@ -2502,7 +2502,7 @@ def brief_payload(vault: Vault, now: dt.datetime, max_bytes: int, recent_days: i
         if not vault.eligible(path, now):
             continue
         metadata = vault.meta(path)
-        if scope_ok is not None and not scope_ok(metadata.get("brain_applies_when"), applies):
+        if scope_ok is not None and not scope_ok(metadata.get("brain_applies_when"), applies, metadata.get("brain_relaxes_safeguard")):
             scope_hidden += 1
             continue
         freshness = okf.freshness(metadata, now.date())

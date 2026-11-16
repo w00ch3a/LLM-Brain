@@ -1259,15 +1259,21 @@ def parse_applies_context(value: str) -> dict[str, str]:
     return out
 
 
-def applies_when_ok(value: Any, context: Optional[dict[str, str]]) -> bool:
+def applies_when_ok(value: Any, context: Optional[dict[str, str]], relaxes: Any = False) -> bool:
     """26 Oct: brain_applies_when scope check (mirrors applies_when_filter in
     bin/llm-brain).  Fails open: a clause hides only when the caller's value
     for that key is known and different.  Unknown/generic/mcp host, missing
     task or project never hide; a malformed clause or unknown key shows the
-    record with a one-line memthena: warning on stderr."""
+    record with a one-line memthena: warning on stderr.
+
+    17 Nov #1: a record that relaxes a safeguard (brain_relaxes_safeguard:
+    true) fails closed instead: it shows only when it names a task scope and
+    the caller's task positively matches it (no wildcard, no unknown task)."""
     if context is None:
         return True
     text = clean(value).strip().strip("\"'").strip()
+    if relaxes_flag(relaxes) and safeguard_scope_enforced():
+        return safeguard_scope_matches(text, context)
     if text in ("", "null", "~"):
         return True
     bad = False
@@ -1300,7 +1306,7 @@ def constraint_rows(vault: Vault, now: dt.datetime, applies: Optional[dict[str, 
     for path in vault.semantic_files():
         if not vault.eligible(path, now):
             continue
-        if not applies_when_ok(vault.meta(path).get("brain_applies_when"), applies):
+        if not applies_when_ok(vault.meta(path).get("brain_applies_when"), applies, vault.meta(path).get("brain_relaxes_safeguard")):
             continue
         rel = vault.rel(path)
         kind = clean(vault.meta(path).get("brain_constraint"))
@@ -2239,6 +2245,121 @@ def command_capture_tag(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------- 17 Nov #1: safeguard-relaxing memory
+#
+# A note such as "skip the confirmation for this chore" is harmless where it
+# was learnt and dangerous anywhere else.  Records that relax a safeguard are
+# tagged brain_relaxes_safeguard: true, must carry a task scope before they
+# are promoted, and are packed only for a task that positively matches it.
+
+SAFEGUARD_OBJECT = (
+    r"(?:the\s+|any\s+|all\s+|a\s+)?(?:unit\s+|integration\s+|pre-?commit\s+)?"
+    r"(?:tests?|test\s+suite|confirmations?|confirm(?:ation)?\s+steps?|checks?|"
+    r"reviews?|verification|validation|approvals?|ci|hooks?|lint(?:ing)?|"
+    r"safeguards?|guards?|backups?|dry[- ]runs?|signing|sign-?off|assertions?)"
+)
+RELAX_PATTERNS = (
+    ("skip", re.compile(r"\b(?:skip(?:ping|ped|s)?|bypass(?:ing|ed|es)?|ignor(?:e|ing|ed)|omit(?:ting|ted|s)?|drop(?:ping|ped)?)\s+" + SAFEGUARD_OBJECT + r"\b", re.I)),
+    ("disable", re.compile(r"\b(?:disabl(?:e|ing|ed)|turn(?:ing|ed)?\s+off|switch(?:ing|ed)?\s+off|remov(?:e|ing|ed)|weaken(?:ing|ed|s)?|loosen(?:ing|ed|s)?|relax(?:ing|ed|es)?|comment(?:ing|ed)?\s+out)\s+" + SAFEGUARD_OBJECT + r"\b", re.I)),
+    ("auto-approve", re.compile(r"\bauto[- ]?(?:approv(?:e|es|ed|ing|al)|confirm(?:s|ed|ing)?|merg(?:e|es|ed|ing)|accept(?:s|ed|ing)?)\b", re.I)),
+    ("no-verify", re.compile(r"(?:--no-verify|--skip-tests?|--no-tests?|--force\b|--yes\b|(?:(?<=\s)|^)-y\b(?=\s|$)|--assume-yes|--dangerously[-\w]*|--no-confirm)", re.I)),
+    ("without", re.compile(r"\bwithout\s+(?:asking|confirm(?:ing|ation)|(?:running\s+)?" + SAFEGUARD_OBJECT + r"|review(?:ing)?|checking|verifying|approval)\b", re.I)),
+    ("no-need", re.compile(r"\b(?:no\s+need\s+to|(?:does|do)\s*n[o']?t\s+(?:need|have)\s+to|need\s*n[o']?t|don'?t\s+bother\s+(?:to|with)|do\s+not\s+bother\s+(?:to|with)|don'?t|do\s+not)\s+"
+                          r"(?:ask(?:\s+(?:for|before|first))?|confirm|(?:run|wait\s+for|do|bother\s+with)\s+" + SAFEGUARD_OBJECT + r"|(?:check|verify|review|test)(?!\s+(?:in|out)\b))\b", re.I)),
+)
+# Words that turn a match into the opposite: "never skip tests" tightens.
+RELAX_NEGATION = re.compile(r"\b(?:never|not|n't|no|must\s+not|mustn'?t|cannot|can'?t|do\s+not|don'?t|avoid|stop)\s+(?:\w+\s+){0,2}$", re.I)
+
+
+def relaxes_flag(value: Any) -> bool:
+    return clean(value).strip().strip("\"'").lower() in ("true", "yes", "1")
+
+
+def safeguard_scope_enforced() -> bool:
+    return os.environ.get("LLM_BRAIN_SAFEGUARD_SCOPE", "1") != "0"
+
+
+def relaxes_safeguard(text: str) -> tuple[bool, str]:
+    """Deterministic: does TEXT tell an agent to relax a safeguard?  Returns
+    (True, matched phrase) or (False, "")."""
+    for line in re.split(r"(?<=[.!?;])\s+|\n+", text or ""):
+        for kind, pattern in RELAX_PATTERNS:
+            for match in pattern.finditer(line):
+                before = line[: match.start()]
+                if kind == "no-need":
+                    # "never ... don't ask" / "always ... do not ask" are rare;
+                    # a leading "never" or "always" reverses the sense.
+                    if re.search(r"\b(?:never|always)\s+$", before, re.I):
+                        continue
+                    return True, match.group(0).strip()
+                if RELAX_NEGATION.search(before):
+                    continue
+                return True, match.group(0).strip()
+    return False, ""
+
+
+def safeguard_task_scope(text: str) -> list[str]:
+    """The task values a brain_applies_when value names (empty when it has no
+    task clause or the clause is a wildcard)."""
+    tasks: list[str] = []
+    for clause in (text or "").strip().strip("\"'").split(";"):
+        key, sep, want = clause.partition("=")
+        if not sep or APPLIES_WHEN_KEYS.get(key.strip().lower(), "") != "task":
+            continue
+        values = [item.strip() for item in want.split(",") if item.strip()]
+        if not values or "*" in values:
+            return []
+        tasks.extend(values)
+    return tasks
+
+
+def safeguard_scope_matches(text: str, context: dict[str, str]) -> bool:
+    tasks = safeguard_task_scope(text)
+    if not tasks:
+        return False
+    have = (context.get("task", "") or "").strip().lower()
+    if not have or have not in {item.lower() for item in tasks}:
+        return False
+    # Other clauses (project, host) still apply, failing closed when unknown.
+    for clause in text.strip().strip("\"'").split(";"):
+        key, sep, want = clause.partition("=")
+        key = APPLIES_WHEN_KEYS.get(key.strip().lower(), "")
+        if not sep or not key or key == "task":
+            continue
+        wanted = {item.strip().lower() for item in want.split(",") if item.strip()}
+        value = (context.get(key, "") or "").strip().lower()
+        if key == "host" and value in ("generic", "mcp", "unknown"):
+            value = ""
+        if "*" in wanted:
+            continue
+        if not value or value not in wanted:
+            return False
+    return True
+
+
+def command_relaxes_safeguard(args: argparse.Namespace) -> int:
+    """Print 'relaxes<TAB>PHRASE<TAB>SCOPE' or 'ok' for one record/review.
+    SCOPE is 'scoped:TASKS' when brain_applies_when names a task, else
+    'unscoped'.  An explicit brain_relaxes_safeguard: false is respected."""
+    try:
+        meta, body = okf.split_frontmatter(Path(args.file))
+    except okf.OkfError as exc:
+        print(f"relaxes-safeguard: {exc}", file=sys.stderr)
+        return 65
+    explicit = clean(meta.get("brain_relaxes_safeguard")).strip().strip("\"'").lower()
+    if explicit in ("false", "no", "0"):
+        print("ok")
+        return 0
+    found, phrase = relaxes_safeguard(clean(meta.get("title")) + "\n" + body)
+    if not found and not relaxes_flag(explicit):
+        print("ok")
+        return 0
+    tasks = safeguard_task_scope(clean(meta.get("brain_applies_when")))
+    scope = ("scoped:" + ",".join(tasks)) if tasks else "unscoped"
+    print(f"relaxes\t{phrase or 'declared'}\t{scope}")
+    return 0
+
+
 # ------------------------------- 26 Oct: structured speaker roles at capture
 
 # Labels typed inside content or tool output ("[User]: ...", "Assistant:",
@@ -2941,6 +3062,9 @@ def parser() -> argparse.ArgumentParser:
     cfilter.add_argument("--min-uses", type=int, default=int(os.environ.get("LLM_BRAIN_CHANGE_NOTICE_MIN_USES", "1") or 1))
     smatch = base("superseded-match", command_superseded_match)
     smatch.add_argument("--review", required=True)
+    rs = commands.add_parser("relaxes-safeguard")
+    rs.add_argument("--file", required=True)
+    rs.set_defaults(func=command_relaxes_safeguard)
     hsuf = base("historical-sufficiency", command_historical_sufficiency)
     hsuf.add_argument("--selected", required=True)
     hsuf.add_argument("--task", default="")

@@ -124,6 +124,7 @@ core_checks() {
     bash "$repo_root/tests/nested-inherits-self-check.sh" -- \
     bash "$repo_root/tests/conflict-decision-self-check.sh" -- \
     bash "$repo_root/tests/host-memory-snapshot-self-check.sh" -- \
+    bash "$repo_root/tests/safeguard-scope-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

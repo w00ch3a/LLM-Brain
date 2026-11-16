@@ -7,6 +7,11 @@
 - Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
+- Memories that relax a safeguard (skip a test or confirmation, auto-approve,
+  `--no-verify`, weaken a check) are tagged `brain_relaxes_safeguard`, held at
+  promotion until they name a task (`review decide ... --applies-when
+  'task=TYPE'`), and packed only for that task. `LLM_BRAIN_SAFEGUARD_SCOPE=0`
+  turns this off.
 
 ## 0.13.0 - 2026-11-13
 
