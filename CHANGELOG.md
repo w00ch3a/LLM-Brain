@@ -12,6 +12,12 @@
   promotion until they name a task (`review decide ... --applies-when
   'task=TYPE'`), and packed only for that task. `LLM_BRAIN_SAFEGUARD_SCOPE=0`
   turns this off.
+- Lessons carry a share scope (`brain_share_scope: this-agent | this-owner |
+  all-agents`, set with `review decide ... --share-scope`). A lesson captured
+  for a named principal is `this-owner` by default; owner-only records
+  (`brain_owner_only`, private, secret-bearing) can never be `all-agents`.
+  Packs, search, recall, briefs, exports and replication honour it, and
+  `share audit PROJECT --as PRINCIPAL...` probes for leaks (read-only).
 
 ## 0.13.0 - 2026-11-13
 

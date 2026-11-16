@@ -910,6 +910,13 @@ _SECRET_RE = re.compile(
 
 
 def _principal_visible(record: _Record, principal: bytes, strict: bool) -> bool:
+    # 17 Nov #2: a lesson's share scope narrows visibility first.
+    share = record.field(b"brain_share_scope")
+    if (share or record.field(b"brain_owner_only").strip(b"\"'").lower() == b"true") and not okf.share_scope_visible(
+        share, record.field(b"brain_share_owner"), record.field(b"brain_share_agent"),
+        record.field(b"brain_owner_only").strip(b"\"'").lower() == b"true", principal, None, strict,
+    ):
+        return False
     if not principal and not strict:
         return True
     if _SECRET_RE.search(record.raw):

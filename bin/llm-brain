@@ -167,6 +167,8 @@ Commands:
                                               --restore-superseded promotes a candidate that repeats an already-replaced version
                                               --accept-merge-loss promotes a merge/compression that drops answer-bearing content
                                               --applies-when 'task=TYPE' scopes it first (required for a memory that relaxes a safeguard)
+                                              --share-scope this-agent|this-owner|all-agents [--share-owner ID] [--share-agent NAME] who may see the lesson
+  share audit PROJECT_ID --as PRINCIPAL... [--agent NAME]   Read-only probe: no owner-only or agent-only lesson reaches another principal
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes
   review sweep PROJECT_ID|--all [--dry-run|--apply --confirm TOKEN|--undo RUN_ID|--scan-sources] [--by-project]
                                               Tiered backlog clean-up; dry-run prints counts only
@@ -3403,6 +3405,35 @@ promote_review_locked() {
   done < <(canonical_files "$dir")
   confidence="$(frontmatter_field "$review" brain_confidence confidence)"
   sensitivity="$(frontmatter_field "$review" brain_sensitivity sensitivity)"
+  # 17 Nov #2: share scope.  Explicit on the review (review decide
+  # --share-scope), else a lesson captured for a named principal is
+  # this-owner for that principal; nothing known keeps the 0.13 behaviour.
+  local share_scope share_owner share_agent share_lines=""
+  share_scope="$(frontmatter_field "$review" brain_share_scope)"; share_owner="$(frontmatter_field "$review" brain_share_owner)"; share_agent="$(frontmatter_field "$review" brain_share_agent)"
+  if [ -z "$share_scope" ] && [ -n "$(frontmatter_field "$review" brain_principal)" ] && [ "${LLM_BRAIN_SHARE_SCOPE_STAMP:-1}" != 0 ]; then share_scope=this-owner; fi
+  case "$share_scope" in
+    '') ;;
+    this-owner|this-agent)
+      [ -n "$share_owner" ] || share_owner="$(frontmatter_field "$review" brain_principal)"
+      [ -n "$share_owner" ] || share_owner="${LLM_BRAIN_OWNER_PRINCIPAL:-}"
+      if [ "$share_scope" = this-agent ]; then
+        [ -n "$share_agent" ] || share_agent="$(frontmatter_field "$review" brain_provider_id)"
+        [ -n "$share_agent" ] || { say_error "review $review_id: share scope this-agent needs --share-agent NAME"; return 65; }
+      fi
+      ;;
+    all-agents)
+      if [ "$(frontmatter_field "$review" brain_owner_only)" = true ] || [ "$sensitivity" = private ] || [ "$sensitivity" = restricted ] || ! secret_scan_file "$review" >/dev/null 2>&1; then
+        say_error "review $review_id is owner-only (secret, private or brain_owner_only); it cannot be shared with all agents"
+        return 65
+      fi
+      ;;
+    *) say_error "review $review_id: brain_share_scope must be this-agent, this-owner or all-agents"; return 65 ;;
+  esac
+  if [ -n "$share_scope" ]; then
+    share_lines="brain_share_scope: $share_scope"
+    [ -z "$share_owner" ] || share_lines="$share_lines"$'\n'"brain_share_owner: $(yaml_quote "$share_owner")"
+    [ -z "$share_agent" ] || share_lines="$share_lines"$'\n'"brain_share_agent: $(yaml_quote "$share_agent")"
+  fi
   authority_origin="$(frontmatter_field "$review" brain_authority_origin)"
   [ -z "$authority_origin" ] || authority_origin_line="brain_authority_origin: $(yaml_quote "$authority_origin")"
   [ -z "$(frontmatter_field "$review" brain_principal)" ] || principal_line="brain_principal: $(yaml_quote "$(frontmatter_field "$review" brain_principal)")"
@@ -3433,6 +3464,7 @@ promote_review_locked() {
     [ -z "$authority_origin_line" ] || printf '%s\n' "$authority_origin_line"
     [ -z "$principal_line" ] || printf '%s\n' "$principal_line"
     [ -z "$audience_line" ] || printf '%s\n' "$audience_line"
+    [ -z "$share_lines" ] || printf '%s\n' "$share_lines"
     printf 'brain_provenance: %s\n' "$(yaml_quote "review://$review_id")"
     printf 'brain_provider_id: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")"
     printf 'brain_provider_version: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")"
@@ -3883,6 +3915,8 @@ cmd_bridge() {
       [ "$(printf '%s' "$query" | wc -c | tr -d ' ')" -le 65536 ] || die 65 "bridge query exceeds 64 KiB"
       id="$(bridge_resolve_project "$source_root" "$project_id")"
       require_project "$id" dir
+      # 17 Nov #2: this-agent lessons match the agent identity (host here).
+      local -x LLM_BRAIN_AGENT_IDENTITY="${LLM_BRAIN_AGENT_IDENTITY:-$recall_host}"
   [ "$receipt_file" = __CANONICAL__ ] && receipt_file="$dir/audit/retrieval-receipts.jsonl"
       if [ -s "$dir/indexes/evidence-pending.txt" ]; then
         local pending_hash pending_stage batch_manifest source view view_hash vector claims
@@ -5107,11 +5141,13 @@ cmd_review() {
       cat "$dir/review/$id.md" 2>/dev/null || die 66 "review missing: $id"
       ;;
     decide)
-      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set=""
+      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set="" share_scope_set="" share_owner_set="" share_agent_set=""
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; --share-scope) share_scope_set="${2:-}"; shift 2 ;; --share-owner) share_owner_set="${2:-}"; shift 2 ;; --share-agent) share_agent_set="${2:-}"; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       [ -z "$applies_when_set" ] || validate_scalar "$applies_when_set" || die 65 "--applies-when must be a single line"
+      case "$share_scope_set" in ''|this-agent|this-owner|all-agents) ;; *) die 64 "--share-scope must be this-agent, this-owner or all-agents" ;; esac
+      { validate_scalar "$share_owner_set" && validate_scalar "$share_agent_set"; } || die 65 "--share-owner/--share-agent must be single lines"
       case "$state" in proposed|needs-validation|approved|rejected|superseded) ;; *) die 64 "invalid review state" ;; esac
       local dir file old
       require_project "$project_id" dir
@@ -5153,6 +5189,12 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag fact
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
+        fi
+        if [ -n "$share_scope_set" ]; then
+          set_frontmatter_field "$file" brain_share_scope "$share_scope_set"
+          [ -z "$share_owner_set" ] || set_frontmatter_field "$file" brain_share_owner "$(yaml_quote "$share_owner_set")"
+          [ -z "$share_agent_set" ] || set_frontmatter_field "$file" brain_share_agent "$(yaml_quote "$share_agent_set")"
+          audit_v2 "$dir" "share-scope-set" "$id" "$old" "$old" "$(sha256_file "$file")" "scope=$share_scope_set reason=$(slug "$reason")"
         fi
         if [ -n "$applies_when_set" ]; then
           set_frontmatter_field "$file" brain_applies_when "$(yaml_quote "$applies_when_set")"
@@ -6000,8 +6042,50 @@ visibility_matches() {
   return 1
 }
 
+# 17 Nov #2: per-lesson share scope (this-agent | this-owner | all-agents).
+# It only narrows: a this-owner lesson is hidden from every named principal
+# except brain_share_owner; a this-agent lesson additionally needs the caller
+# to run as brain_share_agent (LLM_BRAIN_AGENT_IDENTITY).  brain_owner_only
+# or private records are this-owner even when they claim all-agents.
+# Mirrors okf.share_scope_visible.
+share_scope_visible() {
+  local file="$1" principal="$2" share="" share_owner="" share_agent="" share_only="" share_sens=""
+  [ "${LLM_BRAIN_SHARE_SCOPE_ENFORCE:-1}" != 0 ] || return 0
+  fm_get share "$file" brain_share_scope
+  if [ -z "$share" ] || [ "$share" = all-agents ]; then
+    # Owner-only records are visible to the unnamed (owner) caller anyway.
+    [ -n "$principal" ] || [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" = 1 ] || return 0
+    fm_get share_only "$file" brain_owner_only
+    if [ "$share_only" != true ]; then
+      [ -n "$share" ] || return 0
+      fm_get share_sens "$file" brain_sensitivity sensitivity
+      [ "$share_sens" = private ] || return 0
+    fi
+    [ -n "$share" ] || { share=this-owner; share_owner="${LLM_BRAIN_OWNER_PRINCIPAL:-}"; }
+    share=this-owner
+  fi
+  case "$share" in this-owner|this-agent) ;; *) return 1 ;; esac
+  [ -n "$share_owner" ] || fm_get share_owner "$file" brain_share_owner
+  if [ -n "$principal" ]; then
+    [ -n "$share_owner" ] && [ "$principal" = "$share_owner" ] || return 1
+  else
+    [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] || return 1
+  fi
+  [ "$share" = this-agent ] || return 0
+  fm_get share_agent "$file" brain_share_agent
+  [ -n "$share_agent" ] && [ -n "${LLM_BRAIN_AGENT_IDENTITY:-}" ] && [ "$(printf '%s' "$share_agent" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$LLM_BRAIN_AGENT_IDENTITY" | tr '[:upper:]' '[:lower:]')" ]
+}
+
+share_scope_exportable() {
+  local share only
+  only="$(frontmatter_field "$1" brain_owner_only)"; [ "$only" != true ] || return 1
+  share="$(frontmatter_field "$1" brain_share_scope)"
+  [ -z "$share" ] || [ "$share" = all-agents ]
+}
+
 principal_visible() {
   local file="$1" principal="$2" scope audience
+  share_scope_visible "$file" "$principal" || return 1
   # Without a principal every record is visible unless the operator opts into
   # strict per-person scoping (0.10 #9): then only unscoped records are.
   [ -z "$principal" ] && [ "${LLM_BRAIN_STRICT_PRINCIPAL:-0}" != 1 ] && return 0
@@ -6937,6 +7021,48 @@ cmd_host_memory() {
       ;;
     *) die 64 "host-memory requires snapshot, list or diff" ;;
   esac
+}
+
+# 17 Nov #2: read-only leak probe.  For every owner-only or agent-only
+# lesson (share scope this-owner/this-agent, brain_owner_only, private or
+# secret-bearing), search for its title as each named principal (running as
+# --agent) and report any principal other than its owner that can see it.
+# Prints record paths only, never content.  Exit 1 when anything leaks.
+cmd_share() {
+  local action="${1:-}" project_id="${2:-}" agent="probe-agent" dir file rel share owner only sens title who leaks=0 checked=0 probes=0 secret_rc
+  local -a principals=()
+  shift 2 || true
+  [ "$action" = audit ] || die 64 "share requires audit PROJECT_ID --as PRINCIPAL..."
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) [ -n "${2:-}" ] || die 64 "--as requires PRINCIPAL"; validate_scalar "$2" || die 65 "--as must be a single line"; principals+=("$2"); shift 2 ;;
+      --agent) agent="${2:-}"; validate_scalar "$agent" || die 65 "--agent must be a single line"; shift 2 ;;
+      *) die 64 "unknown share audit option: $1" ;;
+    esac
+  done
+  [ "${#principals[@]}" -gt 0 ] || die 64 "share audit requires --as PRINCIPAL (repeatable)"
+  require_project "$project_id" dir
+  while IFS= read -r file; do
+    rel="${file#"$dir"/}"
+    share="$(frontmatter_field "$file" brain_share_scope)"; only="$(frontmatter_field "$file" brain_owner_only)"; sens="$(frontmatter_field "$file" brain_sensitivity sensitivity)"
+    secret_rc=0; secret_scan_file "$file" >/dev/null 2>&1 || secret_rc=$?
+    case "$share" in this-owner|this-agent) ;; *) [ "$only" = true ] || [ "$sens" = private ] || [ "$secret_rc" = 2 ] || continue ;; esac
+    owner="$(frontmatter_field "$file" brain_share_owner)"
+    case "$share" in this-owner|this-agent) ;; *) owner="${LLM_BRAIN_OWNER_PRINCIPAL:-}" ;; esac
+    title="$(frontmatter_field "$file" title)"; [ -n "$title" ] || title="$(basename "$file" .md)"
+    checked=$((checked + 1))
+    for who in "${principals[@]}"; do
+      [ "$who" != "$owner" ] || [ "$share" = this-agent ] || continue
+      probes=$((probes + 1))
+      if (LLM_BRAIN_AGENT_IDENTITY="$agent" cmd_search "$project_id" "$title" --principal "$who" --limit 50 2>/dev/null) | awk -F '\t' -v r="$rel" 'NR > 1 && $1 == r { f=1 } END { exit !f }'; then
+        [ "$who" = "$owner" ] && [ "$share" = this-agent ] && [ "$(printf '%s' "$agent" | tr '[:upper:]' '[:lower:]')" = "$(frontmatter_field "$file" brain_share_agent | tr '[:upper:]' '[:lower:]')" ] && continue
+        printf 'leak\t%s\t%s\n' "$rel" "$who"
+        leaks=$((leaks + 1))
+      fi
+    done
+  done < <(canonical_files "$dir")
+  printf 'share-audit records=%s probes=%s leaks=%s\n' "$checked" "$probes" "$leaks"
+  [ "$leaks" = 0 ]
 }
 
 cmd_conflict() {
@@ -8388,6 +8514,8 @@ cmd_pack() {
   [ -n "$pack_host" ] || pack_host="${LLM_BRAIN_HOST:-}"
   [ -n "$pack_host" ] || [ "$agent" = generic ] || pack_host="$agent"
   require_project "$project_id" dir
+  # 17 Nov #2: this-agent lessons match the agent this pack is for.
+  local -x LLM_BRAIN_AGENT_IDENTITY="${LLM_BRAIN_AGENT_IDENTITY:-$([ "$agent" = generic ] && printf '%s' "$pack_host" || printf '%s' "$agent")}"
   if [ "$sufficiency" = 1 ]; then
     # Sufficiency-gated expand-or-stop: select only as many records as the
     # evidence-coverage loop needed (falls back to 20 if the helper fails).
@@ -8908,6 +9036,8 @@ cmd_export() {
         [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || continue
         # 0.11: secret-bearing records stay in the brain, owner-only.
         secret_scan_file "$file" >/dev/null 2>&1 || continue
+        # 17 Nov #2: owner-only and agent-only lessons stay in the brain too.
+        share_scope_exportable "$file" || continue
         rel="${file#"$dir"/okf/}"
         mkdir -p "$stage/documents/$(dirname "$rel")"
         cp "$file" "$stage/documents/$rel"
@@ -8937,6 +9067,7 @@ cmd_export() {
       while IFS= read -r file; do
         [ "$(frontmatter_field "$file" brain_sensitivity sensitivity)" != private ] || rm -f "$file"
         secret_scan_file "$file" >/dev/null 2>&1 || rm -f "$file"
+        [ ! -f "$file" ] || share_scope_exportable "$file" || rm -f "$file"
       done < <(find "$bundle_dir/okf" -type f -name '*.md')
       {
         printf 'schema_version\t%s\n' "$SCHEMA_VERSION"
@@ -9369,6 +9500,7 @@ cmd_brief() {
   require_positive_integer "$max_bytes" || die 64 "--max-bytes must be a positive integer"
   require_positive_integer "$recent_days" || die 64 "--recent-days must be a positive integer"
   validate_scalar "$principal" || die 65 "--principal must be a single line"
+  local -x LLM_BRAIN_AGENT_IDENTITY="${LLM_BRAIN_AGENT_IDENTITY:-$brief_host}"
   if [ -z "$project_id" ]; then
     [ -n "$source_root" ] || source_root="$CWD"
     project_id="$(project_lookup_readonly "$source_root" || true)"
@@ -12540,6 +12672,7 @@ main() {
     validate-source) cmd_validate_source "$@" ;;
     retract) cmd_retract "$@" ;;
     conflict) cmd_conflict "$@" ;;
+    share) cmd_share "$@" ;;
     host-memory) cmd_host_memory "$@" ;;
     index) cmd_index "$@" ;;
     search) if [ "${LLM_BRAIN_RECEIPTS:-0}" = 1 ] && ! printf '%s\n' "$@" | grep -qx -- --receipt; then set -- "$@" --receipt; fi; SEARCH_MARK_SCOPE=1 cmd_search "$@" ;;

@@ -46,6 +46,54 @@ SECRET_BEARING = re.compile(
 )
 
 
+
+# 17 Nov #2: per-lesson share scope.  brain_share_scope narrows who may see a
+# lesson; it never widens the existing principal/audience/secret rules.
+SHARE_SCOPES = ("this-agent", "this-owner", "all-agents")
+
+
+def _share_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if value is None:
+        return ""
+    return str(value).strip().strip("\"'").strip()
+
+
+def share_scope_visible(scope: Any, owner: Any, agent_want: Any, owner_only: bool,
+                        principal: Any, agent: Any = None, strict: bool = False) -> bool:
+    """Is a record with this share scope visible to PRINCIPAL running as AGENT?
+    this-owner: callers without a principal (the brain owner by convention,
+    unless LLM_BRAIN_STRICT_PRINCIPAL=1) and the named owner.  this-agent: in
+    addition, only the named agent (an unknown agent never matches).  An
+    owner-only record (brain_owner_only, private) is this-owner even when it
+    claims all-agents.  Unknown values fail closed."""
+    if os.environ.get("LLM_BRAIN_SHARE_SCOPE_ENFORCE", "1") == "0":
+        return True
+    scope_text = _share_text(scope).lower()
+    if not scope_text or scope_text == "all-agents":
+        if not owner_only:
+            return True
+        if not scope_text:
+            owner = os.environ.get("LLM_BRAIN_OWNER_PRINCIPAL", "")
+        scope_text = "this-owner"
+    if scope_text not in SHARE_SCOPES:
+        return False
+    who = _share_text(principal)
+    owner_text = _share_text(owner)
+    if who:
+        if not owner_text or who != owner_text:
+            return False
+    elif strict or os.environ.get("LLM_BRAIN_STRICT_PRINCIPAL", "0") == "1":
+        return False
+    if scope_text == "this-agent":
+        if agent is None:
+            agent = os.environ.get("LLM_BRAIN_AGENT_IDENTITY", "")
+        want = _share_text(agent_want).lower()
+        have = _share_text(agent).lower()
+        return bool(want) and bool(have) and want == have
+    return True
+
 class UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader variant that rejects duplicate mapping keys."""
 
@@ -1541,6 +1589,13 @@ class LifecycleResolver:
         except OSError:
             return False
         if path not in self.file_set or path in self.errors:
+            return False
+        share_meta = self.load(path)
+        if (share_meta.get("brain_share_scope") not in (None, "") or _share_text(share_meta.get("brain_owner_only")).lower() == "true") and not share_scope_visible(
+            share_meta.get("brain_share_scope"), share_meta.get("brain_share_owner"),
+            share_meta.get("brain_share_agent"), _share_text(share_meta.get("brain_owner_only")).lower() == "true",
+            self.principal, None, False,
+        ):
             return False
         # Only the explicitly approved internal class is traversable.  Unknown
         # or malformed classifications fail closed instead of being emitted.

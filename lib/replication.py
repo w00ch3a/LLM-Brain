@@ -209,6 +209,12 @@ def protected(meta: Mapping[str, str], data: bytes, rel: str) -> Optional[str]:
     state = (meta.get("brain_review_state") or meta.get("review_state") or "").lower()
     if state == "quarantine":
         return "quarantine-state"
+    # 17 Nov #2: owner-only and agent-only lessons never leave this brain.
+    if (meta.get("brain_owner_only") or "").strip().strip("\"'").lower() == "true":
+        return "owner-only"
+    share = (meta.get("brain_share_scope") or "").strip().strip("\"'").lower()
+    if share and share not in ("all-agents", "this-owner"):
+        return "share-scope-%s" % (share if share == "this-agent" else "invalid")
     try:
         if _SECRET.search(text_for(data, rel)):
             return "secret-scan"
@@ -364,6 +370,10 @@ def has_visibility_metadata(meta: Mapping[str, Any]) -> bool:
 
 
 def visible_for_scope(meta: Mapping[str, str], scope: str, principal: str) -> bool:
+    # 17 Nov #2: a this-owner lesson replicates only to its owner's scope.
+    if (meta.get("brain_share_scope") or "").strip().strip("\"'").lower() == "this-owner":
+        owner = (meta.get("brain_share_owner") or "").strip().strip("\"'")
+        return scope == "principal" and bool(owner) and principal == owner
     if not has_visibility_metadata(meta):
         return True
     return scope == "principal" and principal_matches(meta, principal)
