@@ -8499,6 +8499,28 @@ pack_judge() {
   feedback_record "$project_id" "${feedback_args[@]}"
 }
 
+# 17 Nov #4: open conflicts touching the query.  Prints "REL<TAB>" for each
+# selected record whose search state is conflicted and that no valid
+# decision settled, then "REL<TAB>PARTNER" for each other side named in its
+# brain_conflicts (visible, effective canonical records only).
+pack_open_conflicts() {
+  local dir="$1" results="$2" principal="$3" project="${4:-}" host="${5:-}" task_type="${6:-}" rel item partner
+  awk -F '\t' 'NR > 1 && $4 ~ /conflicted$/ { print $1 }' "$results" | while IFS= read -r rel; do
+    [ -n "$rel" ] && [ -f "$dir/$rel" ] || continue
+    [ "$(conflict_decision_role "$dir" "$rel")" = none ] || continue
+    printf '%s\t\n' "$rel"
+    while IFS= read -r item; do
+      [ -n "$item" ] || continue
+      partner="$(conflict_ref_rel "$dir" "${item#./}" 2>/dev/null || true)"
+      [ -n "$partner" ] && [ "$partner" != "$rel" ] || continue
+      canonical_file_effective "$dir" "$dir/$partner" 2>/dev/null || continue
+      bridge_render_record_visible "$dir" "$partner" "$principal" || continue
+      [ -z "$(applies_when_out_of_scope "$dir" "$project" "$host" "$task_type" "$dir/$partner" 2>/dev/null)" ] || continue
+      printf '%s\t%s\n' "$rel" "$partner"
+    done < <(frontmatter_field "$dir/$rel" brain_conflicts | tr -d '[]"' | tr ',' '\n' | sed 's/^ *//; s/ *$//')
+  done
+}
+
 cmd_pack() {
   local action="$1" project_id="$2"; shift 2 || true
   if [ "$action" = judge ]; then pack_judge "$project_id" "$@"; return; fi
@@ -8746,6 +8768,27 @@ cmd_pack() {
       inherited_hash="$(while IFS=$'\t' read -r parent_id rel; do printf '%s\t%s\t%s\n' "$parent_id" "$rel" "$(sha256_file "$(project_dir "$parent_id")/$rel")"; done <"$inherited_file" | sha256_file /dev/stdin)"
     fi
   fi
+  # 17 Nov #4: keep part of the budget (LLM_BRAIN_PACK_CONFLICT_RESERVE, %,
+  # default 20) for open conflicts touching the query, so a tight budget
+  # cannot cut them first.  Both sides of each conflict are brought next to
+  # each other in render order.  No open conflict = the 0.13 pack exactly.
+  local conflict_reserve="${LLM_BRAIN_PACK_CONFLICT_RESERVE:-20}" conflict_set="" conflict_hash="" conflict_reserve_bytes=0 conflict_bytes=0 main_bytes_full=0 conflict_kept=0 conflict_cut=0 is_conflict
+  case "$conflict_reserve" in ''|*[!0-9]*) conflict_reserve=20 ;; esac
+  [ "$conflict_reserve" -le 90 ] || conflict_reserve=90
+  if [ "$conflict_reserve" -gt 0 ] && [ "$intent" != current_state ] && [ -n "$render_order" ]; then
+    local conflict_pairs
+    conflict_pairs="$(pack_open_conflicts "$dir" "$results" "$principal" "$project_id" "$pack_host" "$pack_task_type" 2>/dev/null || true)"
+    conflict_set="$(printf '%s\n' "$conflict_pairs" | awk -F '\t' '{ print $1; if ($2 != "") print $2 }' | awk 'NF && !s[$0]++')"
+    if [ -n "$conflict_set" ]; then
+      render_order="$(printf '%s\n' "$render_order" | awk -F '\t' '
+        NR == FNR { if ($2 != "") partners[$1] = partners[$1] "\n" $2; next }
+        $0 == "" || done[$0] { next }
+        { print; done[$0] = 1; n = split(partners[$0], p, "\n"); for (i = 1; i <= n; i++) if (p[i] != "" && !done[p[i]]) { print p[i]; done[p[i]] = 1 } }
+      ' <(printf '%s\n' "$conflict_pairs") -)"
+      conflict_reserve_bytes=$((budget * 4 * conflict_reserve / 100))
+      conflict_hash="$(sha256_text "$conflict_reserve:$conflict_set")"
+    fi
+  fi
   if [ "$intent" = evidence ] || [ "$intent" = current_state ] || [ "$require_evidence" = 1 ]; then
     source_snapshot_hash="$(
       { printf '%s\n' "$selected"; printf '%s\n' "$evidence_refs" | tr ',' '\n'; } |
@@ -8759,7 +8802,7 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${conflict_hash:+|conflicts:$conflict_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
@@ -8774,6 +8817,7 @@ cmd_pack() {
     [ -z "$inherited_hash" ] || printf 'brain_inherits: %s\n' "$inherits"
     [ "$scope_hidden_count" = 0 ] || printf 'brain_applies_when_hidden: %s\n' "$scope_hidden_count"
     [ "$action_risk" != high ] || printf 'brain_action_risk: high\n'
+    [ -z "$conflict_set" ] || printf 'brain_conflict_reserve_percent: %s\nbrain_open_conflicts: %s\n' "$conflict_reserve" "$(printf '%s\n' "$conflict_set" | awk 'NF' | wc -l | tr -d ' ')"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
     if [ -n "$freshness_hash" ]; then
@@ -8874,7 +8918,20 @@ cmd_pack() {
       fi
       excerpt="$(body_after_frontmatter "$source" | head -c 800)"
       evidence_bytes="$(printf '%s' "$excerpt" | wc -c | tr -d ' ')"
-      [ $((bytes + evidence_bytes)) -le $((budget * 4)) ] || { context_truncated=true; evidence_incomplete=true; break; }
+      if [ -n "$conflict_set" ]; then
+        # Conflict sides may use the reserve or any room left; everything
+        # else stops at the budget minus the unused reserve.
+        is_conflict=0; printf '%s\n' "$conflict_set" | grep -Fxq -- "$rel" && is_conflict=1
+        if [ "$is_conflict" = 1 ]; then
+          if [ $((bytes + evidence_bytes)) -gt $((budget * 4)) ]; then context_truncated=true; evidence_incomplete=true; conflict_cut=$((conflict_cut + 1)); continue; fi
+          conflict_bytes=$((conflict_bytes + evidence_bytes)); conflict_kept=$((conflict_kept + 1))
+        else
+          local reserve_left=$((conflict_reserve_bytes - conflict_bytes)); [ "$reserve_left" -ge 0 ] || reserve_left=0
+          if [ "$main_bytes_full" = 1 ] || [ $((bytes + evidence_bytes + reserve_left)) -gt $((budget * 4)) ]; then main_bytes_full=1; context_truncated=true; evidence_incomplete=true; continue; fi
+        fi
+      else
+        [ $((bytes + evidence_bytes)) -le $((budget * 4)) ] || { context_truncated=true; evidence_incomplete=true; break; }
+      fi
       facts="$(okf facts "$source")"
       IFS=$'\t' read -r type title status trust freshness generated_at stale_after source_count runtime <<<"$facts"
       lifecycle_warnings="$(lifecycle_bundle_warning_text "$lifecycle_bundle" 2>/dev/null || true)"
@@ -8883,6 +8940,9 @@ cmd_pack() {
       if [ -n "$history_file" ] && [ -s "$history_file" ]; then
         history_line="$(awk -F '\t' -v path="$rel" '$1 == path { print $4; exit }' "$history_file")"
         [ -z "$history_line" ] || printf 'Resolver: %s\n\n' "$history_line"
+      fi
+      if [ -n "$conflict_set" ] && [ "${is_conflict:-0}" = 1 ]; then
+        printf 'Open conflict: <code>%s</code> conflicts with <code>%s</code>. Both sides are shown; do not pick one silently (settle it with <code>conflict decide</code>).\n\n' "$rel" "$(frontmatter_field "$source" brain_conflicts | tr -d '[]"')"
       fi
       if [ "$(frontmatter_field "$source" brain_relaxes_safeguard)" = true ] && [ "${LLM_BRAIN_SAFEGUARD_SCOPE:-1}" != 0 ]; then
         printf 'Relaxes a safeguard: only for <code>%s</code>, the task it was learnt on. It does not carry over to any other task; every other confirmation and test step still applies.\n\n' "$(frontmatter_field "$source" brain_applies_when)"
@@ -8950,6 +9010,7 @@ cmd_pack() {
     footer_labels="$(awk -F= '$1 == "label_filtered_count" { print $2; exit }' "$metadata")"; case "$footer_labels" in ''|*[!0-9]*) footer_labels=0 ;; esac
     footer_lower=$((footer_matched - records_rendered - superseded_omitted - hidden_future - state_skipped)); [ "$footer_lower" -ge 0 ] || footer_lower=0
     footer_scope=$((scope_hidden_count + footer_labels + superseded_omitted + hidden_future + state_skipped))
+    [ -z "$conflict_set" ] || printf 'Conflict reserve: %s%% of the budget held for open conflicts; %s conflicting record(s) shown%s.\n\n' "$conflict_reserve" "$conflict_kept" "$([ "$conflict_cut" = 0 ] || printf ', %s cut by the budget' "$conflict_cut")"
     local safeguard_withheld=0
     [ -z "$scope_hidden" ] || safeguard_withheld="$(printf '%s\n' "$scope_hidden" | awk -F '\t' 'index($2, "relaxes-safeguard:") == 1' | wc -l | tr -d ' ')"
     [ "$safeguard_withheld" = 0 ] || printf 'Withheld %s memory(ies) that relax a safeguard (skip a test, a confirmation or a check): each applies only to the task it was learnt on, not this one. Keep every safeguard here.\n\n' "$safeguard_withheld"

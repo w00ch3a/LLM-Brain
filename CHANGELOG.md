@@ -24,6 +24,10 @@
   and MCP capture now declare rendering, redaction, truncation and role-label
   escaping). `custody verify PROJECT` re-hashes every stored source and lists
   what changed on the way in (read-only).
+- Packs hold part of the budget (`LLM_BRAIN_PACK_CONFLICT_RESERVE`, default
+  20%) for open conflicts touching the task and show both sides together,
+  so a tight budget can't cut them first. Packs without an open conflict
+  are unchanged; `=0` turns it off.
 
 ## 0.13.0 - 2026-11-13
 

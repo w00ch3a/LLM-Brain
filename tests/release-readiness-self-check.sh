@@ -127,6 +127,7 @@ core_checks() {
     bash "$repo_root/tests/safeguard-scope-self-check.sh" -- \
     bash "$repo_root/tests/share-scope-self-check.sh" -- \
     bash "$repo_root/tests/ingest-transforms-self-check.sh" -- \
+    bash "$repo_root/tests/conflict-reserve-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 
