@@ -180,7 +180,7 @@ Commands:
   retract PROJECT_ID CANONICAL_ID --reason TEXT [--source REF] [--preview [--principal ID]|--confirm TOKEN] | --finish
   index build|status PROJECT_ID [--embedder EXECUTABLE] [--json]
   search PROJECT_ID QUERY [--topic ID] [--limit N] [--strategy lexical|vector|hybrid] [--query-embedder EXECUTABLE] [--fusion rrf|zscore] [--fusion-alpha A] [--vector-weight W] [--vector-gate always|never|MARGIN] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--explain] [--include-proposed] [--include-cold] [--path FILE]... [--usage-boost]
-  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label L]... [--without-label L]... [--turn N] [--session ID] [--state-index] [--sufficiency] [--host NAME] [--task-type TYPE] [--action-risk low|medium|high]
+  pack build PROJECT_ID --task TEXT [--agent NAME] [--budget-tokens N] [--strategy lexical|hybrid] [--query-embedder EXECUTABLE] [--expand-graph] [--historical] [--as-of ISO-UTC] [--intent INTENT] [--principal ID] [--require-evidence] [--exploratory] [--receipt] [--path FILE]... [--usage-boost] [--recency-boost] [--label L]... [--without-label L]... [--turn N] [--session ID] [--state-index] [--sufficiency] [--host NAME] [--task-type TYPE] [--action-risk low|medium|high] [--layout ranked|auto|timeline|current-first|side-by-side|steps]
   pack judge PROJECT_ID --pack REF [--visible FILE] [--later FILE] [--record] [--json]   Point-of-use: new vs already-visible, used later or not
   adapters build PROJECT_ID [--agent NAME|all]
   adapters openclaw inspect|stage PROJECT_ID INPUT [--output PATH] [--scope project|principal] [--principal ID]
@@ -8596,7 +8596,7 @@ cmd_pack() {
   [ "$action" = "build" ] || die 64 "pack requires build or judge"
   local current_file="" current_hash="" superseded_omitted=0 history_file="" history_hash="" history_line="" sufficiency_file="" historical_sufficiency="none" hidden_future=0
   local recency_boost=0 pack_turn=0 pack_every="${LLM_BRAIN_CONSTRAINT_EVERY:-8}" pack_session="" state_index=0 sufficiency=0 search_limit=20 extras_file="" extras_hash=""
-  local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources
+  local action_risk="${LLM_BRAIN_PACK_ACTION_RISK:-}" risk_reasons risk_sources pack_layout="${LLM_BRAIN_PACK_LAYOUT:-ranked}" layout_line="" layout_reason="" layout_lead="" layout_foot="" layout_hash=""
   local -a pack_label_args=()
   local record_sources=0 record_voices=0 records_rendered=0 state_skipped=0
   local inherits="" inherited_file="" inherited_hash="" inherited_count=0 parent_id parent_dir decisions_text="" decisions_hash=""
@@ -8633,6 +8633,7 @@ cmd_pack() {
       --host) pack_host="${2:-}"; shift 2 ;;
       --task-type) pack_task_type="${2:-}"; shift 2 ;;
       --action-risk) action_risk="${2:-}"; shift 2 ;;
+      --layout) pack_layout="${2:-}"; shift 2 ;;
       *) die 64 "unknown pack option: $1" ;;
     esac
   done
@@ -8641,6 +8642,7 @@ cmd_pack() {
   # Action risk (AMV-Guard): only "high" changes the pack; low/medium/unset
   # render byte-for-byte as before.
   case "$action_risk" in ''|low|medium|high) ;; *) die 64 "--action-risk must be low, medium or high" ;; esac
+  case "$pack_layout" in ranked|auto|timeline|current-first|side-by-side|steps) ;; *) die 64 "--layout must be ranked, auto, timeline, current-first, side-by-side or steps" ;; esac
   case "$intent" in
     exact_identifier|factual|current_state|historical|procedure|evidence|exploratory|legacy) ;;
     *) die 64 "unsupported pack intent: $intent" ;;
@@ -8858,6 +8860,24 @@ cmd_pack() {
       conflict_hash="$(sha256_text "$conflict_reserve:$conflict_set")"
     fi
   fi
+  # 17 Nov #6: lay the same records out to suit the question (opt-in;
+  # --layout auto picks timeline / current-first / side-by-side / steps).
+  if [ "$pack_layout" != ranked ] && [ -n "$render_order" ]; then
+    local layout_tmp layout_out
+    layout_tmp="$(mktemp "$dir/context-packs/.layout.XXXXXX")"
+    printf '%s\n' "$render_order" >"$layout_tmp.in"
+    printf '%s\n' "${conflict_pairs:-}" >"$layout_tmp.pairs"
+    local -a layout_args=(pack-layout --project-dir "$dir" --selected "$layout_tmp.in" --results "$results" --conflicts "$layout_tmp.pairs" --task "$task" --intent "$intent" --layout "$pack_layout" --section-out "$layout_tmp.lead" --footnote-out "$layout_tmp.foot")
+    [ -z "$principal" ] || layout_args+=(--principal "$principal")
+    [ -z "$current_file" ] || layout_args+=(--dropped "$current_file")
+    if layout_out="$(memory_lineage "${layout_args[@]}" 2>/dev/null)" && [ -n "$layout_out" ]; then
+      IFS=$'\t' read -r layout_line layout_reason <<<"$(printf '%s\n' "$layout_out" | head -n 1)"
+      render_order="$(printf '%s\n' "$layout_out" | tail -n +2)"
+      layout_lead="$(cat "$layout_tmp.lead" 2>/dev/null || true)"; layout_foot="$(cat "$layout_tmp.foot" 2>/dev/null || true)"
+      layout_hash="$(sha256_text "$layout_line|$render_order|$layout_lead|$layout_foot")"
+    fi
+    rm -f "$layout_tmp" "$layout_tmp.in" "$layout_tmp.pairs" "$layout_tmp.lead" "$layout_tmp.foot"
+  fi
   if [ "$intent" = evidence ] || [ "$intent" = current_state ] || [ "$require_evidence" = 1 ]; then
     source_snapshot_hash="$(
       { printf '%s\n' "$selected"; printf '%s\n' "$evidence_refs" | tr ',' '\n'; } |
@@ -8871,7 +8891,7 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${conflict_hash:+|conflicts:$conflict_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${conflict_hash:+|conflicts:$conflict_hash}${layout_hash:+|layout:$layout_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
@@ -8886,6 +8906,7 @@ cmd_pack() {
     [ -z "$inherited_hash" ] || printf 'brain_inherits: %s\n' "$inherits"
     [ "$scope_hidden_count" = 0 ] || printf 'brain_applies_when_hidden: %s\n' "$scope_hidden_count"
     [ "$action_risk" != high ] || printf 'brain_action_risk: high\n'
+    [ -z "$layout_line" ] || printf 'brain_layout: %s\n' "$layout_line"
     [ -z "$conflict_set" ] || printf 'brain_conflict_reserve_percent: %s\nbrain_open_conflicts: %s\n' "$conflict_reserve" "$(printf '%s\n' "$conflict_set" | awk 'NF' | wc -l | tr -d ' ')"
     printf '%s\n\n' '---'
     printf '# %s Context Pack\n\nTask: %s\n\n' "$agent" "$task"
@@ -8967,6 +8988,10 @@ cmd_pack() {
       [ "$hidden_future" = 0 ] || printf -- '- %s matching record(s) written after this date were left out.\n' "$hidden_future"
       printf '\n'
     fi
+    if [ -n "$layout_line" ]; then
+      printf 'Layout: %s (%s).\n\n' "$layout_line" "$layout_reason"
+      [ -z "$layout_lead" ] || { printf '%s\n\n' "$layout_lead"; bytes=$((bytes + ${#layout_lead})); }
+    fi
     printf '## Selected Memory\n\n'
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
@@ -9038,6 +9063,7 @@ cmd_pack() {
       rendered_refs="${rendered_refs}${rendered_refs:+,}${rel}"
       records_rendered=$((records_rendered + 1))
     done <<<"$render_order"
+    [ -z "$layout_foot" ] || { printf '%s\n\n' "$layout_foot"; bytes=$((bytes + ${#layout_foot})); }
     if [ -n "$inherited_file" ] && [ -s "$inherited_file" ]; then
       for parent_id in $(cut -f1 "$inherited_file" | awk '!s[$0]++'); do
         printf '## Inherited from `%s` (declared with inherits)\n\n' "$parent_id"

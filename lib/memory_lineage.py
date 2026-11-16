@@ -2897,6 +2897,182 @@ def command_attempt_meta(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------ 17 Nov #6: intent-aware layout
+#
+# Same retrieval, different layout.  The pack's records are re-ordered and a
+# short lead section is added to suit what was asked: a timeline for "when /
+# what changed", the current value first with replaced versions footnoted for
+# "what is X", both sides of a conflict side by side, steps first for "how do
+# I".  ``ranked`` is the 0.13 layout.
+
+LAYOUTS = ("ranked", "timeline", "current-first", "side-by-side", "steps")
+LAYOUT_TIMELINE = re.compile(r"\b(when|what changed|changed|changes|history|timeline|since|over time|used to|previously|before .{0,20}after|evolv\w*)\b", re.I)
+LAYOUT_STEPS = re.compile(r"\b(how (?:do|to|can|should|does)|steps?|procedure|runbook|instructions?|walk ?through|set ?up|install)\b", re.I)
+LAYOUT_CURRENT = re.compile(r"\b(what(?:'s| is| are)|which|current(?:ly)?|now|latest|today|at the moment)\b", re.I)
+STEP_LINE = re.compile(r"^\s*(?:\d+[.)]|[-*+])\s+\S")
+
+
+def _cell(text: str, limit: int = 160) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip().replace("|", "\\|")
+    return (text[: limit - 1].rstrip() + "…") if len(text) > limit else (text or "—")
+
+
+def _source_names(meta: dict[str, Any]) -> str:
+    names = []
+    for item in meta.get("sources") or []:
+        name = clean(item.get("resource") or item.get("ref") or item.get("url")) if isinstance(item, dict) else clean(item)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names) or "—"
+
+
+def _layout_date(vault: Vault, path: Path) -> str:
+    meta = vault.meta(path)
+    for key in ("brain_observed_at", "brain_valid_from"):
+        value = clean(meta.get(key))
+        if value:
+            return value[:10]
+    created = _created(vault, path)
+    return created.date().isoformat() if created else ""
+
+
+def choose_layout(task: str, intent: str, has_conflicts: bool, has_steps: bool) -> tuple[str, str]:
+    if has_conflicts:
+        return "side-by-side", "open conflicts touch this task"
+    if intent == "historical" or LAYOUT_TIMELINE.search(task or ""):
+        return "timeline", "the task asks when or what changed"
+    if (intent == "procedure" or LAYOUT_STEPS.search(task or "")) and has_steps:
+        return "steps", "the task asks how to do something"
+    if intent in ("current_state", "factual", "exact_identifier") or LAYOUT_CURRENT.search(task or ""):
+        return "current-first", "the task asks for a current value"
+    return "ranked", "no layout cue in the task"
+
+
+def command_pack_layout(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    refs = [line.strip() for line in Path(args.selected).read_text(encoding="utf-8").splitlines() if line.strip()]
+    states: dict[str, str] = {}
+    ranked: list[str] = []
+    if args.results and Path(args.results).is_file():
+        for line in Path(args.results).read_text(encoding="utf-8").splitlines()[1:]:
+            cols = line.split("\t")
+            if len(cols) > 3:
+                states[cols[0]] = cols[3]
+                try:
+                    ranked.append((cols[0], float(cols[1])))
+                except ValueError:
+                    pass
+    # A conflict only shapes the layout when one side scores at least half
+    # the top hit; a weak match the search padded in keeps its #4 label but
+    # gets no table.
+    best = max((score for _, score in ranked), default=0.0)
+    top = {ref for ref, score in ranked if best > 0 and score >= best * 0.5} or set(refs[:1])
+    pairs: list[tuple[str, str]] = []
+    if args.conflicts and Path(args.conflicts).is_file():
+        for line in Path(args.conflicts).read_text(encoding="utf-8").splitlines():
+            a, _, b = line.partition("\t")
+            if a and b and a in refs and b in refs and (a in top or b in top) and tuple(sorted((a, b))) not in pairs:
+                pairs.append(tuple(sorted((a, b))))
+    dropped: list[str] = []
+    if args.dropped and Path(args.dropped).is_file():
+        for line in Path(args.dropped).read_text(encoding="utf-8").splitlines():
+            cols = line.split("\t")
+            if len(cols) > 1 and cols[0] == "drop":
+                dropped.append(cols[1])
+    info: dict[str, dict[str, Any]] = {}
+    for ref in refs + dropped:
+        path = vault.resolver.canonical_ref(ref)
+        if path is None:
+            continue
+        try:
+            meta, body = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        steps = [line.strip() for line in body.splitlines() if STEP_LINE.match(line)]
+        info[ref] = {"path": path, "meta": meta, "body": body, "title": clean(meta.get("title")) or ref,
+                     "type": clean(meta.get("type")), "date": _layout_date(vault, path), "steps": steps}
+    has_steps = any(item["type"] == "Procedure" or len(item["steps"]) >= 2 for ref, item in info.items() if ref in refs)
+    layout, reason = args.layout, "requested"
+    if layout == "auto":
+        layout, reason = choose_layout(args.task, args.intent, bool(pairs), has_steps)
+    if layout == "side-by-side" and not pairs:
+        layout, reason = "ranked", "no open conflict to compare"
+    order = list(refs)
+    lead: list[str] = []
+    foot: list[str] = []
+    if layout == "timeline":
+        dated = [r for r in refs if r in info and info[r]["date"]]
+        undated = [r for r in refs if r not in dated]
+        order = sorted(dated, key=lambda r: (info[r]["date"], refs.index(r))) + undated
+        lead.append("## Timeline — oldest first\n")
+        for ref in order:
+            if ref in info:
+                lead.append(f"- {info[ref]['date'] or 'undated'} — {_cell(info[ref]['title'], 100)}: {_cell(ms.first_sentence(info[ref]['body']))} (`{ref}`)")
+    elif layout == "current-first":
+        def current_rank(ref: str) -> int:
+            state = states.get(ref, "")
+            keyed = bool(clean(info.get(ref, {}).get("meta", {}).get("brain_state_key"))) if ref in info else False
+            if state == "current" or (keyed and not state.endswith("conflicted")):
+                return 0
+            return 1
+        order = sorted(refs, key=lambda r: (current_rank(r), refs.index(r)))
+        if order and order[0] in info:
+            lead.append("## Current value\n")
+            lead.append(f"{_cell(ms.first_sentence(info[order[0]]['body']), 240)} (`{order[0]}`, recorded {info[order[0]]['date'] or 'undated'})")
+        replaced = [r for r in dropped if r in info]
+        if order and order[0] in info:
+            for raw in ref_list(info[order[0]]["meta"].get("brain_supersedes")) + ref_list(info[order[0]]["meta"].get("brain_version_of")):
+                path = vault.resolver.canonical_ref(raw)
+                if path is None or not path.is_file():
+                    continue
+                ref = vault.rel(path)
+                if ref in replaced or ref in refs:
+                    continue
+                try:
+                    meta, body = okf.split_frontmatter(path)
+                except okf.OkfError:
+                    continue
+                info[ref] = {"meta": meta, "body": body, "date": _layout_date(vault, path)}
+                replaced.append(ref)
+        if replaced:
+            foot.append("## Earlier versions (footnote) — replaced, not current\n")
+            for ref in replaced:
+                foot.append(f"- {_cell(ms.first_sentence(info[ref]['body']))} (`{ref}`, recorded {info[ref]['date'] or 'undated'})")
+    elif layout == "steps":
+        procs = [r for r in refs if r in info and (info[r]["type"] == "Procedure" or len(info[r]["steps"]) >= 2)]
+        order = procs + [r for r in refs if r not in procs]
+        if procs:
+            first = info[procs[0]]
+            lead.append(f"## Steps first — {_cell(first['title'], 100)} (`{procs[0]}`)\n")
+            shown = 0
+            for line in first["steps"][:12]:
+                if shown + len(line) > 1200:
+                    break
+                lead.append(line)
+                shown += len(line)
+    elif layout == "side-by-side":
+        lead.append("## Side by side — open conflicts; do not pick one silently\n")
+        for a, b in pairs:
+            if a not in info or b not in info:
+                continue
+            A, B = info[a], info[b]
+            lead.append(f"| | `{a}` | `{b}` |")
+            lead.append("|---|---|---|")
+            lead.append(f"| Says | {_cell(ms.first_sentence(A['body']))} | {_cell(ms.first_sentence(B['body']))} |")
+            lead.append(f"| Recorded | {A['date'] or '—'} | {B['date'] or '—'} |")
+            lead.append(f"| Authority | {_cell(clean(A['meta'].get('brain_source_authority')), 40)} | {_cell(clean(B['meta'].get('brain_source_authority')), 40)} |")
+            lead.append(f"| Source | {_cell(_source_names(A['meta']), 80)} | {_cell(_source_names(B['meta']), 80)} |")
+            lead.append("")
+    print(f"{layout}\t{reason}")
+    for ref in order:
+        print(ref)
+    if args.section_out:
+        Path(args.section_out).write_text(("\n".join(lead).rstrip() + "\n\n") if lead else "", encoding="utf-8")
+    if args.footnote_out:
+        Path(args.footnote_out).write_text(("\n".join(foot).rstrip() + "\n\n") if foot else "", encoding="utf-8")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -3062,6 +3238,16 @@ def parser() -> argparse.ArgumentParser:
     cfilter.add_argument("--min-uses", type=int, default=int(os.environ.get("LLM_BRAIN_CHANGE_NOTICE_MIN_USES", "1") or 1))
     smatch = base("superseded-match", command_superseded_match)
     smatch.add_argument("--review", required=True)
+    pl6 = base("pack-layout", command_pack_layout)
+    pl6.add_argument("--selected", required=True)
+    pl6.add_argument("--results", default="")
+    pl6.add_argument("--conflicts", default="")
+    pl6.add_argument("--dropped", default="")
+    pl6.add_argument("--task", default="")
+    pl6.add_argument("--intent", default="legacy")
+    pl6.add_argument("--layout", choices=("auto",) + LAYOUTS, default="auto")
+    pl6.add_argument("--section-out", default="")
+    pl6.add_argument("--footnote-out", default="")
     rs = commands.add_parser("relaxes-safeguard")
     rs.add_argument("--file", required=True)
     rs.set_defaults(func=command_relaxes_safeguard)

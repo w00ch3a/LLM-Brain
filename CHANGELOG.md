@@ -35,6 +35,12 @@
   and recall mark failure-derived or conflicting lessons "Check evidence
   before acting" with that path. `LLM_BRAIN_PACK_EVIDENCE_FLAGS=0` hides the
   marks.
+- Packs can be laid out to suit the question (`pack build --layout auto`, or
+  `LLM_BRAIN_PACK_LAYOUT`): a timeline for "when / what changed", the current
+  value first with replaced versions in a footnote, open conflicts side by
+  side, or steps first for "how do I". Same records, different order and a
+  short lead section. Off by default (`ranked`, the 0.13 layout);
+  `personal-eval.py --layout-ab` compares the two on a copy of a brain.
 
 ## 0.13.0 - 2026-11-13
 

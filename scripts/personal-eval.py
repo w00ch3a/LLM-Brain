@@ -30,7 +30,13 @@ and principal-scoped records are never targets.
 Usage:
   personal-eval.py --brain ROOT --project PROJECT_ID --output DIR
                    [--filler N] [--limit N] [--seed N] [--queries FILE]
-                   [--cli PATH] [--budget-tokens N]
+                   [--cli PATH] [--budget-tokens N] [--layout-ab]
+
+``--layout-ab`` (16 Nov #6) builds every case twice, with the default ranked
+layout (A) and with ``--layout auto`` (B), and scores both: hits, MRR and how
+far into the pack the target is first named (``first_mention``, a fraction of
+the pack's bytes; lower is earlier).  Only layout names and scores are
+written.
 """
 
 from __future__ import annotations
@@ -279,6 +285,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--budget-tokens", type=int, default=1200)
+    parser.add_argument("--layout-ab", action="store_true", help="also build each case with --layout auto and compare")
     parser.add_argument("--queries", help="optional TSV: target_hash<TAB>follow-up query")
     parser.add_argument("--cli", default=str(Path(__file__).resolve().parent.parent / "bin" / "llm-brain"))
     args = parser.parse_args(argv)
@@ -334,13 +341,26 @@ def run(args: argparse.Namespace) -> int:
         if built.returncode != 0:
             raise Refused("index build failed on the working copy")
         rows = []
-        for case in cases:
-            result = run_cli(cli, work, env, "pack", "build", args.project, "--task", case["query"], "--budget-tokens", str(args.budget_tokens))
+
+        def build(case: dict, *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+            result = run_cli(cli, work, env, "pack", "build", args.project, "--task", case["query"], "--budget-tokens", str(args.budget_tokens), *extra)
             pack_file = ""
             for token in result.stdout.split():
                 if token.startswith("file="):
                     pack_file = token[5:]
-            rels = EXPANSION.findall(Path(pack_file).read_text(encoding="utf-8")) if result.returncode == 0 and pack_file and Path(pack_file).is_file() else []
+            text = Path(pack_file).read_text(encoding="utf-8") if result.returncode == 0 and pack_file and Path(pack_file).is_file() else ""
+            return result, text
+
+        def score(text: str, rel: str) -> tuple[int, float]:
+            rels = EXPANSION.findall(text)
+            rank = rels.index(rel) + 1 if rel in rels else 0
+            body = text.split("\n---\n", 1)[-1]
+            at = body.find(rel)
+            return rank, (round(at / max(len(body), 1), 4) if at >= 0 else 1.0)
+
+        for case in cases:
+            result, text = build(case)
+            rels = EXPANSION.findall(text)
             rank = rels.index(case["rel"]) + 1 if case["rel"] in rels else 0
             above = sum(1 for r in rels[: (rank - 1 if rank else len(rels))] if r in filler)
             rows.append({
@@ -354,6 +374,12 @@ def run(args: argparse.Namespace) -> int:
                 "pack_records": len(rels),
                 "pack_ok": result.returncode == 0,
             })
+            if args.layout_ab:
+                result_b, text_b = build(case, "--layout", "auto")
+                rank_b, first_b = score(text_b, case["rel"])
+                layout = (re.search(r"^brain_layout: (\S+)$", text_b, re.M) or [None, "ranked"])[1]
+                rows[-1].update({"first_mention": score(text, case["rel"])[1], "layout_b": layout, "rank_b": rank_b,
+                                 "first_mention_b": first_b, "pack_ok_b": result_b.returncode == 0})
     finally:
         if scratch.exists():
             make_writable(scratch)
@@ -361,9 +387,11 @@ def run(args: argparse.Namespace) -> int:
     after = tree_fingerprint(src)
     out.mkdir(parents=True, exist_ok=True)
     with (out / "results.tsv").open("w", encoding="utf-8") as fh:
-        fh.write("case\ttarget\tkind\torigin\thit\trank\tfiller_above\tpack_records\tpack_ok\n")
+        ab_cols = "\tfirst_mention\tlayout_b\trank_b\tfirst_mention_b" if args.layout_ab else ""
+        fh.write(f"case\ttarget\tkind\torigin\thit\trank\tfiller_above\tpack_records\tpack_ok{ab_cols}\n")
         for r in rows:
-            fh.write(f"{r['case']}\t{r['target']}\t{r['kind']}\t{r['origin']}\t{str(r['hit']).lower()}\t{r['rank']}\t{r['filler_above']}\t{r['pack_records']}\t{str(r['pack_ok']).lower()}\n")
+            ab = f"\t{r['first_mention']}\t{r['layout_b']}\t{r['rank_b']}\t{r['first_mention_b']}" if args.layout_ab else ""
+            fh.write(f"{r['case']}\t{r['target']}\t{r['kind']}\t{r['origin']}\t{str(r['hit']).lower()}\t{r['rank']}\t{r['filler_above']}\t{r['pack_records']}\t{str(r['pack_ok']).lower()}{ab}\n")
     hits = sum(r["hit"] for r in rows)
     by_kind = {}
     for kind in ("correction", "decision"):
@@ -386,8 +414,29 @@ def run(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "source_unchanged": before == after,
     }
+    if args.layout_ab:
+        def arm(rank_key: str, first_key: str) -> dict:
+            n = len(rows)
+            firsts = sorted(r[first_key] for r in rows)
+            return {"hits": sum(1 for r in rows if r[rank_key]),
+                    "mrr": round(sum(1 / r[rank_key] for r in rows if r[rank_key]) / n, 4) if n else 0.0,
+                    "first_mention_median": firsts[n // 2] if n else 1.0}
+        summary["layout_ab"] = {
+            "a": dict(arm("rank", "first_mention"), layout="ranked"),
+            "b": dict(arm("rank_b", "first_mention_b"), layout="auto"),
+            "layouts_chosen": dict(sorted(Counter(r["layout_b"] for r in rows).items())),
+            "earlier_in_b": sum(1 for r in rows if r["first_mention_b"] < r["first_mention"]),
+            "later_in_b": sum(1 for r in rows if r["first_mention_b"] > r["first_mention"]),
+            "lost_in_b": sum(1 for r in rows if r["rank"] and not r["rank_b"]),
+            "pack_failures_b": sum(not r["pack_ok_b"] for r in rows),
+        }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"personal-eval=ok cases={len(rows)} hits={hits} hit_rate={summary['hit_rate']} mrr={summary['mrr']} unpromoted_sessions={unpromoted} source_unchanged={str(before == after).lower()} output={out}")
+    if args.layout_ab:
+        ab = summary["layout_ab"]
+        print(f"layout-ab a=ranked hits={ab['a']['hits']} mrr={ab['a']['mrr']} first_mention_median={ab['a']['first_mention_median']} "
+              f"b=auto hits={ab['b']['hits']} mrr={ab['b']['mrr']} first_mention_median={ab['b']['first_mention_median']} "
+              f"earlier_in_b={ab['earlier_in_b']} later_in_b={ab['later_in_b']} lost_in_b={ab['lost_in_b']} layouts={json.dumps(ab['layouts_chosen'], sort_keys=True)}")
     return 0 if before == after else 70
 
 
