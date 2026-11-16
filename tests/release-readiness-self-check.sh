@@ -130,6 +130,8 @@ core_checks() {
     bash "$repo_root/tests/conflict-reserve-self-check.sh" -- \
     bash "$repo_root/tests/source-outcome-self-check.sh" -- \
     bash "$repo_root/tests/pack-layout-self-check.sh" -- \
+    bash "$repo_root/tests/namesake-self-check.sh" -- \
+    bash "$repo_root/tests/fair-benchmark-self-check.sh" -- \
     bash "$repo_root/tests/core-contract-self-check.sh"
 }
 

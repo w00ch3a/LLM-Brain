@@ -1738,6 +1738,68 @@ def preservation_screen(vault: Vault, merged_text: str, targets: list[Path], ext
     return out
 
 
+# ------------------------------------------------ 17 Nov #7: look-alike names
+#
+# Two records whose names look alike ("Alex Chen" / "Alex Cheng", "nas-01" /
+# "nas-02", or the very same name) are the same entity only when nothing says
+# otherwise.  A record says who or what it is about with ``brain_entity_id``;
+# failing that, identifiers in its text (e-mail addresses, IPv4 addresses,
+# codes such as EMP-1042) are compared.  Different ids mean different
+# entities, and they are never merged, superseded into each other or offered
+# for merging.
+
+ENTITY_ID_PATTERNS = (
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    re.compile(r"\b[A-Z]{2,6}-\d{2,}\b"),
+)
+
+
+def entity_name(metadata: dict[str, Any], title: str) -> str:
+    return clean(metadata.get("brain_entity_name")) or title
+
+
+def entity_ids(metadata: dict[str, Any], body: str) -> tuple[set[str], bool]:
+    """(ids, explicit).  ``brain_entity_id`` wins over ids found in the text."""
+    explicit = {clean(item).lower() for item in ref_list(metadata.get("brain_entity_id")) if clean(item)}
+    if explicit:
+        return explicit, True
+    found: set[str] = set()
+    for pattern in ENTITY_ID_PATTERNS:
+        found.update(match.group(0).lower() for match in pattern.finditer(body or ""))
+    return found, False
+
+
+def name_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def look_alike(a: str, b: str) -> bool:
+    import difflib
+    na, nb = name_key(a), name_key(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if min(len(na), len(nb)) < 4:
+        return False
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.8
+
+
+def distinct_entities(meta_a: dict[str, Any], body_a: str, meta_b: dict[str, Any], body_b: str) -> tuple[bool, str]:
+    """True when the two records name different ids (and nothing they share)."""
+    ids_a, explicit_a = entity_ids(meta_a, body_a)
+    ids_b, explicit_b = entity_ids(meta_b, body_b)
+    if explicit_a != explicit_b and (explicit_a or explicit_b):
+        # One names an entity id and the other only has text ids: compare the
+        # explicit id with the other's text ids, if any.
+        if not ids_a or not ids_b:
+            return False, ""
+    if ids_a and ids_b and not (ids_a & ids_b):
+        return True, f"{','.join(sorted(ids_a))[:80]} vs {','.join(sorted(ids_b))[:80]}"
+    return False, ""
+
+
 def command_merge_screen(args: argparse.Namespace) -> int:
     """#14/#15: refuse a consolidation merge or compression unless the merged
     text still carries the answer-bearing content of every original.  Prints
@@ -1935,6 +1997,10 @@ def doctor_findings(vault: Vault, now: dt.datetime, max_bytes: int, threshold: f
             pairs[(left, right)] = f"body-overlap={len(a & b) / union:.2f}"
     for (left, right), reason in sorted(pairs.items(), key=lambda item: (vault.rel(item[0][0]), vault.rel(item[0][1]))):
         if left in file_set and right in file_set:
+            distinct, ids = distinct_entities(vault.meta(left), vault.body(left), vault.meta(right), vault.body(right))
+            if distinct:
+                findings.append(("memory-doctor", vault.rel(left), vault.title(left), "namesake-distinct", f"{reason}~{vault.rel(right)} ids={ids}", "keep-apart"))
+                continue
             findings.append(("memory-doctor", vault.rel(left), vault.title(left), "likely-duplicate", f"{reason}~{vault.rel(right)}", "merge-or-supersede"))
     return findings
 
@@ -2229,6 +2295,8 @@ def command_triage(args: argparse.Namespace) -> int:
         topic = clean(metadata.get("brain_topic_id"))
         if kind in ("conflict", "reconsolidation", "redaction"):
             bucket, reason = "conflict", f"review-kind={kind}"
+        elif clean(metadata.get("brain_review_reason")) == "namesake-distinct-entity":
+            bucket, reason = "conflict", "namesake-distinct-entity"
         elif ref_list(metadata.get("brain_conflicts")):
             bucket, reason = "conflict", "declares-conflicts"
         elif re.search(r"(?im)^\s*(contradicts|reconsolidates)\s*:", body):
@@ -2241,6 +2309,8 @@ def command_triage(args: argparse.Namespace) -> int:
                 bucket, reason = "conflict", f"clashes-with-current-state-key={key}"
         elif topic and by_topic.get(topic):
             bucket, reason = "fit", f"extends-topic={topic}"
+        elif normalised_title(title) and by_title.get(normalised_title(title)) and all(distinct_entities(metadata, body, vault.meta(other), vault.body(other))[0] for other in by_title[normalised_title(title)]):
+            bucket, reason = "novel", "namesake-of-existing-title"
         elif normalised_title(title) and by_title.get(normalised_title(title)):
             bucket, reason = "fit", "matches-existing-title"
         elif replaces:
@@ -2858,6 +2928,112 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return dot / norm if norm else 0.0
 
 
+# ------------------------------------------- 17 Nov #7b: honest benchmarks
+#
+# Two rules for our own evaluations.  (1) Split by source group: a case whose
+# answer record shares a source with a near-duplicate record elsewhere in the
+# corpus can be answered by copying that duplicate, so it is reported as
+# leaky and the leak-free score is shown separately; cases are folded into
+# dev/test by the hash of their source group, so one group never spans both.
+# (2) Track retrieval margin (top-1 score against the next) as the brain
+# grows, not only hit rate.
+
+GROUP_FIELDS = ("brain_evidence_group", "brain_provenance_episode", "brain_source_ref", "brain_source_hash_sha256", "brain_derived_from")
+
+
+def source_group(vault: Vault, path: Path) -> str:
+    meta = vault.meta(path)
+    for field in GROUP_FIELDS:
+        values = ref_list(meta.get(field))
+        if values:
+            return f"{field.removeprefix('brain_')}:{clean(values[0])}"
+    sources = meta.get("sources")
+    if isinstance(sources, list):
+        for item in sources:
+            name = clean(item.get("resource") or item.get("ref") or item.get("url")) if isinstance(item, dict) else clean(item)
+            if name:
+                return f"source:{name}"
+    return f"self:{vault.rel(path)}"
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def command_eval_fairness(args: argparse.Namespace) -> int:
+    vault = Vault(args.project_dir, args.principal)
+    files = [path for path in vault.semantic_files()]
+    rel_of = {path: vault.rel(path) for path in files}
+    groups = {rel_of[path]: source_group(vault, path) for path in files}
+    words = {rel_of[path]: shingles(TOKEN_RE.findall(re.sub(r"\A\s*# [^\n]*\n", "", vault.body(path)).lower())) for path in files}
+    titles = {rel_of[path]: normalised_title(vault.title(path)) for path in files}
+    by_group: dict[str, list[str]] = defaultdict(list)
+    for rel, group in groups.items():
+        by_group[group].append(rel)
+    strategies = [item for item in args.strategies.split(",") if item]
+    rows = []
+    for line in Path(args.cases).read_text(encoding="utf-8").splitlines():
+        cols = line.split("\t")
+        if len(cols) < 3 or not cols[0] or cols[0] == "case_id":
+            continue
+        case_id, expected = cols[0], [item.strip() for item in cols[2].split(",") if item.strip()]
+        case_groups = sorted({groups.get(rel, f"self:{rel}") for rel in expected})
+        folds = {"dev" if int(hashlib.sha256(group.encode()).hexdigest()[:8], 16) % 2 == 0 else "test" for group in case_groups}
+        fold = folds.pop() if len(folds) == 1 else "mixed"
+        leaks = 0
+        for rel in expected:
+            for other in by_group.get(groups.get(rel, ""), []):
+                if other in expected:
+                    continue
+                a, b = words.get(rel, set()), words.get(other, set())
+                union = len(a | b)
+                if (titles.get(rel) and titles.get(rel) == titles.get(other)) or (union and len(a & b) / union >= args.duplicate_threshold):
+                    leaks += 1
+        for strategy in strategies:
+            search = Path(args.stage) / f"{case_id}.{strategy}.search"
+            ranked = Path(args.stage) / f"{case_id}.{strategy}.ranked"
+            order = [row.split("\t")[0] for row in ranked.read_text(encoding="utf-8").splitlines() if row] if ranked.is_file() else []
+            gold_rank = next((index + 1 for index, rel in enumerate(order) if rel in expected), 0)
+            margin = "-"
+            if search.is_file():
+                scored = []
+                for row in search.read_text(encoding="utf-8").splitlines()[1:]:
+                    parts = row.split("\t")
+                    try:
+                        scored.append((parts[0], float(parts[1])))
+                    except (IndexError, ValueError):
+                        continue
+                if scored and scored[0][1] > 0:
+                    top = scored[0][1]
+                    if scored[0][0] in expected:
+                        nxt = next((score for rel, score in scored[1:] if rel not in expected), 0.0)
+                        margin = f"{(top - nxt) / top:.4f}"
+                    else:
+                        gold = next((score for rel, score in scored if rel in expected), 0.0)
+                        margin = f"{(gold - top) / top:.4f}"
+            rows.append((case_id, strategy, fold, "leaky" if leaks else "clean", str(leaks), str(gold_rank), margin))
+    with Path(args.out).open("w", encoding="utf-8") as stream:
+        stream.write("case_id\tstrategy\tfold\tleak\tnear_duplicates\tgold_rank\tmargin\n")
+        for row in rows:
+            stream.write("\t".join(row) + "\n")
+    print("strategy\tcases\tleak_free_cases\thits\tleak_free_hits\tdev_hits\ttest_hits\tmargin_median\tleak_free_margin_median\tcorpus_records")
+    for strategy in strategies:
+        sub = [row for row in rows if row[1] == strategy]
+        clean_rows = [row for row in sub if row[3] == "clean"]
+        hits = lambda items: sum(1 for row in items if row[5] != "0")
+        dev = [row for row in clean_rows if row[2] == "dev"]
+        test = [row for row in clean_rows if row[2] == "test"]
+        med = _median([float(row[6]) for row in sub if row[6] != "-"])
+        clean_med = _median([float(row[6]) for row in clean_rows if row[6] != "-"])
+        fmt = lambda value: "-" if value is None else f"{value:.4f}"
+        print(f"{strategy}\t{len(sub)}\t{len(clean_rows)}\t{hits(sub)}\t{hits(clean_rows)}\t{hits(dev)}/{len(dev)}\t{hits(test)}/{len(test)}\t{fmt(med)}\t{fmt(clean_med)}\t{len(files)}")
+    return 0
+
+
 def command_raw_baseline(args: argparse.Namespace) -> int:
     """Rank raw history for a query with no memory pipeline at all.
 
@@ -3120,6 +3296,12 @@ def parser() -> argparse.ArgumentParser:
     vault_scan.add_argument("--schema", default="")
     vault_scan.add_argument("--no-cache", action="store_true")
     vault_scan.set_defaults(func=command_vault_scan)
+    fair = base("eval-fairness", command_eval_fairness)
+    fair.add_argument("--cases", required=True)
+    fair.add_argument("--stage", required=True)
+    fair.add_argument("--strategies", required=True)
+    fair.add_argument("--out", required=True)
+    fair.add_argument("--duplicate-threshold", type=float, default=0.5)
     raw_baseline = commands.add_parser("raw-baseline")
     raw_baseline.add_argument("--project-dir", required=True)
     raw_baseline.add_argument("--query", required=True)

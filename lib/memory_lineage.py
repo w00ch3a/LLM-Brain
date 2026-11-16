@@ -2076,7 +2076,7 @@ HUMAN_CLAIM = re.compile(r"\b(human[- ]verified|verified by (?:a )?human|human[-
 HEALTH_WEIGHTS = {
     "broken-frontmatter": (10, 40), "smuggled-frontmatter": (10, 30), "unproven-human-verification": (8, 24),
     "dropped-host-config": (15, 30), "mass-rewrite": (10, 10), "near-duplicate-name": (2, 20),
-    "state-key-near-collision": (3, 15),
+    "state-key-near-collision": (3, 15), "namesake": (0, 0),
 }
 
 
@@ -2088,6 +2088,15 @@ def _norm_name(text: str) -> str:
 def _close(a: str, b: str) -> bool:
     import difflib
     return a == b or (min(len(a), len(b)) >= 8 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.92)
+
+
+def _namesakes_distinct(left: Path, right: Path) -> bool:
+    try:
+        ma, ba = okf.split_frontmatter(left)
+        mb, bb = okf.split_frontmatter(right)
+    except okf.OkfError:
+        return False
+    return ms.distinct_entities(ma, ba, mb, bb)[0]
 
 
 def health_findings(root: Path, host_configs: list[str]) -> list[tuple[str, str, str, str]]:
@@ -2145,6 +2154,9 @@ def health_findings(root: Path, host_configs: list[str]) -> list[tuple[str, str,
                 for right, b2 in bucket[index + 1:]:
                     pair = (left.relative_to(root).as_posix(), right.relative_to(root).as_posix())
                     if a and _close(a, b2) and pair not in linked:
+                        if _namesakes_distinct(left, right):
+                            findings.append(("namesake", left.relative_to(root).as_posix(), f"~{right.relative_to(root).as_posix()}", "different entities with look-alike names: keep both, do not merge"))
+                            continue
                         findings.append(("near-duplicate-name", left.relative_to(root).as_posix(), f"~{right.relative_to(root).as_posix()}", "merge or supersede one of them"))
     # Distinct state keys that are almost the same key.
     keys = sorted({clean(meta.get("brain_state_key")) for _, meta, _ in parsed if clean(meta.get("brain_state_key"))})
@@ -3073,6 +3085,91 @@ def command_pack_layout(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------ 17 Nov #7: look-alike names
+
+NAMESAKE_TARGET_FIELDS = ("brain_supersedes", "brain_version_of", "brain_merge_of", "brain_merged_from", "brain_compressed_from")
+
+
+def _entity_summary(vault: Vault, path: Path, meta: dict[str, Any], body: str) -> str:
+    ids, explicit = ms.entity_ids(meta, body)
+    parts = []
+    if ids:
+        parts.append(("entity " if explicit else "id ") + ", ".join(f"`{item}`" for item in sorted(ids)[:3]))
+    project = clean(meta.get("brain_project_id"))
+    if project:
+        parts.append(f"project `{project}`")
+    created = _created(vault, path)
+    parts.append("recorded " + (created.date().isoformat() if created else "undated"))
+    return " · ".join(parts)
+
+
+def command_namesake_screen(args: argparse.Namespace) -> int:
+    """Hold a review that would replace or merge a different entity with a
+    look-alike name.  Prints ``ok``, ``hold<TAB>detail`` or
+    ``distinct<TAB>ref ref...`` (same-title records that are other entities,
+    so promotion must not treat them as one)."""
+    vault = Vault(args.project_dir, args.principal)
+    meta, body = okf.split_frontmatter(Path(args.review))
+    name = ms.entity_name(meta, clean(meta.get("title")))
+    targets: list[Path] = []
+    for field in NAMESAKE_TARGET_FIELDS:
+        for ref in ref_list(meta.get(field)):
+            path = vault.resolver.canonical_ref(ref)
+            if path is not None and path not in targets:
+                targets.append(path)
+    key = clean(meta.get("brain_state_key"))
+    same_title: list[Path] = []
+    for path in vault.semantic_files():
+        try:
+            other_meta, _ = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        if key and clean(other_meta.get("brain_state_key")) == key and path not in targets:
+            targets.append(path)
+        if clean(other_meta.get("title")) == clean(meta.get("title")) and path not in same_title:
+            same_title.append(path)
+    held = []
+    for path in targets:
+        other_meta, other_body = okf.split_frontmatter(path)
+        other_name = ms.entity_name(other_meta, clean(other_meta.get("title")))
+        distinct, ids = ms.distinct_entities(meta, body, other_meta, other_body)
+        if distinct and ms.look_alike(name, other_name):
+            held.append(f"{vault.rel(path)} ({ids})")
+    if held:
+        print("hold\t" + "; ".join(held))
+        return 0
+    apart = [vault.rel(path) for path in same_title if ms.distinct_entities(meta, body, *okf.split_frontmatter(path))[0]]
+    print(("distinct\t" + " ".join(apart)) if apart else "ok")
+    return 0
+
+
+def command_namesake_labels(args: argparse.Namespace) -> int:
+    """For records in one pack whose names look alike but whose ids differ,
+    print ``rel<TAB>label`` naming what tells them apart."""
+    vault = Vault(args.project_dir, args.principal)
+    refs = [line.strip() for line in Path(args.selected).read_text(encoding="utf-8").splitlines() if line.strip()]
+    items = []
+    for ref in refs:
+        path = vault.resolver.canonical_ref(ref)
+        if path is None:
+            continue
+        try:
+            meta, body = okf.split_frontmatter(path)
+        except okf.OkfError:
+            continue
+        items.append((ref, path, meta, body, ms.entity_name(meta, clean(meta.get("title")))))
+    for ref, path, meta, body, name in items:
+        others = []
+        for oref, opath, ometa, obody, oname in items:
+            if oref == ref or not ms.look_alike(name, oname):
+                continue
+            if ms.distinct_entities(meta, body, ometa, obody)[0]:
+                others.append(f"<code>{oref}</code> ({_entity_summary(vault, opath, ometa, obody)})")
+        if others:
+            print(f"{ref}\tLook-alike name, different entity: this one is {_entity_summary(vault, path, meta, body)}; not the same as {'; '.join(others[:3])}. Do not combine them.")
+    return 0
+
+
 # --------------------------------------------------------------- parser
 
 def parser() -> argparse.ArgumentParser:
@@ -3248,6 +3345,10 @@ def parser() -> argparse.ArgumentParser:
     pl6.add_argument("--layout", choices=("auto",) + LAYOUTS, default="auto")
     pl6.add_argument("--section-out", default="")
     pl6.add_argument("--footnote-out", default="")
+    ns7 = base("namesake-screen", command_namesake_screen)
+    ns7.add_argument("--review", required=True)
+    nl7 = base("namesake-labels", command_namesake_labels)
+    nl7.add_argument("--selected", required=True)
     rs = commands.add_parser("relaxes-safeguard")
     rs.add_argument("--file", required=True)
     rs.set_defaults(func=command_relaxes_safeguard)

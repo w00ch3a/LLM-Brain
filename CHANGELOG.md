@@ -41,6 +41,23 @@
   side, or steps first for "how do I". Same records, different order and a
   short lead section. Off by default (`ranked`, the 0.13 layout);
   `personal-eval.py --layout-ab` compares the two on a copy of a brain.
+- Look-alike names never merge. A record can name its entity
+  (`brain_entity_id`); failing that, e-mail, IPv4 and code ids in the text
+  are compared. A review that would supersede or merge a different entity
+  with a look-alike name is held (`review decide ... --same-entity` confirms
+  on purpose; `LLM_BRAIN_NAMESAKE_GUARD=0` turns it off). A second person
+  with the very same name gets their own record instead of a conflict
+  review. Triage, doctor and health stop suggesting such merges, and packs
+  label look-alikes with what tells them apart (entity id, project, date;
+  `LLM_BRAIN_PACK_NAMESAKE_LABELS=0` hides it). The lifecycle eval gains a
+  namesake set (`tests/fixtures/lifecycle/namesakes.v1.json`) and treats a
+  held review as a valid step outcome.
+- `eval run` reports leak-free scores: a case whose answer shares a source
+  group with a near-duplicate record is marked leaky, cases fold into
+  dev/test by source group, and each case's retrieval margin (top-1 against
+  the next) is recorded in `fairness.tsv`. `--margin-log FILE` appends the
+  margin and brain size per run so a shrinking margin shows before hit rate
+  drops.
 
 ## 0.13.0 - 2026-11-13
 

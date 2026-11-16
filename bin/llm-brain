@@ -241,7 +241,7 @@ Commands:
   experiment record PROJECT_ID NAME --status negative|blocked|enabled --reason TEXT [--evidence REF]
   experiment prediction PROJECT_ID EPISODE_REF --expected TEXT --observed TEXT [--recalled REF]
   experiment replay PROJECT_ID RUN_ID --mode success|failure
-  eval run PROJECT_ID --cases FILE --strategies LIST [--query-embedder EXECUTABLE] [--answer-runner EXECUTABLE] [--output DIR]
+  eval run PROJECT_ID --cases FILE --strategies LIST [--query-embedder EXECUTABLE] [--answer-runner EXECUTABLE] [--output DIR] [--margin-log FILE]
   export okf|knowledge-catalog|bundle PROJECT_ID
   export replication PROJECT_ID [--scope project|principal] [--principal ID] [--review REF] [--output FILE]
   import bundle FILE --dry-run|--apply [--project-id ID]
@@ -3441,6 +3441,24 @@ promote_review_locked() {
       return 3
     fi
   fi
+  # 17 Nov #7: a review that would replace or merge a different entity with
+  # a look-alike name (different brain_entity_id, or disjoint ids in the
+  # text) is held; same-title records about other entities are not treated
+  # as the same record.  review decide --same-entity confirms on purpose.
+  local namesake_apart=""
+  if [ ! -f "$dest" ] && [ "${LLM_BRAIN_NAMESAKE_GUARD:-1}" != 0 ]; then
+    local ns_verdict ns_detail
+    IFS=$'\t' read -r ns_verdict ns_detail <<<"$(memory_lineage namesake-screen --project-dir "$dir" --review "$review" 2>/dev/null || printf 'ok\n')"
+    if [ "$ns_verdict" = hold ] && [ "$(frontmatter_field "$review" brain_same_entity_confirmed)" != true ]; then
+      set_frontmatter_field "$review" brain_review_state needs-validation
+      set_frontmatter_field "$review" brain_review_reason namesake-distinct-entity
+      set_frontmatter_field "$review" brain_namesake_of "$(yaml_quote "$ns_detail")"
+      audit_v2 "$dir" "namesake-hold" "$review_id" "$state" needs-validation "$(sha256_file "$review")" "targets=$(slug "$ns_detail" | cut -c1-120)"
+      printf 'promotion=held review_id=%s reason=namesake-distinct-entity targets=%s\n' "$review_id" "$ns_detail"
+      return 3
+    fi
+    [ "$ns_verdict" != distinct ] || namesake_apart=" $ns_detail "
+  fi
   # 17 Nov #1: a memory that relaxes a safeguard (skip tests or a
   # confirmation, auto-approve, --no-verify, weaken a check) is tagged and
   # must name the task it was learnt for (brain_applies_when "task=...")
@@ -3472,6 +3490,7 @@ promote_review_locked() {
   while IFS= read -r existing; do
     [ "$existing" = "$dest" ] && continue
     [ "$(frontmatter_field "$existing" title)" = "$title" ] || continue
+    case "$namesake_apart" in *" ${existing#"$dir"/} "*) continue ;; esac
     local conflict
     conflict="$(create_conflict_review "$dir" "$review_id" "$existing")"
     say_error "promotion conflict created: $conflict"
@@ -3547,10 +3566,10 @@ promote_review_locked() {
     printf 'brain_provider_id: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_id)")"
     printf 'brain_provider_version: %s\n' "$(yaml_quote "$(frontmatter_field "$review" brain_provider_version)")"
     printf 'brain_candidate_hash_sha256: %s\n' "$(sha256_file "$review")"
-    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_merge_of brain_compressed_from brain_conflicts brain_supports brain_contrasts brain_required_bindings brain_applicability brain_applies_when brain_relaxes_safeguard brain_relaxes_safeguard_match brain_prerequisites brain_verification; do
+    for field in brain_source_ref brain_source_hash_sha256 brain_observed_at brain_valid_from brain_valid_to brain_last_verified_at brain_version_of brain_derived_from brain_state_key brain_depends_on brain_supersedes brain_merge_of brain_compressed_from brain_conflicts brain_supports brain_contrasts brain_required_bindings brain_applicability brain_applies_when brain_relaxes_safeguard brain_relaxes_safeguard_match brain_prerequisites brain_verification brain_entity_id brain_entity_name brain_same_entity_confirmed; do
       field_value="$(frontmatter_field "$review" "$field")"
       [ -n "$field_value" ] || continue
-      case "$field" in brain_relaxes_safeguard) printf '%s: %s\n' "$field" "$field_value" ;; *) printf '%s: %s\n' "$field" "$(yaml_quote "$field_value")" ;; esac
+      case "$field" in brain_relaxes_safeguard|brain_same_entity_confirmed) printf '%s: %s\n' "$field" "$field_value" ;; *) printf '%s: %s\n' "$field" "$(yaml_quote "$field_value")" ;; esac
     done
     printf 'brain_schema_version: %s\n' "$SCHEMA_VERSION"
     printf 'last_validated_at: %s\n' "$(yaml_quote "$generated_at")"
@@ -5219,9 +5238,9 @@ cmd_review() {
       cat "$dir/review/$id.md" 2>/dev/null || die 66 "review missing: $id"
       ;;
     decide)
-      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set="" share_scope_set="" share_owner_set="" share_agent_set="" source_outcome_set=""
+      local project_id="$1" id="$2" state="$3" actor="$ACTOR" reason="" kind as_fact=0 applies_when_set="" share_scope_set="" share_owner_set="" share_agent_set="" source_outcome_set="" same_entity_set=0
       shift 3 || true
-      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; --share-scope) share_scope_set="${2:-}"; shift 2 ;; --share-owner) share_owner_set="${2:-}"; shift 2 ;; --share-agent) share_agent_set="${2:-}"; shift 2 ;; --source-outcome) source_outcome_set="${2:-}"; case "$source_outcome_set" in success|failure|unknown) ;; *) die 64 "--source-outcome must be success, failure or unknown" ;; esac; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
+      while [ $# -gt 0 ]; do case "$1" in --actor) actor="${2:-}"; shift 2 ;; --reason) reason="${2:-}"; shift 2 ;; --as-fact) as_fact=1; shift ;; --overrule-belief) BELIEF_OVERRULE=1; shift ;; --accept-merge-loss) MERGE_ACCEPT_LOSS=1; shift ;; --restore-superseded) RESTORE_SUPERSEDED=1; shift ;; --applies-when) applies_when_set="${2:-}"; [ -n "$applies_when_set" ] || die 64 "--applies-when requires a scope such as task=TYPE"; shift 2 ;; --share-scope) share_scope_set="${2:-}"; shift 2 ;; --share-owner) share_owner_set="${2:-}"; shift 2 ;; --share-agent) share_agent_set="${2:-}"; shift 2 ;; --same-entity) same_entity_set=1; shift ;; --source-outcome) source_outcome_set="${2:-}"; case "$source_outcome_set" in success|failure|unknown) ;; *) die 64 "--source-outcome must be success, failure or unknown" ;; esac; shift 2 ;; *) die 64 "unknown review decision option" ;; esac; done
       [ -n "$reason" ] || die 64 "review decide requires --reason"
       [ -z "$applies_when_set" ] || validate_scalar "$applies_when_set" || die 65 "--applies-when must be a single line"
       case "$share_scope_set" in ''|this-agent|this-owner|all-agents) ;; *) die 64 "--share-scope must be this-agent, this-owner or all-agents" ;; esac
@@ -5268,6 +5287,10 @@ cmd_review() {
           set_frontmatter_field "$file" brain_capture_tag_previous "$previous_tag"
           audit_v2 "$dir" "capture-tag-override" "$id" "$previous_tag" fact "$(sha256_file "$file")" "reason=$(slug "$reason")"
         fi
+        if [ "${same_entity_set:-0}" = 1 ]; then
+          set_frontmatter_field "$file" brain_same_entity_confirmed true
+          audit_v2 "$dir" "same-entity-confirmed" "$id" "$old" "$old" "$(sha256_file "$file")" "reason=$(slug "$reason")"
+        fi
         if [ -n "$source_outcome_set" ]; then
           set_frontmatter_field "$file" brain_source_outcome "$source_outcome_set"
           audit_v2 "$dir" "source-outcome-set" "$id" "$old" "$old" "$(sha256_file "$file")" "outcome=$source_outcome_set reason=$(slug "$reason")"
@@ -5289,6 +5312,7 @@ cmd_review() {
         release_lock
         [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != superseded-version ] || die 75 "review $id held: it repeats $(frontmatter_field "$file" brain_matches_superseded), a version that has already been replaced; use --restore-superseded only to bring the old version back on purpose"
         [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != merge-preservation-failed ] || die 75 "review $id held: the merged text loses answer-bearing content of an original ($(frontmatter_field "$file" brain_merge_missing)); add it, or use --accept-merge-loss"
+        [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != namesake-distinct-entity ] || die 75 "review $id held: it would replace or merge a different entity with a look-alike name ($(frontmatter_field "$file" brain_namesake_of)); give it its own record (drop the supersedes/merge link), or use --same-entity if they really are one"
         [ "$promotion_status" != 3 ] || [ "$(frontmatter_field "$file" brain_review_reason)" != relaxes-safeguard-unscoped ] || die 75 "review $id held: it relaxes a safeguard ($(frontmatter_field "$file" brain_relaxes_safeguard_match)) and names no task scope; approve it with --applies-when 'task=TYPE' for the task it was learnt on, so it cannot carry over to other tasks"
         [ "$promotion_status" != 3 ] || die 75 "review $id held: it contradicts a better-supported fact (see the belief_ conflict review); add corroborating sources or use --overrule-belief"
         return "$promotion_status"
@@ -8213,7 +8237,7 @@ eval_history_hash() {
 }
 
 cmd_eval() {
-  local raw_baseline=0 raw_embedder="" raw_status
+  local raw_baseline=0 raw_embedder="" raw_status margin_log="" fairness_table=""
   local action="${1:-}" project_id="${2:-}" cases="" strategies="" answer_runner="" query_embedder="$QUERY_EMBEDDER" output="" dir cases_hash history_hash manifest_hash vectors_hash vector_index answer_runner_hash query_embedder_hash eval_id stage trace report summary deterministic_hash strategy case_id query expected task ranked actual degraded metadata candidate_paths candidate_ranks evidence_refs hit context_bytes token_estimate provider_calls memory_write_cost elapsed started answer_request answer_output answer_outcome delivered_novel novel_used judged case_count=0
   shift 2 || true
   [ "$action" = "run" ] || die 64 "eval requires run"
@@ -8225,6 +8249,7 @@ cmd_eval() {
       --answer-runner) answer_runner="${2:-}"; shift 2 ;;
       --query-embedder) query_embedder="${2:-}"; shift 2 ;;
       --output) output="${2:-}"; shift 2 ;;
+      --margin-log) margin_log="${2:-}"; [ -n "$margin_log" ] || die 64 "--margin-log requires FILE"; shift 2 ;;
       *) die 64 "unknown eval option: $1" ;;
     esac
   done
@@ -8362,6 +8387,8 @@ cmd_eval() {
   deterministic_hash="$(cut -f1-13,15 "$trace" | sha256_file /dev/stdin)"
   summary="$stage/summary.tsv"
   awk -F '\t' 'NR > 1 { total[$2]++; if ($9 == "true") hit[$2]++; bytes[$2] += $10; calls[$2] += $12; writes[$2] += $13 } END { for (s in total) printf "%s\t%d\t%d\t%d\t%d\t%d\n", s, total[s], hit[s] + 0, bytes[s] + 0, calls[s] + 0, writes[s] + 0 }' "$trace" >"$summary"
+  # 17 Nov #7b: leak-free (source-group split) scores and retrieval margin.
+  fairness_table="$(memory_signals eval-fairness --project-dir "$dir" --cases "$cases" --stage "$stage" --strategies "$strategies" --out "$stage/fairness.tsv" 2>/dev/null || true)"
   report="$stage/report.md"
   {
     printf '%s\n' '---'
@@ -8399,12 +8426,18 @@ cmd_eval() {
       printf 'strategy\tanswers\tsuccesses\tsuccess_without_memory_use\tdelivered_novel\tnovel_used\n'
       awk -F '\t' 'NR > 1 && $16 != "-" { s = $2; n[s]++; if ($15 == "success") { ok[s]++; if ($17 == 0) idle[s]++ } nov[s] += $16; use[s] += $17 } END { for (s in n) printf "%s\t%d\t%d\t%d\t%d\t%d\n", s, n[s], ok[s] + 0, idle[s] + 0, nov[s], use[s] }' "$trace" | sort
     fi
+    if [ -n "$fairness_table" ]; then
+      printf '\n## Leak-free split and retrieval margin\n\n'
+      printf 'A case is leaky when its answer record shares a source group with a near-duplicate record elsewhere in the brain (it could be answered by copying that record); leak-free hits are the honest number. Cases fold into dev/test by the hash of their source group, so one group never spans both. Margin is (top-1 score - next score) / top-1 when the answer ranks first, negative when it does not; watch it as the brain grows.\n\n'
+      printf '%s\n' "$fairness_table"
+    fi
     printf '\n## Artefacts\n\n* Trace: `trace.tsv`\n* Cases hash: `%s`\n* Requested strategies: `%s`\n' "$cases_hash" "$strategies"
+    [ ! -f "$stage/fairness.tsv" ] || printf '* Leak-free split and margin per case: `fairness.tsv`\n'
   } >"$report"
   rm -f "$summary"
   for artifact in "$stage"/*; do
     [ -e "$artifact" ] || continue
-    case "$(basename "$artifact")" in report.md|trace.tsv|answers) ;; *) rm -rf "$artifact" ;; esac
+    case "$(basename "$artifact")" in report.md|trace.tsv|fairness.tsv|answers) ;; *) rm -rf "$artifact" ;; esac
   done
   acquire_lock "project-$project_id"
   if [ -e "$output" ]; then
@@ -8413,6 +8446,10 @@ cmd_eval() {
   mv "$stage" "$output"
   audit_v2 "$dir" "evaluation-run" "$eval_id" "" "derived" "$(sha256_file "$output/report.md")" "cases=$case_count"
   release_lock
+  if [ -n "$margin_log" ] && [ -n "$fairness_table" ]; then
+    [ -s "$margin_log" ] || printf 'recorded_at\tevaluation_id\tcorpus_records\tstrategy\tcases\tleak_free_hits\tleak_free_cases\tmargin_median\tleak_free_margin_median\n' >>"$margin_log"
+    printf '%s\n' "$fairness_table" | awk -F '\t' -v at="$(now_utc)" -v id="$eval_id" 'NR > 1 { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", at, id, $10, $1, $2, $5, $3, $8, $9 }' >>"$margin_log"
+  fi
   printf 'eval=ok project_id=%s evaluation_id=%s output=%s cases=%s\n' "$project_id" "$eval_id" "$output" "$case_count"
 }
 
@@ -8878,6 +8915,18 @@ cmd_pack() {
     fi
     rm -f "$layout_tmp" "$layout_tmp.in" "$layout_tmp.pairs" "$layout_tmp.lead" "$layout_tmp.foot"
   fi
+  # 17 Nov #7: records with look-alike names but different ids each say
+  # what tells them apart (entity id, project, date).
+  local namesake_file="" namesake_hash=""
+  if [ -n "$render_order" ] && [ "${LLM_BRAIN_PACK_NAMESAKE_LABELS:-1}" != 0 ]; then
+    namesake_file="$(mktemp "$dir/context-packs/.namesake.XXXXXX")"
+    printf '%s\n' "$render_order" >"$namesake_file.in"
+    local -a namesake_args=(namesake-labels --project-dir "$dir" --selected "$namesake_file.in")
+    [ -z "$principal" ] || namesake_args+=(--principal "$principal")
+    memory_lineage "${namesake_args[@]}" >"$namesake_file" 2>/dev/null || : >"$namesake_file"
+    rm -f "$namesake_file.in"
+    [ ! -s "$namesake_file" ] || namesake_hash="$(sha256_file "$namesake_file")"
+  fi
   if [ "$intent" = evidence ] || [ "$intent" = current_state ] || [ "$require_evidence" = 1 ]; then
     source_snapshot_hash="$(
       { printf '%s\n' "$selected"; printf '%s\n' "$evidence_refs" | tr ',' '\n'; } |
@@ -8891,12 +8940,12 @@ cmd_pack() {
         done | sha256_file /dev/stdin
     )"
   fi
-  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${conflict_hash:+|conflicts:$conflict_hash}${layout_hash:+|layout:$layout_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
+  hash="$(sha256_text "$project_id|$agent|$task|$budget|$topic|$include_proposed|$include_cold|$strategy|$expand_graph|$historical|$as_of|$intent|$principal|$require_evidence|$exploratory|$retrieval_mode|$retrieval_degraded|$manifest_hash|$evidence_refs|$selected${source_snapshot_hash:+|$source_snapshot_hash}${intentions_hash:+|intentions:$intentions_hash}${notices_hash:+|notices:$notices_hash}${extras_hash:+|extras:$extras_hash}${history_hash:+|history:$history_hash}${current_hash:+|current:$current_hash}${inherited_hash:+|inherited:$inherits:$inherited_hash}${decisions_hash:+|decisions:$decisions_hash}${conflict_hash:+|conflicts:$conflict_hash}${layout_hash:+|layout:$layout_hash}${namesake_hash:+|namesakes:$namesake_hash}${freshness_hash:+|freshness:$freshness_hash}${scope_hidden:+|scope:$pack_host:$pack_task_type:$scope_hidden_count}$([ "$action_risk" != high ] || printf '|action-risk:high')")"
   # Bound the task slug: long task text must not exceed the 255-byte file-name
   # limit (the hash suffix keeps names unique).
   local task_slug; task_slug="$(slug "$task" | cut -c1-80 | sed -E 's/-+$//')"
   pack="$dir/context-packs/$(slug "$agent" | cut -c1-40)-${task_slug}-${hash:0:12}.md"
-  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
+  if [ -f "$pack" ]; then rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file" "$namesake_file"; printf 'pack=idempotent file=%s\n' "$pack"; return 0; fi
   acquire_lock "project-$project_id"
   {
     printf '%s\n' '---'
@@ -9037,6 +9086,10 @@ cmd_pack() {
       fi
       line="$(lesson_evidence_flag "$source" "$state")"
       [ -z "$line" ] || printf '%s\n\n' "$line"
+      if [ -n "$namesake_hash" ]; then
+        line="$(awk -F '\t' -v r="$rel" '$1 == r { print $2; exit }' "$namesake_file")"
+        [ -z "$line" ] || printf '%s\n\n' "$line"
+      fi
       if [ -n "$conflict_set" ] && [ "${is_conflict:-0}" = 1 ]; then
         printf 'Open conflict: <code>%s</code> conflicts with <code>%s</code>. Both sides are shown; do not pick one silently (settle it with <code>conflict decide</code>).\n\n' "$rel" "$(frontmatter_field "$source" brain_conflicts | tr -d '[]"')"
       fi
@@ -9133,7 +9186,7 @@ cmd_pack() {
   release_lock
   printf 'context_rendered_refs=%s\nevidence_opened=%s\nevidence_incomplete=%s\ncontext_truncated=%s\n' "$rendered_refs" "$evidence_opened" "$evidence_incomplete" "$context_truncated" >>"$metadata"
   retrieval_receipt "$receipt_file" pack "$project_id" "$task" "$metadata" "$selected" || say_error "retrieval receipt unavailable"
-  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file"
+  rm -f "$results" "$metadata" "$warnings" "$intentions_file" "$notices_file" "$extras_file" "$history_file" "$sufficiency_file" "$current_file" "$inherited_file" "$namesake_file"
   printf 'pack=ok file=%s bytes=%s\n' "$pack" "$bytes"
 }
 

@@ -454,6 +454,8 @@ def record_fields(record: dict[str, Any], project_id: str) -> dict[str, Any]:
         "verification",
         "source_ref",
         "source_hash_sha256",
+        "entity_id",
+        "entity_name",
     ):
         if name in record:
             fields[f"brain_{name}"] = record[name]
@@ -528,9 +530,9 @@ def cli_base(cli: Path, vault: Path) -> list[str]:
     return [str(cli), "--root", str(vault)]
 
 
-def run_cli(cli: Path, vault: Path, args: list[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+def run_cli(cli: Path, vault: Path, args: list[str], *, timeout: int | None = None, allow: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
     result = command(cli_base(cli, vault) + args, timeout=timeout or CLI_TIMEOUT)
-    if result.returncode != 0:
+    if result.returncode != 0 and result.returncode not in allow:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise EvaluationError(f"llm-brain {' '.join(args[:3])} failed ({result.returncode}): {detail[:500]}")
     return result
@@ -650,7 +652,13 @@ def apply_event(
         write_candidate(candidate, record, project_id)
         submitted = run_cli(cli, vault, ["reflect", "submit", project_id, str(candidate)])
         review_id = parse_key_values(submitted.stdout).get("review_id", record["id"])
-        run_cli(cli, vault, ["review", "decide", project_id, review_id, "approved", "--actor", "human:lifecycle-evaluation", "--reason", "ground-truth fixture approval"])
+        # Exit 75 is a promotion hold (e.g. a look-alike-name merge) and 73 a
+        # conflict review; neither writes okf/, and the step check scores
+        # whether that was the right store operation.
+        decided = run_cli(cli, vault, ["review", "decide", project_id, review_id, "approved", "--actor", "human:lifecycle-evaluation", "--reason", "ground-truth fixture approval"], allow=(73, 75))
+        if decided.returncode in (73, 75):
+            runtime.event_results.append({"operation": operation, "status": "held" if decided.returncode == 75 else "conflict-review", "record": record["path"], "review_id": review_id})
+            return
         runtime.record_texts[record["path"]] = record["text"]
         runtime.event_results.append({"operation": operation, "status": "ok", "record": record["path"], "review_id": review_id})
         return

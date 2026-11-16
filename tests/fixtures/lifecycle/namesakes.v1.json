@@ -1,0 +1,37 @@
+{
+  "format": "llm-brain.lifecycle-evaluation",
+  "version": 1,
+  "horizons": [8],
+  "scenario_families": [
+    {
+      "id": "namesakes",
+      "description": "Near-namesake people and hosts with different ids are never merged or superseded into each other; a second person with the very same name gets their own record.",
+      "ground_truth": {
+        "records": [
+          {"id": "person-alex-chen", "title": "Alex Chen", "entity_id": "person:EMP-1042", "text": "Alex Chen (payroll team, EMP-1042) uses laptop LT-4471 and approves payroll runs."},
+          {"id": "host-nas-01", "title": "Host nas-01", "entity_id": "host:nas-01", "text": "Host nas-01 holds the design share backups at 10.0.4.11."}
+        ],
+        "queries": [
+          {"id": "alex-chen-laptop", "text": "Alex Chen payroll laptop", "expected_paths": ["person-alex-chen"], "source_expected": false,
+           "expected_states": {"person-alex-chen": "current"}},
+          {"id": "nas-01-backups", "text": "nas-01 design share backups", "expected_paths": ["host-nas-01"], "source_expected": false,
+           "expected_states": {"host-nas-01": "current"}},
+          {"id": "alex-cheng-support", "text": "Alex Cheng support laptop", "expected_paths": ["person-alex-cheng"], "source_expected": false,
+           "expected_states": {"person-alex-cheng": "current"}},
+          {"id": "second-alex-chen", "text": "Alex Chen sales territory", "expected_paths": ["person-alex-chen-sales"], "source_expected": false,
+           "expected_states": {"person-alex-chen-sales": "current", "person-alex-chen": "current"}}
+        ]
+      },
+      "events": [
+        {"operation": "review", "expect_op": "none", "record": {"id": "person-alex-cheng-merge", "title": "Alex Cheng", "entity_id": "person:EMP-2290", "supersedes": "okf/claims/person-alex-chen.md",
+          "text": "Alex Cheng (support team, EMP-2290) uses laptop LT-9902."}},
+        {"operation": "review", "record": {"id": "person-alex-cheng", "title": "Alex Cheng", "entity_id": "person:EMP-2290",
+          "text": "Alex Cheng (support team, EMP-2290) uses laptop LT-9902."}},
+        {"operation": "review", "expect_op": "none", "record": {"id": "host-nas-02-merge", "title": "Host nas-02", "entity_id": "host:nas-02", "supersedes": "okf/claims/host-nas-01.md",
+          "text": "Host nas-02 holds the media share at 10.0.4.12."}},
+        {"operation": "review", "record": {"id": "person-alex-chen-sales", "title": "Alex Chen", "entity_id": "person:EMP-3310",
+          "text": "Alex Chen (sales team, EMP-3310) covers the northern sales territory."}}
+      ]
+    }
+  ]
+}
