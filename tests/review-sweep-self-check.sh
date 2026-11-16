@@ -225,7 +225,8 @@ before="$(tree_hash "$project_dir/review")"
 [ "$(tree_hash "$project_dir/review")" = "$before" ] || fail 'closeout touched the old backlog'
 [ -f "$project_dir/reflection/review-policy.since" ] || fail 'closeout marker missing'
 
-# 7. Strict mode is byte-identical to 0.10 (when the 0.10 source is available).
+# 7. Strict mode is byte-identical to 0.10 (when the 0.10 source is available),
+# apart from the two custody lines every episode now carries (#3, 16 Nov).
 base_ref="${LLM_BRAIN_STRICT_BASELINE_REF:-f058c92}"
 if git -C "$repo_root" cat-file -e "$base_ref^{commit}" 2>/dev/null; then
   mkdir -p "$fixture/base"
@@ -238,7 +239,7 @@ if git -C "$repo_root" cat-file -e "$base_ref^{commit}" 2>/dev/null; then
     "$c" --root "$r" work run-once "$p" >/dev/null
     "$c" --root "$r" review list "$p"
   }
-  normalise() { (cd "$1" && find . -type f ! -path './.locks/*' | LC_ALL=C sort | while IFS= read -r f; do printf '== %s\n' "$f"; case "$f" in */audit.v2.tsv) hx='s/[0-9a-f]{64}/HASH/g' ;; *) hx='s/^$//' ;; esac; sed -E -e "$hx" -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z/TS/g; s/[0-9]{8}T[0-9]{6}Z/TS/g; s/^(format_level|writer_version|recorded_at)=.*/\1=X/; s#llm-brain/[0-9]+\.[0-9]+\.[0-9]+#llm-brain/VERSION#g' "$f"; done); }
+  normalise() { (cd "$1" && find . -type f ! -path './.locks/*' | LC_ALL=C sort | while IFS= read -r f; do printf '== %s\n' "$f"; case "$f" in */audit.v2.tsv) hx='s/[0-9a-f]{64}/HASH/g' ;; *) hx='s/^$//' ;; esac; sed -E -e "$hx" -e '/^brain_source_(transforms: \[\]|bytes_identical: true)$/d' -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z/TS/g; s/[0-9]{8}T[0-9]{6}Z/TS/g; s/^(format_level|writer_version|recorded_at)=.*/\1=X/; s#llm-brain/[0-9]+\.[0-9]+\.[0-9]+#llm-brain/VERSION#g' "$f"; done); }
   # Same root path for both runs so path-derived ids match.
   (cd "$fixture" && LLM_BRAIN_REVIEW_POLICY=strict scenario "$fixture/base/bin/llm-brain" "$fixture/strict") >"$fixture/old.out"
   mv "$fixture/strict" "$fixture/strict-old"

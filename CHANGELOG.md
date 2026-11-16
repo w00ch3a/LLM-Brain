@@ -18,6 +18,12 @@
   (`brain_owner_only`, private, secret-bearing) can never be `all-agents`.
   Packs, search, recall, briefs, exports and replication honour it, and
   `share audit PROJECT --as PRINCIPAL...` probes for leaks (read-only).
+- Ingest records every transform: episodes carry `brain_source_transforms`
+  (core custody is a plain copy, so `[]`), `brain_source_bytes_identical`,
+  and any `brain_upstream_transforms` an adapter declared (the Hermes plugin
+  and MCP capture now declare rendering, redaction, truncation and role-label
+  escaping). `custody verify PROJECT` re-hashes every stored source and lists
+  what changed on the way in (read-only).
 
 ## 0.13.0 - 2026-11-13
 

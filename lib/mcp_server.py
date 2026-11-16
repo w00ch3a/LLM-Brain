@@ -252,7 +252,9 @@ class Server:
             project_id = self.project(arguments)
             with tempfile.TemporaryDirectory(prefix="llm-brain-mcp.", dir=self.scratch) as scratch:
                 record = Path(scratch) / "mcp-capture.md"
-                record.write_text(f"---\ntype: MCPCapture\ntitle: {json.dumps(title)}\n---\n# {title}\n\n{text}\n", encoding="utf-8")
+                # 17 Nov #3: the note is wrapped, never edited; say so.
+                transforms = json.dumps(["wrap:mcp-capture-markdown", "append:trailing-newline"])
+                record.write_text(f"---\ntype: MCPCapture\ntitle: {json.dumps(title)}\nbrain_transforms: {transforms}\n---\n# {title}\n\n{text}\n", encoding="utf-8")
                 return self.run_cli("bridge", "capture", "--source-root", self.source_root(arguments), "--project-id", project_id, "--record", str(record))
         raise ToolError(f"unknown tool: {name}")
 

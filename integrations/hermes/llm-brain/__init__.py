@@ -720,8 +720,36 @@ def _turn_record(
 ) -> str:
     """One capture record.  raw=True keeps every text byte for byte (no
     whole-message redaction) and marks the record restricted / owner-only."""
-    metadata = _safe_metadata(metadata or {})
+    raw_metadata = metadata or {}
+    metadata = _safe_metadata(raw_metadata)
     keep = (lambda value: value) if raw else _safe_text
+    # 17 Nov #3: every change made between the Hermes messages and this
+    # record is listed in brain_transforms, so custody can be checked.
+    texts = [user, assistant] + [text for _, text in (turns or [])]
+    transforms = ["render:hermes-turn-markdown"]
+    redacted = 0 if raw else sum(1 for text in texts if text and _sensitive(text))
+    if redacted:
+        transforms.append(f"redact:whole-message-sha256:{redacted}")
+    if json.dumps(metadata, sort_keys=True) != json.dumps(raw_metadata, sort_keys=True, default=str):
+        transforms.append("redact:metadata-values")
+    tool_omitted = tool_truncated = 0
+    tool_total = 0
+    for message in messages:
+        if str(message.get("role") or "") != "tool":
+            continue
+        content = _message_text(message.get("content"))
+        if _sensitive(content) or _sensitive(str(message.get("outcome") or message.get("status") or "")):
+            tool_omitted += 1
+            continue
+        remaining = min(MAX_TOOL_EXCERPT_BYTES, MAX_TURN_EXCERPT_BYTES - tool_total) if tool_total < MAX_TURN_EXCERPT_BYTES else 0
+        size = len(content.encode("utf-8", "replace"))
+        if size > remaining:
+            tool_truncated += 1
+        tool_total += min(size, remaining)
+    if tool_omitted:
+        transforms.append(f"omit:sensitive-tool-results:{tool_omitted}")
+    if tool_truncated:
+        transforms.append(f"truncate:tool-results:{tool_truncated}")
     from datetime import datetime, timezone
     observed = metadata.get("observed_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     safe_user = keep(user)
@@ -729,6 +757,8 @@ def _turn_record(
     shown_user, escaped_user = _escape_role_labels(safe_user)
     shown_assistant, escaped_assistant = _escape_role_labels(safe_assistant)
     escaped = escaped_user + escaped_assistant
+    if not user or not assistant:
+        transforms.append("placeholder:empty-content")
     body = [
         f"# Hermes {kind} `{request_id}`", "", "## User content", "",
         shown_user or "[empty]", "", "## Assistant content", "", shown_assistant or "[empty]",
@@ -761,6 +791,8 @@ def _turn_record(
     ]
     if escaped:
         fields.append(f"brain_role_labels_escaped: {escaped}")
+        transforms.append(f"escape:role-labels:{escaped}")
+    fields.append("brain_transforms: " + json.dumps(transforms))
     if raw:
         fields.append("brain_owner_only: true")
     fields.extend((f"brain_sensitivity: {'restricted' if raw else 'internal'}", "brain_schema_version: 3", "---", ""))
