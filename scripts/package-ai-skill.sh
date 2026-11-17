@@ -120,7 +120,7 @@ install -m 0644 "$repo_root/docs/releases/unreleased.md" "$plugin/docs/releases/
 install -m 0644 "$repo_root/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md" "$plugin/docs/research/2026-09-06-hermes-openclaw-memory-comparison.md"
 install -m 0644 "$repo_root/docs/research/2026-09-25-evidence-first-host-memory.md" "$plugin/docs/research/2026-09-25-evidence-first-host-memory.md"
 
-install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/CONTRIBUTING.md" "$repo_root/SECURITY.md" "$repo_root/install_prompt.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
+install -m 0644 "$repo_root/LICENSE" "$repo_root/README.md" "$repo_root/CONTRIBUTING.md" "$repo_root/SECURITY.md" "$repo_root/install_prompt.md" "$repo_root/SKILL.md" "$repo_root/VERSION" "$repo_root/requirements-okf.lock" "$standalone/"
 install -m 0755 "$repo_root/bin/llm-brain" "$standalone/bin/llm-brain"
 install -m 0755 "$repo_root/lib/okf.py" "$standalone/lib/okf.py"
 install -m 0755 "$repo_root/lib/replication.py" "$standalone/lib/replication.py"

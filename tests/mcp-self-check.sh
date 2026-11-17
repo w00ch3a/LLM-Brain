@@ -48,7 +48,7 @@ init = by_id[1]["result"]
 assert init["protocolVersion"] == "2025-06-18"
 assert init["serverInfo"] == {"name": "llm-brain", "version": version}
 names = [tool["name"] for tool in by_id[2]["result"]["tools"]]
-assert names == ["brain_search", "brain_pack_build", "brain_recall", "brain_status", "brain_brief", "brain_capture"], names
+assert names == ["brain_search", "brain_pack_build", "brain_recall", "brain_status", "brain_brief", "brain_share_audit", "brain_custody_verify", "brain_capture"], names
 def text(i):
     result = by_id[i]["result"]
     assert result["isError"] is False, (i, result)

@@ -4,6 +4,8 @@ Unless `LLM_BRAIN_PASSIVE=0`, apply the Memthena automatic-use contract to every
 
 @./skills/llm-brain/SKILL.md
 
+For 0.14 feature commands (safeguard scope, share audit, custody verify, pack layout, evidence flags and namesake holds), see **Using 0.14 memory features** in that skill.
+
 Factual retrieval remains the default. Select `--intent current_state` explicitly for state resolution; unresolved state and correlated evidence stay warnings. Commitment decisions and `run prepare` procedure capsules are derived, non-canonical artefacts, and Hermes does not execute capsules.
 
 After resolving a non-trivial project, perform one bounded, read-only

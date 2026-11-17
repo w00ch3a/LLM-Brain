@@ -1650,7 +1650,7 @@ class LLMBrainMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [{
             "name": "llm_brain_search",
-            "description": "Search local LLM-Brain memory and return provenance-labelled context.",
+            "description": "Search local LLM-Brain memory and return provenance-labelled context. Honours share scope. If a result says 'Check evidence before acting', open the cited evidence before using it. Look-alike names with distinct ids are separate records; do not merge them.",
             "parameters": {
                 "type": "object",
                 "properties": {

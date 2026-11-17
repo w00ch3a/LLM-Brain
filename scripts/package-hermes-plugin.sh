@@ -16,6 +16,8 @@ mkdir -p "$(dirname "$output_dir")"
 stage="${output_dir}.tmp.$$"
 mkdir -p "$stage/docs/releases" "$stage/docs/research"
 cp "$source_dir/__init__.py" "$source_dir/README.md" "$stage/"
+# Host skill: Hermes agents need the when-and-how commands for 0.14 features.
+cp "$repo_root/skills/llm-brain/SKILL.md" "$stage/SKILL.md"
 mkdir -p "$stage/dashboard/dist"
 cp "$source_dir/dashboard/plugin_api.py" "$stage/dashboard/plugin_api.py"
 cp "$source_dir/dashboard/dist/index.js" "$stage/dashboard/dist/index.js"

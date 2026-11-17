@@ -70,7 +70,7 @@ second.unlink()
 
 with tarfile.open(destination, "r:gz") as archive:
     names = set(archive.getnames())
-    required = {"llm-brain/__init__.py", "llm-brain/plugin.yaml", "llm-brain/README.md",
+    required = {"llm-brain/__init__.py", "llm-brain/plugin.yaml", "llm-brain/README.md", "llm-brain/SKILL.md",
                 f"llm-brain/docs/releases/v{version}.md"}
     if not required <= names or any(not (n == "llm-brain" or n.startswith("llm-brain/")) for n in names):
         raise SystemExit("Hermes archive layout is incomplete")

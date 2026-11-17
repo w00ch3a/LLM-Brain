@@ -91,6 +91,7 @@ for member in \
   "llm-brain/CONTRIBUTING.md" \
   "llm-brain/SECURITY.md" \
   "llm-brain/install_prompt.md" \
+  "llm-brain/SKILL.md" \
   "llm-brain/docs/research/2026-09-25-evidence-first-host-memory.md"
 do
   grep -Fqx "$member" <<<"$standalone_members" || fail "standalone archive omitted: $member"

@@ -55,25 +55,32 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
 
 def tool_definitions(read_only: bool) -> list[dict[str, Any]]:
     tools = [
-        tool("brain_search", "Search approved project memory (BM25F lexical by default). Returns ranked TSV rows.", {
+        tool("brain_search", "Search approved project memory (BM25F lexical by default). Honours share scope (this-agent/this-owner/all-agents) and only returns memory the principal may see. Returns ranked TSV rows.", {
             "query": text_property("Search text."),
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum rows (default 8)."},
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative file paths the task touches; boosts concepts whose brain_paths match."},
         }, ["query"], True),
-        tool("brain_pack_build", "Build a budgeted, cited context pack for a task. Due intentions appear first. Writes only a derived pack file.", {
+        tool("brain_pack_build", "Build a budgeted, cited context pack for a task. Due intentions appear first. Open conflicts keep a reserved share of the budget and are shown together. Failure-derived or conflicting lessons are marked 'Check evidence before acting' — open the cited evidence before using them. Safeguard-relaxing memories appear only when task_type matches. Writes only a derived pack file.", {
             "task": text_property("Task description."),
             "budget_tokens": {"type": "integer", "minimum": 1, "maximum": 32000, "description": "Approximate token budget (default 1200)."},
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative file paths the task touches."},
             "action_risk": {"type": "string", "enum": ["low", "medium", "high"], "description": "Optional. high flags stale or single-source premises 're-verify before acting'; low/medium (or omitted) give the default pack."},
+            "layout": {"type": "string", "enum": ["ranked", "auto", "timeline", "current-first", "side-by-side", "steps"], "description": "Optional pack layout. auto picks timeline, current-first, side-by-side or steps from the question; default is ranked (0.13 order). Same records, different order."},
+            "task_type": text_property("Optional task type (passed as --task-type). Required to surface a safeguard-relaxing memory that is scoped to that task."),
         }, ["task"], False),
-        tool("brain_recall", "Bridge recall: approved memory plus captured evidence, rendered as bounded markdown in JSON.", {
+        tool("brain_recall", "Bridge recall: approved memory plus captured evidence, rendered as bounded markdown in JSON. Honours share scope. Failure-derived or conflicting lessons are marked 'Check evidence before acting' — open the cited evidence before using them.", {
             "query": text_property("Recall question."),
             "budget_tokens": {"type": "integer", "minimum": 1, "maximum": 32000, "description": "Approximate token budget (default 4000)."},
         }, ["query"], True),
         tool("brain_status", "Read-only maintenance status for the project (health, findings and advisory signals).", {}, [], True),
-        tool("brain_brief", "Size-capped project brief: durable approved facts, due intentions and recent changes.", {
+        tool("brain_brief", "Size-capped project brief: durable approved facts, due intentions and recent changes. Honours share scope and safeguard-task scope.", {
             "max_bytes": {"type": "integer", "minimum": 256, "maximum": 16000, "description": "Byte cap (default 4000)."},
         }, [], True),
+        tool("brain_share_audit", "Read-only leak probe: check that no owner-only or agent-only lesson reaches another principal. Prints paths only; a leak is reported as isError with those paths (CLI exit 1).", {
+            "as_principals": {"type": "array", "items": {"type": "string"}, "description": "Principals to search as. Required; repeat to probe several."},
+            "agent": text_property("Optional agent identity when probing this-agent lessons (passed as --agent)."),
+        }, ["as_principals"], True),
+        tool("brain_custody_verify", "Read-only: re-hash every stored source and list ingest transforms (paths and transform names only). A mismatch or missing file is reported as isError with the table (CLI exit 1).", {}, [], True),
     ]
     if not read_only:
         tools.append(tool("brain_capture", "Capture a note as source custody plus a PROPOSED review item. Never approves memory; secrets are blocked by the scanner.", {
@@ -144,6 +151,19 @@ class Server:
             message = (completed.stderr or completed.stdout).strip().splitlines()
             raise ToolError(message[-1] if message else f"llm-brain exited {completed.returncode}")
         return completed.stdout
+
+    def run_cli_report(self, *arguments: str) -> tuple[str, int]:
+        """Run a read-only report command that uses exit 1 as a finding, not a crash."""
+        command = [self.cli, "--root", self.root, *arguments]
+        try:
+            completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=TOOL_TIMEOUT, cwd=self.cwd, env=self.env)
+        except subprocess.TimeoutExpired as error:
+            raise ToolError("llm-brain command timed out") from error
+        output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+        if completed.returncode not in (0, 1):
+            message = output.splitlines()
+            raise ToolError(message[-1] if message else f"llm-brain exited {completed.returncode}")
+        return output, completed.returncode
 
     @staticmethod
     def text_arg(arguments: dict[str, Any], key: str, required: bool = False) -> str:
@@ -224,6 +244,14 @@ class Server:
                 if action_risk not in ("low", "medium", "high"):
                     raise ToolError("action_risk must be low, medium or high")
                 command += ["--action-risk", action_risk]
+            layout = arguments.get("layout")
+            if layout is not None:
+                if layout not in ("ranked", "auto", "timeline", "current-first", "side-by-side", "steps"):
+                    raise ToolError("layout must be ranked, auto, timeline, current-first, side-by-side or steps")
+                command += ["--layout", layout]
+            task_type = self.line_arg(arguments, "task_type")
+            if task_type:
+                command += ["--task-type", task_type]
             output = self.run_cli(*command, *self.principal(arguments))
             fields = dict(part.split("=", 1) for part in output.split() if "=" in part)
             pack_file = fields.get("file", "")
@@ -246,6 +274,27 @@ class Server:
             return self.run_cli("maintenance", "status", self.project(arguments), *self.principal(arguments))
         if name == "brain_brief":
             return self.run_cli("brief", self.project(arguments), "--max-bytes", str(self.int_arg(arguments, "max_bytes", 4000, 256, 16000)), *self.principal(arguments))
+        if name == "brain_share_audit":
+            principals = arguments.get("as_principals") or []
+            if not isinstance(principals, list) or not principals or len(principals) > 32:
+                raise ToolError("as_principals must be a non-empty list of at most 32 principals")
+            command = ["share", "audit", self.project(arguments)]
+            for principal in principals:
+                if not isinstance(principal, str) or not principal.strip() or "\n" in principal or "\r" in principal:
+                    raise ToolError("as_principals must be single-line strings")
+                command += ["--as", principal.strip()]
+            agent = self.line_arg(arguments, "agent")
+            if agent:
+                command += ["--agent", agent]
+            output, code = self.run_cli_report(*command)
+            if code == 1:
+                raise ToolError(output or "share audit found a leak")
+            return output
+        if name == "brain_custody_verify":
+            output, code = self.run_cli_report("custody", "verify", self.project(arguments))
+            if code == 1:
+                raise ToolError(output or "custody verify found a mismatch or missing source")
+            return output
         if name == "brain_capture" and not self.read_only:
             text = self.text_arg(arguments, "text", True)
             title = self.line_arg(arguments, "title") or "MCP capture"
