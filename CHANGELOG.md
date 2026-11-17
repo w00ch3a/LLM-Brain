@@ -7,6 +7,9 @@
 - Documented the shipped schema-3/OKF-v0.2 lifecycle, provenance and independent-root accounting.
 - Documented opt-in receipts and preview/confirm tombstone retraction; no automatic forgetting or receipt writes.
 - Clarified Hermes' unchanged factual-prefetch/native-compressor defaults and evaluation-only experimental boundaries.
+
+## 0.14.0 - 2026-11-17
+
 - Memories that relax a safeguard (skip a test or confirmation, auto-approve,
   `--no-verify`, weaken a check) are tagged `brain_relaxes_safeguard`, held at
   promotion until they name a task (`review decide ... --applies-when
@@ -58,6 +61,7 @@
   the next) is recorded in `fairness.tsv`. `--margin-log FILE` appends the
   margin and brain size per run so a shrinking margin shows before hit rate
   drops.
+- No vault migration. See docs/releases/v0.14.0.md.
 
 ## 0.13.0 - 2026-11-13
 
