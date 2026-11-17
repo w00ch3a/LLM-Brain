@@ -169,6 +169,7 @@ Commands:
                                               --applies-when 'task=TYPE' scopes it first (required for a memory that relaxes a safeguard)
                                               --share-scope this-agent|this-owner|all-agents [--share-owner ID] [--share-agent NAME] who may see the lesson
                                               --source-outcome success|failure|unknown how the task it was learnt from ended
+                                              --same-entity confirms a review that would replace or merge a different entity with a look-alike name
   share audit PROJECT_ID --as PRINCIPAL... [--agent NAME]   Read-only probe: no owner-only or agent-only lesson reaches another principal
   custody verify PROJECT_ID   Read-only: stored sources still match their recorded hash; lists every transform applied at ingest
   review list PROJECT_ID --triage | review triage PROJECT_ID   Schema-fit ordering; never promotes

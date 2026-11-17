@@ -244,6 +244,24 @@ changed during the run. It has only been run on the synthetic fixture in
 `tests/personal-eval-self-check.sh`. Run it on a real brain only on a copy,
 deliberately.
 
+`--layout-ab` builds every case twice, once with the default ranked layout
+and once with `pack build --layout auto`, and scores both: hits, MRR and how
+early the target is mentioned. It is copy-only and writes hashes and scores
+only.
+
+
+## Leak-free scores and retrieval margin
+
+`eval run` always writes `fairness.tsv` beside the existing report. A case
+whose expected path shares a source group with a near-duplicate record is
+marked leaky; cases fold into dev/test by the hash of that source group; and
+each case records its retrieval margin (top-1 against the next result). The
+Markdown report adds a "Leak-free split and retrieval margin" table. The
+result hash and trace are unchanged. `--margin-log FILE` appends the margin
+and brain size after each run so a shrinking margin is visible before hit
+rate drops. The fairness report is report-only. Test:
+`tests/fair-benchmark-self-check.sh`.
+
 ## Real-agent evaluation (Codex CLI)
 
 `evals/real/` runs a real coding agent with memory on and off. It contains 12

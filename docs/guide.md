@@ -45,6 +45,11 @@ code instead of drifting in an unversioned wiki. Examples use placeholders;
 this public documentation contains no vault records, credentials, hostnames
 or user-specific filesystem paths.
 
+## What's new in 0.14
+
+Seven memory-quality and safety changes. No vault migration. See the
+[v0.14.0 notes](releases/v0.14.0.md) and [Scope, custody and pack layout](#scope-custody-and-pack-layout-17-nov).
+
 ## What's new in 0.13
 
 Fifteen memory-quality and safety changes, and support for Hermes 0.23. No
@@ -379,6 +384,8 @@ $brain pack build PROJECT_ID --task "current task" --budget-tokens 4000
 ./bin/llm-brain project ensure /path/to/repository
 ./bin/llm-brain search PROJECT_ID "release state" --intent current_state --require-evidence
 ./bin/llm-brain pack build PROJECT_ID --task "release state" --intent evidence --budget-tokens 2000
+./bin/llm-brain custody verify PROJECT_ID
+./bin/llm-brain share audit PROJECT_ID --as PRINCIPAL
 
 # inspect or write a bounded derived maintenance report
 ./bin/llm-brain maintenance preview PROJECT_ID --limit 20
@@ -717,6 +724,88 @@ migration and records without them behave as before.
   the store. The tombstone stays in force. After fixing the store, run
   `retract PID ID --finish` to re-check.
 
+
+### Scope, custody and pack layout (17 Nov)
+
+All fields below are optional, additive OKF v0.2 frontmatter; nothing needs a
+migration and records without them behave as before.
+
+- **Safeguard-relaxing memories.** A lesson that relaxes a safeguard (skip a
+  test or confirmation, auto-approve, `--no-verify`, weaken a check) is tagged
+  `brain_relaxes_safeguard` and is held at promotion (audit
+  `safeguard-scope-hold`, exit 75) until it names a task with
+  `review decide ... --applies-when 'task=TYPE'` (audit `applies-when-set`).
+  A `task=*` wildcard does not count. Once scoped, it is packed only for that
+  task; other or unknown task types are withheld, and an in-scope hit is
+  labelled "Relaxes a safeguard: only for task=...". Scope here fails closed
+  for tagged records. `LLM_BRAIN_SAFEGUARD_SCOPE=0` turns this off. An explicit
+  `brain_relaxes_safeguard: false` on a review overrides a false-positive
+  phrase match. Existing records are not retro-tagged.
+- **Share scope.** A lesson carries `brain_share_scope: this-agent | this-owner | all-agents`
+  (plus `brain_share_owner` / `brain_share_agent`), set with
+  `review decide ... --share-scope X [--share-owner ID] [--share-agent NAME]`
+  (audit `share-scope-set`). A lesson captured for a named principal is
+  `this-owner` by default; with nothing known, earlier visibility is kept.
+  Owner-only records (`brain_owner_only`, private, restricted, or
+  secret-bearing) can never be `all-agents` (exit 65). Packs, search, recall,
+  briefs, exports and replication honour the scope and only ever narrow
+  visibility. `brain_owner_only: true` is owner-only even without a share
+  scope. Unknown agent identity never matches a `this-agent` lesson (agent
+  comes from pack `--agent` or host, recall/brief host, or
+  `LLM_BRAIN_AGENT_IDENTITY`). `share audit PROJECT --as PRINCIPAL... [--agent NAME]`
+  is a read-only leak probe: it searches each owner- or agent-only lesson's
+  title as each named principal, prints paths only, and exits 1 on a leak.
+  `LLM_BRAIN_SHARE_SCOPE_STAMP=0` stops the default this-owner stamp;
+  `LLM_BRAIN_SHARE_SCOPE_ENFORCE=0` is a diagnostic off switch. Existing
+  records are not retro-stamped.
+- **Ingest transforms and custody verify.** Each episode records
+  `brain_source_transforms` (core custody is a plain copy, so `[]`),
+  `brain_source_bytes_identical`, and any `brain_upstream_transforms` an
+  adapter declared. The Hermes plugin declares rendering, redaction,
+  truncation and role-label escaping; MCP capture declares Markdown wrapping
+  and a trailing newline. `custody verify PROJECT` is read-only: it re-hashes
+  every stored source and lists what changed on the way in (identical,
+  transformed, unrecorded, mismatch or missing). It prints paths and
+  transform names only, and exits 1 on a mismatch or a missing file.
+  Episodes captured before 0.14 show as `unrecorded`.
+- **Conflict reserve.** Packs hold part of the budget
+  (`LLM_BRAIN_PACK_CONFLICT_RESERVE`, default 20%, cap 90) for open conflicts
+  that touch the task, place both sides together, and label them so one side
+  is not picked silently. Packs without an open conflict are unchanged. The
+  reserve is not applied under `--intent current_state`. `=0` turns it off.
+- **Source outcome and evidence flags.** Lessons record how the task they
+  came from ended (`brain_source_outcome: success | failure | unknown`, from
+  a run outcome, the episode's `brain_task_outcome`, or
+  `review decide ... --source-outcome`; audit `source-outcome-set`; partial
+  counts as failure) and the evidence path (`brain_source_evidence`). Packs
+  and recall mark a failure-derived or conflicting lesson "Check evidence
+  before acting" with that path. `LLM_BRAIN_PACK_EVIDENCE_FLAGS=0` hides the
+  marks; the fields are still written.
+- **Pack layout (opt-in).** `pack build --layout auto|ranked|timeline|current-first|side-by-side|steps`
+  (or `LLM_BRAIN_PACK_LAYOUT`) keeps the same records and changes only the
+  order, plus a short lead section that counts toward the budget. `auto`
+  picks a timeline for "when / what changed", the current value first with
+  replaced versions in a footnote, open conflicts side by side, or steps
+  first for "how do I"; otherwise it stays ranked. The default is `ranked`
+  (the 0.13 layout). `scripts/personal-eval.py --layout-ab` compares ranked
+  against `auto` on a copy of a brain.
+- **Look-alike names never merge.** A record can name its entity
+  (`brain_entity_id`); failing that, e-mail, IPv4 and code ids in the text
+  are compared. A review that would supersede or merge a different entity
+  with a look-alike name is held (reason `namesake-distinct-entity`, audit
+  `namesake-hold`, exit 75). `review decide ... --same-entity` confirms on
+  purpose (audit `same-entity-confirmed`). A second person with the same
+  name gets their own record instead of a conflict review. Triage, doctor
+  and health stop suggesting such merges, and packs label look-alikes with
+  what tells them apart (`LLM_BRAIN_PACK_NAMESAKE_LABELS=0` hides the
+  label). `LLM_BRAIN_NAMESAKE_GUARD=0` turns the hold off.
+- **Leak-free eval scores.** `eval run` reports leak-free scores: a case
+  whose answer shares a source group with a near-duplicate record is marked
+  leaky, cases fold into dev/test by source group, and each case's
+  retrieval margin is recorded in `fairness.tsv`. `--margin-log FILE`
+  appends the margin and brain size per run. The fairness report is always
+  on and report-only.
+
 ## Neural Expansion
 
 Neural Expansion is a read-only, offline memory-graph viewer. It shows records
@@ -760,6 +849,9 @@ iframe, no network) when `llm-brain` is in `plugins.enabled`. See
 - Protected or ambiguous material stays in review.
 - Canonical changes use promotion, supersession or retraction.
 - Read-only search does not mutate memory.
+- Honour share scope; owner-only and secret-bearing lessons can never be `all-agents`.
+- Open cited evidence before acting on a failure-derived or conflicting lesson.
+- Do not merge look-alike names that have distinct entity or text ids.
 - Lock recovery requires proof that the owner died.
 - Indexes, vectors and context packs remain rebuildable.
 
@@ -805,4 +897,4 @@ bash tests/release-readiness-self-check.sh
 bash tests/release-readiness-self-check.sh --release
 ```
 
-Read [the installation prompt](../install_prompt.md) for agent-guided setup, [the architecture reference](../references/architecture.md) for storage and authority boundaries, [the release guide](../RELEASING.md) for publication gates, and the [v0.9.1 release notes](releases/v0.9.1.md) for this version. The [evidence-first host comparison](research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.
+Read [the installation prompt](../install_prompt.md) for agent-guided setup, [the architecture reference](../references/architecture.md) for storage and authority boundaries, [the release guide](../RELEASING.md) for publication gates, and the [v0.14.0 release notes](releases/v0.14.0.md) for this version. The [evidence-first host comparison](research/2026-09-25-evidence-first-host-memory.md) explains the research behind the changes.

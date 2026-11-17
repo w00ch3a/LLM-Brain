@@ -171,6 +171,17 @@ Labels also show in Neural Expansion's detail panel:
 UNKNOWN, and search and packs accept `--label` / `--without-label`. See the
 [v0.9.0 notes](docs/releases/v0.9.0.md).
 
+## What's new in 0.14
+
+Seven memory-quality and safety changes. Memories that relax a safeguard
+stay scoped to their task. Lessons carry a share scope, and a read-only
+`share audit` probes for leaks. Every ingest transform is recorded, and
+`custody verify` re-checks stored sources. Packs reserve room for open
+conflicts, flag failure-derived lessons to check evidence first, and can
+be laid out by query intent (`--layout auto`, off by default). Look-alike
+names never merge, and `eval run` reports leak-free scores. No vault
+migration. Details: [v0.14.0 notes](docs/releases/v0.14.0.md).
+
 ## What's new in 0.13
 
 Fifteen memory-quality and safety changes, and support for Hermes 0.23. Stale
